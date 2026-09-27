@@ -1,0 +1,5 @@
+@echo off
+echo Starting NIFTY 50 Institutional Trading Desk...
+cd /d %~dp0
+python -m streamlit run app.py
+pause
