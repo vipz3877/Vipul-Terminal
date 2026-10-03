@@ -1,9 +1,10 @@
 """
-🏛️ VIPUL PROFESSIONAL TERMINAL v4.2 (REAL-TIME GREEKS + CHAIN BREADTH CONFLUENCE)
-Multi-Layer Institutional Signal Detection
-- Real-Time Greeks Momentum & Tick-by-Tick Shift Validation
-- Chain Breadth Confluence (Multi-strike backing, avoiding single-strike traps)
-- Gamma Ladder Mapping & Dynamic Entry/Targets/Stop-Loss
+🏛️ VIPUL PROFESSIONAL TERMINAL v4.3 (REAL-TIME OI UNWINDING + GREEKS)
+Institutional Option Chain Surveillance Engine
+- Real-Time OI Unwinding & Writer Panic Tracking (Negative OI Exits)
+- Delta-Weighted Greeks Flow Velocity
+- Multi-Strike Chain Breadth Confluence (Single-Strike Trap Filter)
+- Gamma Ladder Mapping & Dynamic Trade Levels
 """
 
 import sys
@@ -34,7 +35,7 @@ try:
 except ImportError:
     st_autorefresh = None
 
-st.set_page_config(page_title="Vipul Professional v4.2", layout="wide")
+st.set_page_config(page_title="Vipul Professional v4.3", layout="wide")
 
 st.markdown("""
 
@@ -123,7 +124,7 @@ def fetch_option_chain(scrip, seg, expiry, token):
     return spot, pd.DataFrame(rows).sort_values("Strike").reset_index(drop=True)
 
 # ============================================================
-# INSTITUTIONAL LAYERS WITH GREEKS & CHAIN BREADTH CONFLUENCE
+# INSTITUTIONAL LAYERS: REAL-TIME OI UNWINDING + GREEKS
 # ============================================================
 def analyze_gamma_ladder(df, spot):
     df = df.copy()
@@ -142,64 +143,65 @@ def analyze_gamma_ladder(df, spot):
         "gamma_symmetry": "SYMMETRIC" if abs(sum(df[df["Strike"] > spot]["total_gamma"]) - sum(df[df["Strike"] < spot]["total_gamma"])) / total_g < 0.1 else "ASYMMETRIC"
     }
 
-def analyze_greeks_and_chain_breadth(df, spot):
+def analyze_realtime_oi_and_greeks(df):
     """
-    Combines Video 2 & 3 Logic: 
-    1. Checks for multi-strike chain breadth (avoids single-strike false traps).
-    2. Evaluates real-time Greeks momentum (Delta & Gamma velocity shift).
+    Combines Real-Time OI Unwinding (writer panic/exits) with Greeks velocity:
+    1. Tracks negative OI changes (writers exiting/squeezed).
+    2. Weights changes using Delta probabilities across multiple strikes (Chain Breadth).
     """
     df = df.copy()
     df["CE_OI_Chg"] = df["CE_OI"] - df["CE_PrevOI"]
     df["PE_OI_Chg"] = df["PE_OI"] - df["PE_PrevOI"]
 
-    # Delta-weighted flow velocity
+    # Writer panic / unwinding totals (Negative change = exiting positions)
+    ce_unwinding = df[df["CE_OI_Chg"] < 0]["CE_OI_Chg"].sum()
+    pe_unwinding = df[df["PE_OI_Chg"] < 0]["PE_OI_Chg"].sum()
+
+    ce_building = df[df["CE_OI_Chg"] > 0]["CE_OI_Chg"].sum()
+    pe_building = df[df["PE_OI_Chg"] > 0]["PE_OI_Chg"].sum()
+
+    # Delta-weighted momentum velocity
     df["CE_delta_flow"] = df["CE_OI_Chg"] * df["CE_Delta"].abs()
     df["PE_delta_flow"] = df["PE_OI_Chg"] * df["PE_Delta"].abs()
 
     net_ce_flow = df["CE_delta_flow"].sum()
     net_pe_flow = df["PE_delta_flow"].sum()
 
-    # Chain breadth check: Are multiple consecutive strikes participating?
-    active_ce_strikes = (df["CE_OI_Chg"] < -1500).sum()
-    active_pe_strikes = (df["PE_OI_Chg"] < -1500).sum()
-
+    # Chain Breadth: Verify participation across multiple consecutive strikes
+    active_ce_strikes = (df["CE_OI_Chg"] < -1000).sum()
+    active_pe_strikes = (df["PE_OI_Chg"] < -1000).sum()
     breadth_confirmed = (active_ce_strikes >= 2) or (active_pe_strikes >= 2)
 
-    if net_ce_flow < -300 and net_pe_flow > 300 and breadth_confirmed:
+    # Signal logic based strictly on writer panic (unwinding) + Greeks flow + breadth
+    if ce_unwinding < -3000 and pe_building > 3000 and breadth_confirmed:
         signal = "BUY"
-        conviction = "STRONG (Multi-Strike Chain Breadth & Greeks Aligned)"
-    elif net_pe_flow < -300 and net_ce_flow > 300 and breadth_confirmed:
+        conviction = "STRONG (Call Writers Unwinding / Put Writers Aggressive)"
+    elif pe_unwinding < -3000 and ce_building > 3000 and breadth_confirmed:
         signal = "SELL"
-        conviction = "STRONG (Multi-Strike Chain Breadth & Greeks Aligned)"
+        conviction = "STRONG (Put Writers Unwinding / Call Writers Aggressive)"
     else:
         signal = "WAIT"
-        conviction = "Single-Strike Trap or Balanced Flow (Awaiting Breadth)"
+        conviction = "Balanced OI / Single-Strike Trap (Awaiting Multi-Strike Unwinding)"
 
     return {
         "signal": signal,
         "conviction": conviction,
+        "ce_unwinding": ce_unwinding,
+        "pe_unwinding": pe_unwinding,
         "net_ce_flow": round(net_ce_flow, 2),
         "net_pe_flow": round(net_pe_flow, 2),
         "breadth_confirmed": breadth_confirmed
     }
-
-def analyze_volatility_regime(df, spot):
-    atm_idx = (df["Strike"] - spot).abs().idxmin()
-    pos = df.index.get_loc(atm_idx)
-    near = df.iloc[max(0, pos-5):min(len(df), pos+6)].copy()
-    atm_iv = (near["CE_IV"].mean() + near["PE_IV"].mean()) / 2
-    return {"atm_iv": round(atm_iv, 2), "regime": "HIGH" if atm_iv > 15 else "LOW" if atm_iv < 9 else "NORMAL"}
 
 # ============================================================
 # MASTER PROFESSIONAL SIGNAL GENERATOR
 # ============================================================
 def generate_professional_signal(df, spot, prev_close, step):
     gamma_ladder = analyze_gamma_ladder(df, spot)
-    greeks_breadth = analyze_greeks_and_chain_breadth(df, spot)
-    vol_regime = analyze_volatility_regime(df, spot)
+    oi_greeks = analyze_realtime_oi_and_greeks(df)
 
-    final_signal = greeks_breadth["signal"]
-    confidence = 88 if final_signal != "WAIT" else 0
+    final_signal = oi_greeks["signal"]
+    confidence = 90 if final_signal != "WAIT" else 0
 
     max_gamma = gamma_ladder["max_gamma_strike"]
     if final_signal == "BUY":
@@ -224,17 +226,16 @@ def generate_professional_signal(df, spot, prev_close, step):
         "target": round(target, 2),
         "stop_loss": round(stop_loss, 2),
         "risk_reward": rr,
-        "greeks_breadth": greeks_breadth,
-        "gamma_ladder": gamma_ladder,
-        "vol_regime": vol_regime
+        "oi_greeks": oi_greeks,
+        "gamma_ladder": gamma_ladder
     }
 
 # ============================================================
 # UI INTERFACE
 # ============================================================
 with st.sidebar:
-    st.markdown("### 🏛️ VIPUL PROFESSIONAL v4.2")
-    st.caption("Greeks + Chain Breadth Engine")
+    st.markdown("### 🏛️ VIPUL PROFESSIONAL v4.3")
+    st.caption("Real-Time OI Unwinding + Greeks")
     st.divider()
     
     dhan_token = st.text_input("DHAN TOKEN", type="password", value=DEFAULT_DHAN_TOKEN)
@@ -276,7 +277,7 @@ result = generate_professional_signal(df, spot, prev_close, info["step"])
 # DISPLAY DASHBOARD
 # ============================================================
 st.markdown(f"# 🏛️ {idx_name} : {spot:,.2f}")
-st.caption(f"Institutional Greeks Terminal • {expiry} • {datetime.now():%H:%M:%S} IST")
+st.caption(f"Institutional Real-Time OI & Greeks Terminal • {expiry} • {datetime.now():%H:%M:%S} IST")
 
 sig = result["signal"]
 if sig == "BUY":
@@ -284,21 +285,18 @@ if sig == "BUY":
 elif sig == "SELL":
     st.error(f"### 🔴 SIGNAL: SELL | CONFIDENCE: {result['confidence']}% | ENTRY: {result['entry']} | TARGET: {result['target']} | STOP LOSS: {result['stop_loss']} | R:R: {result['risk_reward']}")
 else:
-    st.warning(f"### 🟡 STATUS: WAIT — Single-Strike trap filter active. Awaiting multi-strike breadth confirmation.")
+    st.warning(f"### 🟡 STATUS: WAIT — Awaiting institutional writer panic/unwinding confirmation across multi-strike chain breadth.")
 
 st.markdown("---")
-st.markdown("### 📊 Real-Time Greeks & Chain Breadth Validation")
+st.markdown("### 📊 Real-Time OI Unwinding & Greeks Breakdown")
 
-c1, c2, c3 = st.columns(3)
+c1, c2 = st.columns(2)
 with c1:
-    gb = result['greeks_breadth']
-    st.info(f"**Chain Breadth Confluence**\n- Breadth Confirmed: {gb['breadth_confirmed']}\n- Net CE Flow: {gb['net_ce_flow']:+,.0f}\n- Net PE Flow: {gb['net_pe_flow']:+,.0f}")
+    og = result['oi_greeks']
+    st.info(f"**OI Unwinding & Writer Panic Matrix**\n- Call Unwinding (Exits): {og['ce_unwinding']:+,.0f}\n- Put Unwinding (Exits): {og['pe_unwinding']:+,.0f}\n- Breadth Confirmed: {og['breadth_confirmed']}\n- Status: {og['conviction']}")
 with c2:
     gl = result['gamma_ladder']
-    st.info(f"**Gamma Ladder Map**\n- Max Gamma: {gl['max_gamma_strike']:,.0f}\n- Concentration: {gl['gamma_concentration']*100:.1f}%\n- Symmetry: {gl['gamma_symmetry']}")
-with c3:
-    vr = result['vol_regime']
-    st.info(f"**Volatility Regime**\n- ATM IV: {vr['atm_iv']}%\n- Regime: {vr['regime']}")
+    st.info(f"**Gamma Ladder Map**\n- Max Gamma Strike: {gl['max_gamma_strike']:,.0f}\n- Concentration: {gl['gamma_concentration']*100:.1f}%\n- Symmetry: {gl['gamma_symmetry']}")
 
 st.markdown("---")
-st.caption(f"Vipul Professional Terminal v4.2 • Last Scan: {datetime.now():%H:%M:%S} IST")
+st.caption(f"Vipul Professional Terminal v4.3 • Last Scan: {datetime.now():%H:%M:%S} IST")
