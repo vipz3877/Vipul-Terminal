@@ -28,16 +28,10 @@ except ImportError:
 
 st.set_page_config(page_title="Vipul Professional v4.5", layout="wide")
 
-# ============================================================
-# HIGH-VISIBILITY FLASH STYLING & CSS
-# ============================================================
 st.markdown("""
 
 """, unsafe_allow_html=True)
 
-# ============================================================
-# CONFIGURATION & API
-# ============================================================
 CLIENT_ID = "1108425500"
 DEFAULT_DHAN_TOKEN = os.getenv("DHAN_ACCESS_TOKEN", "")
 
@@ -91,9 +85,6 @@ def fetch_option_chain(scrip, seg, expiry, token):
         })
     return spot, pd.DataFrame(rows).sort_values("Strike").reset_index(drop=True)
 
-# ============================================================
-# DUAL-FORCE ENGINE
-# ============================================================
 def analyze_gamma_ladder(df, spot):
     df = df.copy()
     df["total_gamma"] = df["CE_Gamma"].abs() * df["CE_OI"] + df["PE_Gamma"].abs() * df["PE_OI"]
@@ -123,9 +114,6 @@ def detect_iv_spike_vs_gamma_blast(df):
     else:
         return {"status": "BALANCED ACCUMULATION", "signal": "WAIT", "desc": "Market in range compression. Awaiting trigger."}
 
-# ============================================================
-# SIDEBAR
-# ============================================================
 with st.sidebar:
     st.markdown("### VIPUL TERMINAL v4.5")
     dhan_token = st.text_input("DHAN TOKEN", type="password", value=DEFAULT_DHAN_TOKEN)
@@ -145,9 +133,6 @@ spot, df = fetch_option_chain(info["scrip"], info["seg"], expiry, dhan_token)
 gamma_ladder = analyze_gamma_ladder(df, spot)
 analysis = detect_iv_spike_vs_gamma_blast(df)
 
-# ============================================================
-# HIGH-SPEED DASHBOARD INTERFACE
-# ============================================================
 st.markdown(f"## {idx_name} Spot: {spot:,.2f}")
 
 status = analysis["status"]
