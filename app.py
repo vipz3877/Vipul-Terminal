@@ -153,4 +153,4 @@ st.markdown(f"## 🏛️ {idx_name} Spot: `{spot:,.2f}`")
 # GIANT FLASH STATUS BANNER
 status = analysis["status"]
 if "BULLISH GAMMA BLAST" in status:
-    st.markdown(f'
+    st.markdown('
