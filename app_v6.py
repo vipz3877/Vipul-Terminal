@@ -1,5 +1,5 @@
 """
-VIPUL BLOOMBERG PROFESSIONAL TERMINAL v6.0
+VIPUL BLOOMBERG PROFESSIONAL TERMINAL v6.0 (RESTORED GROQ SIDEBAR)
 Unified: v5.0 engine (Gamma Blast / IV Spike, walls, traps, expected move)
        + v4.3 logic (OI battle, 3-min velocity, tiered bias, state gating,
                      Groq multi-agent council, signal validation, caching)
@@ -31,25 +31,7 @@ st.set_page_config(page_title="Vipul Bloomberg Terminal v6.0", layout="wide")
 # CSS
 # ============================================================
 st.markdown("""
-<style>
-.stApp { background-color:#000; color:#ff9800; font-family:'Courier New',monospace; }
-section[data-testid="stSidebar"] { background-color:#0b0b0b; border-right:1px solid #333; }
-h1,h2,h3,h4 { color:#ff9800 !important; font-family:'Courier New',monospace; letter-spacing:1px; }
-[data-testid="stMetricValue"] { color:#fff; }
-[data-testid="stMetricLabel"] { color:#ff9800; }
-.bbg-panel { border:1px solid #333; background:#0f0f0f; padding:14px; border-radius:4px; margin-bottom:12px; }
-.bbg-title { font-size:12px; color:#888; letter-spacing:2px; text-transform:uppercase; }
-.bbg-big { font-size:26px; font-weight:800; }
-.bbg-desc { font-size:14px; margin-top:6px; color:#ddd; }
-.agent { font-size:13px; color:#ddd; margin:4px 0; }
-.agent b { color:#ff9800; }
-@keyframes flashGreen { 0%,100% {box-shadow:0 0 0 rgba(0,230,118,0);} 50% {box-shadow:0 0 28px rgba(0,230,118,.9);} }
-@keyframes flashRed   { 0%,100% {box-shadow:0 0 0 rgba(255,23,68,0);} 50% {box-shadow:0 0 28px rgba(255,23,68,.9);} }
-@keyframes flashAmber { 0%,100% {box-shadow:0 0 0 rgba(255,171,0,0);} 50% {box-shadow:0 0 22px rgba(255,171,0,.8);} }
-.flash-green { animation: flashGreen 1s infinite; }
-.flash-red   { animation: flashRed 1s infinite; }
-.flash-amber { animation: flashAmber 1.4s infinite; }
-</style>
+
 """, unsafe_allow_html=True)
 
 
@@ -68,13 +50,13 @@ def get_secret(name, default=""):
 CLIENT_ID = get_secret("DHAN_CLIENT_ID", "1108425500")
 DEFAULT_DHAN_TOKEN = get_secret("DHAN_ACCESS_TOKEN", "")
 DEFAULT_GROQ_KEY = get_secret("GROQ_API_KEY", "")
-GROQ_MODEL = get_secret("GROQ_MODEL", "llama-3.3-70b-versatile")  # mixtral-8x7b-32768 is retired
+GROQ_MODEL = get_secret("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 OPTIONCHAIN_URL = "https://api.dhan.co/v2/optionchain"
 EXPIRY_URL = "https://api.dhan.co/v2/optionchain/expirylist"
 
-YEAR_DAYS = 365          # DTE is in calendar days. Set to 252 to match the v4.3 doc formula.
-VELOCITY_WINDOW_SEC = 150  # min seconds between OI snapshots for velocity
+YEAR_DAYS = 365
+VELOCITY_WINDOW_SEC = 150
 
 INDEX_MAP = {
     "NIFTY 50": {"scrip": 13, "seg": "IDX_I", "step": 50, "default_prev": 24500.0},
@@ -175,7 +157,6 @@ def calc_max_pain(df):
 
 
 def compute_bias(dce, dpe, spot, prev_close, pcr):
-    """Tiered bias score (v4.3), made symmetric for the bearish side."""
     score = 50
     if dce < -15000 and dpe > 10000:
         score += 25
@@ -264,7 +245,7 @@ def compute_metrics(df, spot, prev_close, expiry_str, step):
 
 
 # ============================================================
-# 3-MIN OI VELOCITY (session-state snapshots)
+# 3-MIN OI VELOCITY
 # ============================================================
 ZERO_VEL = {"ce_builds": 0.0, "ce_unwinds": 0.0, "pe_builds": 0.0, "pe_unwinds": 0.0}
 
@@ -333,13 +314,13 @@ def evaluate_market_state_change(m, vel):
 
 
 # ============================================================
-# GROQ MULTI-AGENT COUNCIL (single call)
+# GROQ MULTI-AGENT COUNCIL
 # ============================================================
 def run_council(m, vel, news, api_key):
     if Groq is None:
-        return {"error": "groq package not installed (add `groq` to requirements.txt)."}
+        return {"error": "groq package not installed."}
     if not api_key:
-        return {"error": "No GROQ API key set."}
+        return {"error": "No GROQ API key provided in sidebar."}
 
     strike_log = []
     for _, r in m["near"].iterrows():
@@ -390,10 +371,9 @@ Return ONLY this JSON:
 
 
 # ============================================================
-# SIGNAL VALIDATION (Risk Officer, done in code)
+# SIGNAL VALIDATION
 # ============================================================
 def build_signal(m, ai):
-    """Levels come from walls (deterministic). LLM only supplies signal + confidence."""
     sig = str(ai.get("signal", "WAIT")).upper()
     if sig not in ("BUY", "SELL", "WAIT"):
         sig = "WAIT"
@@ -429,7 +409,10 @@ def build_signal(m, ai):
 with st.sidebar:
     st.markdown("### BBG // TERMINAL CONFIG")
     dhan_token = st.text_input("DHAN TOKEN", type="password", value=DEFAULT_DHAN_TOKEN)
-    groq_key = st.text_input("GROQ API KEY", type="password", value=DEFAULT_GROQ_KEY)
+    
+    # RESTORED GROQ API KEY INPUT FIELD
+    groq_key = st.text_input("GROQ API KEY", type="password", value=DEFAULT_GROQ_KEY, help="Paste your Groq API key here to activate the AI Council.")
+    
     require_token(dhan_token)
 
     idx_name = st.selectbox("INDEX SELECTION", list(INDEX_MAP.keys()))
@@ -507,68 +490,3 @@ else:
     color, flash = "#90a4ae", ""
 
 st.markdown(f"""
-<div class="bbg-panel {flash}" style="border:2px solid {color};">
-  <div class="bbg-title">Dual-Force Engine</div>
-  <div class="bbg-big" style="color:{color};">{status} &nbsp;|&nbsp; {m['engine_signal']}</div>
-  <div class="bbg-desc">{m['desc']}</div>
-</div>""", unsafe_allow_html=True)
-
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("BIAS SCORE", f"{m['score']}/100", m["bias"])
-c2.metric("PCR", f"{m['pcr']:.2f}")
-c3.metric("EXPECTED MOVE (±)", f"{m['exp_move']:,.0f}", f"IV {m['atm_iv']:.1f}% | {m['dte']}d")
-c4.metric("OI BATTLE", m["battle"])
-
-c5, c6, c7, c8 = st.columns(4)
-c5.metric("CALL WALL", f"{m['call_wall']:,.0f}")
-c6.metric("PUT WALL", f"{m['put_wall']:,.0f}")
-c7.metric("MAX PAIN", f"{m['max_pain']:,.0f}")
-c8.metric("GAMMA STRIKE", f"{m['gamma_strike']:,.0f}", f"{m['gamma_strike'] - spot:+,.0f} vs spot")
-
-c9, c10, c11, c12 = st.columns(4)
-c9.metric("CE TRAP (RES)", f"{m['ce_trap']:,.0f}" if m["ce_trap"] else "—")
-c10.metric("PE TRAP (SUPP)", f"{m['pe_trap']:,.0f}" if m["pe_trap"] else "—")
-c11.metric("NET CE OI Δ", f"{m['dce']:+,.0f}")
-c12.metric("NET PE OI Δ", f"{m['dpe']:+,.0f}")
-
-st.markdown("#### 3-MIN OI VELOCITY (near spot)")
-v1, v2, v3, v4 = st.columns(4)
-v1.metric("CE BUILDS", f"{vel['ce_builds']:,.0f}")
-v2.metric("CE UNWINDS", f"{vel['ce_unwinds']:,.0f}")
-v3.metric("PE BUILDS", f"{vel['pe_builds']:,.0f}")
-v4.metric("PE UNWINDS", f"{vel['pe_unwinds']:,.0f}")
-if sum(vel.values()) == 0:
-    st.caption("Velocity needs two snapshots ~3 min apart. It will populate after the next refresh.")
-
-st.markdown("#### AI COUNCIL")
-st.caption(f"Gate: {gate_label}")
-if "error" in ai and "signal" not in ai:
-    st.warning(ai["error"])
-else:
-    sig = build_signal(m, ai)
-    scolor = {"BUY": "#00e676", "SELL": "#ff1744"}.get(sig["signal"], "#90a4ae")
-    lv = ""
-    if sig["target"] is not None:
-        rr_txt = f"1:{sig['rr']:.1f}" if sig["rr"] else "n/a"
-        lv = (f"Entry {sig['entry']:,.0f} &nbsp;|&nbsp; Target {sig['target']:,.0f} &nbsp;|&nbsp; "
-              f"SL {sig['sl']:,.0f} &nbsp;|&nbsp; R:R {rr_txt}")
-    st.markdown(f"""
-    <div class="bbg-panel" style="border:2px solid {scolor};">
-      <div class="bbg-title">Risk-Validated Signal</div>
-      <div class="bbg-big" style="color:{scolor};">{sig['signal']} &nbsp;|&nbsp; Confidence {sig['confidence']}%</div>
-      <div class="bbg-desc">{lv}</div>
-      <div class="bbg-desc" style="color:#ffab00;">{sig['note']}</div>
-    </div>""", unsafe_allow_html=True)
-    st.markdown(f"""
-    <div class="bbg-panel">
-      <div class="agent"><b>Price Action:</b> {ai.get('price_action_agent', '-')}</div>
-      <div class="agent"><b>Order Flow:</b> {ai.get('order_flow_agent', '-')}</div>
-      <div class="agent"><b>Volatility:</b> {ai.get('volatility_agent', '-')}</div>
-      <div class="agent"><b>Sentiment:</b> {ai.get('news_agent', '-')}</div>
-      <div class="agent"><b>Risk Officer:</b> {ai.get('final_approval', '-')}</div>
-    </div>""", unsafe_allow_html=True)
-
-st.caption(f"1σ range: {m['lower_1sigma']:,.0f} to {m['upper_1sigma']:,.0f}  |  Updated {datetime.now().strftime('%H:%M:%S')}")
-
-with st.expander("OPTION CHAIN DATA"):
-    st.dataframe(m["df"], use_container_width=True)
