@@ -268,7 +268,7 @@ def update_oi_velocity(m, key):
         if stk not in snap["map"]:
             continue
         p_ce, p_pe = snap["map"][stk]
-        d_ce, d_pe = c_ce - p_ce, c_pe - p_pe
+        d_ce, d_pe = c_ce - p_ce, c_ce - p_pe
         if d_ce > 0:
             vel["ce_builds"] += d_ce
         elif d_ce < 0:
