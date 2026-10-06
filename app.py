@@ -1,9 +1,8 @@
 """
-🏛️ VIPUL PROFESSIONAL TERMINAL v4.3 (REAL-TIME OI UNWINDING + GREEKS)
-Institutional Option Chain Surveillance Engine
-- Real-Time OI Unwinding & Writer Panic Tracking (Negative OI Exits)
-- Delta-Weighted Greeks Flow Velocity
-- Multi-Strike Chain Breadth Confluence (Single-Strike Trap Filter)
+🏛️ VIPUL PROFESSIONAL TERMINAL v4.4 (IV SPIKE vs GAMMA BLAST ENGINE)
+Option Chain Institutional Surveillance for Option Buyers
+- Dual-Force Gamma Blast Detection (Bullish/Bearish)
+- IV Spike & Single-Side Trap Filter
 - Gamma Ladder Mapping & Dynamic Trade Levels
 """
 
@@ -35,7 +34,7 @@ try:
 except ImportError:
     st_autorefresh = None
 
-st.set_page_config(page_title="Vipul Professional v4.3", layout="wide")
+st.set_page_config(page_title="Vipul Professional v4.4", layout="wide")
 
 st.markdown("""
 
@@ -124,7 +123,7 @@ def fetch_option_chain(scrip, seg, expiry, token):
     return spot, pd.DataFrame(rows).sort_values("Strike").reset_index(drop=True)
 
 # ============================================================
-# INSTITUTIONAL LAYERS: REAL-TIME OI UNWINDING + GREEKS
+# INSTITUTIONAL LAYER: IV SPIKE (TRAP) vs DUAL-FORCE GAMMA BLAST
 # ============================================================
 def analyze_gamma_ladder(df, spot):
     df = df.copy()
@@ -143,65 +142,72 @@ def analyze_gamma_ladder(df, spot):
         "gamma_symmetry": "SYMMETRIC" if abs(sum(df[df["Strike"] > spot]["total_gamma"]) - sum(df[df["Strike"] < spot]["total_gamma"])) / total_g < 0.1 else "ASYMMETRIC"
     }
 
-def analyze_realtime_oi_and_greeks(df):
+def detect_iv_spike_vs_gamma_blast(df):
     """
-    Combines Real-Time OI Unwinding (writer panic/exits) with Greeks velocity:
-    1. Tracks negative OI changes (writers exiting/squeezed).
-    2. Weights changes using Delta probabilities across multiple strikes (Chain Breadth).
+    Strict Dual-Force Video Logic:
+    - IV SPIKE (Trap): One-sided short covering / exit without aggressive opposing buildup.
+    - GAMMA BLAST (Explosion): Dual Force Act -> Call writers exiting while Put writers aggressively build (Bullish Blast) 
+      OR Put writers exiting while Call writers aggressively build (Bearish Blast).
     """
     df = df.copy()
     df["CE_OI_Chg"] = df["CE_OI"] - df["CE_PrevOI"]
     df["PE_OI_Chg"] = df["PE_OI"] - df["PE_PrevOI"]
 
-    # Writer panic / unwinding totals (Negative change = exiting positions)
-    ce_unwinding = df[df["CE_OI_Chg"] < 0]["CE_OI_Chg"].sum()
-    pe_unwinding = df[df["PE_OI_Chg"] < 0]["PE_OI_Chg"].sum()
+    ce_exits = df[df["CE_OI_Chg"] < -1000]["CE_OI_Chg"].sum()  # Call writers exiting
+    pe_exits = df[df["PE_OI_Chg"] < -1000]["PE_OI_Chg"].sum()  # Put writers exiting
 
-    ce_building = df[df["CE_OI_Chg"] > 0]["CE_OI_Chg"].sum()
-    pe_building = df[df["PE_OI_Chg"] > 0]["PE_OI_Chg"].sum()
+    ce_build = df[df["CE_OI_Chg"] > 1000]["CE_OI_Chg"].sum()   # Call writers building
+    pe_build = df[df["PE_OI_Chg"] > 1000]["PE_OI_Chg"].sum()   # Put writers building
 
-    # Delta-weighted momentum velocity
-    df["CE_delta_flow"] = df["CE_OI_Chg"] * df["CE_Delta"].abs()
-    df["PE_delta_flow"] = df["PE_OI_Chg"] * df["PE_Delta"].abs()
-
-    net_ce_flow = df["CE_delta_flow"].sum()
-    net_pe_flow = df["PE_delta_flow"].sum()
-
-    # Chain Breadth: Verify participation across multiple consecutive strikes
-    active_ce_strikes = (df["CE_OI_Chg"] < -1000).sum()
-    active_pe_strikes = (df["PE_OI_Chg"] < -1000).sum()
-    breadth_confirmed = (active_ce_strikes >= 2) or (active_pe_strikes >= 2)
-
-    # Signal logic based strictly on writer panic (unwinding) + Greeks flow + breadth
-    if ce_unwinding < -3000 and pe_building > 3000 and breadth_confirmed:
+    # DUAL FORCE BULLISH GAMMA BLAST: Call writers exiting + Put writers aggressively building
+    if ce_exits < -3000 and pe_build > 3000:
+        status = "BULLISH GAMMA BLAST"
         signal = "BUY"
-        conviction = "STRONG (Call Writers Unwinding / Put Writers Aggressive)"
-    elif pe_unwinding < -3000 and ce_building > 3000 and breadth_confirmed:
+        description = "Dual-Force Active: Call writers trapped/exiting + Put writers aggressively building. Gamma explosion likely."
+        confidence = 95
+    # DUAL FORCE BEARISH GAMMA BLAST: Put writers exiting + Call writers aggressively building
+    elif pe_exits < -3000 and ce_build > 3000:
+        status = "BEARISH GAMMA BLAST"
         signal = "SELL"
-        conviction = "STRONG (Put Writers Unwinding / Call Writers Aggressive)"
-    else:
+        description = "Dual-Force Active: Put writers trapped/exiting + Call writers aggressively building. Downside gamma blast active."
+        confidence = 95
+    # SINGLE SIDED IV SPIKE / TRAP WARNING
+    elif ce_exits < -3000 and pe_build <= 1000:
+        status = "IV SPIKE (BULL TRAP)"
         signal = "WAIT"
-        conviction = "Balanced OI / Single-Strike Trap (Awaiting Multi-Strike Unwinding)"
+        description = "Single-side Call exit detected without Put support. Temporary IV spike risk; potential bull trap."
+        confidence = 40
+    elif pe_exits < -3000 and ce_build <= 1000:
+        status = "IV SPIKE (BEAR TRAP)"
+        signal = "WAIT"
+        description = "Single-side Put exit detected without Call support. Temporary IV spike risk; potential bear trap."
+        confidence = 40
+    else:
+        status = "BALANCED / ACCUMULATION"
+        signal = "WAIT"
+        description = "No explosive dual-force gamma blast or IV spike trap detected. Awaiting institutional trigger."
+        confidence = 0
 
     return {
+        "status": status,
         "signal": signal,
-        "conviction": conviction,
-        "ce_unwinding": ce_unwinding,
-        "pe_unwinding": pe_unwinding,
-        "net_ce_flow": round(net_ce_flow, 2),
-        "net_pe_flow": round(net_pe_flow, 2),
-        "breadth_confirmed": breadth_confirmed
+        "description": description,
+        "confidence": confidence,
+        "ce_exits": ce_exits,
+        "pe_exits": pe_exits,
+        "ce_build": ce_build,
+        "pe_build": pe_build
     }
 
 # ============================================================
-# MASTER PROFESSIONAL SIGNAL GENERATOR
+# MASTER SIGNAL GENERATOR
 # ============================================================
 def generate_professional_signal(df, spot, prev_close, step):
     gamma_ladder = analyze_gamma_ladder(df, spot)
-    oi_greeks = analyze_realtime_oi_and_greeks(df)
+    blast_analysis = detect_iv_spike_vs_gamma_blast(df)
 
-    final_signal = oi_greeks["signal"]
-    confidence = 90 if final_signal != "WAIT" else 0
+    final_signal = blast_analysis["signal"]
+    confidence = blast_analysis["confidence"]
 
     max_gamma = gamma_ladder["max_gamma_strike"]
     if final_signal == "BUY":
@@ -226,7 +232,7 @@ def generate_professional_signal(df, spot, prev_close, step):
         "target": round(target, 2),
         "stop_loss": round(stop_loss, 2),
         "risk_reward": rr,
-        "oi_greeks": oi_greeks,
+        "blast_analysis": blast_analysis,
         "gamma_ladder": gamma_ladder
     }
 
@@ -234,8 +240,8 @@ def generate_professional_signal(df, spot, prev_close, step):
 # UI INTERFACE
 # ============================================================
 with st.sidebar:
-    st.markdown("### 🏛️ VIPUL PROFESSIONAL v4.3")
-    st.caption("Real-Time OI Unwinding + Greeks")
+    st.markdown("### 🏛️ VIPUL PROFESSIONAL v4.4")
+    st.caption("IV Spike vs Gamma Blast Engine")
     st.divider()
     
     dhan_token = st.text_input("DHAN TOKEN", type="password", value=DEFAULT_DHAN_TOKEN)
@@ -277,26 +283,30 @@ result = generate_professional_signal(df, spot, prev_close, info["step"])
 # DISPLAY DASHBOARD
 # ============================================================
 st.markdown(f"# 🏛️ {idx_name} : {spot:,.2f}")
-st.caption(f"Institutional Real-Time OI & Greeks Terminal • {expiry} • {datetime.now():%H:%M:%S} IST")
+st.caption(f"Gamma Blast & IV Spike Terminal • {expiry} • {datetime.now():%H:%M:%S} IST")
 
 sig = result["signal"]
-if sig == "BUY":
-    st.success(f"### 🟢 SIGNAL: BUY | CONFIDENCE: {result['confidence']}% | ENTRY: {result['entry']} | TARGET: {result['target']} | STOP LOSS: {result['stop_loss']} | R:R: {result['risk_reward']}")
-elif sig == "SELL":
-    st.error(f"### 🔴 SIGNAL: SELL | CONFIDENCE: {result['confidence']}% | ENTRY: {result['entry']} | TARGET: {result['target']} | STOP LOSS: {result['stop_loss']} | R:R: {result['risk_reward']}")
+ba = result["blast_analysis"]
+
+if "GAMMA BLAST" in ba["status"]:
+    if sig == "BUY":
+        st.success(f"### 🚀 {ba['status']} DETECTED | CONFIDENCE: {result['confidence']}% | ENTRY: {result['entry']} | TARGET: {result['target']} | STOP LOSS: {result['stop_loss']} | R:R: {result['risk_reward']}")
+    else:
+        st.error(f"### 🚀 {ba['status']} DETECTED | CONFIDENCE: {result['confidence']}% | ENTRY: {result['entry']} | TARGET: {result['target']} | STOP LOSS: {result['stop_loss']} | R:R: {result['risk_reward']}")
+elif "IV SPIKE" in ba["status"]:
+    st.warning(f"### ⚠️ {ba['status']} — Single-side short covering. High risk of false trap! Stand aside.")
 else:
-    st.warning(f"### 🟡 STATUS: WAIT — Awaiting institutional writer panic/unwinding confirmation across multi-strike chain breadth.")
+    st.warning(f"### 🟡 STATUS: {ba['status']} — Awaiting Dual-Force institutional trigger.")
 
 st.markdown("---")
-st.markdown("### 📊 Real-Time OI Unwinding & Greeks Breakdown")
+st.markdown("### 📊 Dual-Force Gamma Blast & Trap Detector Breakdown")
 
 c1, c2 = st.columns(2)
 with c1:
-    og = result['oi_greeks']
-    st.info(f"**OI Unwinding & Writer Panic Matrix**\n- Call Unwinding (Exits): {og['ce_unwinding']:+,.0f}\n- Put Unwinding (Exits): {og['pe_unwinding']:+,.0f}\n- Breadth Confirmed: {og['breadth_confirmed']}\n- Status: {og['conviction']}")
+    st.info(f"**Market Structure & Trap Status**\n- Current State: **{ba['status']}**\n- Call Exits (Covering): {ba['ce_exits']:+,.0f}\n- Put Exits (Covering): {ba['pe_exits']:+,.0f}\n- Call Building: {ba['ce_build']:+,.0f}\n- Put Building: {ba['pe_build']:+,.0f}\n- **Rule Analysis:** {ba['description']}")
 with c2:
     gl = result['gamma_ladder']
-    st.info(f"**Gamma Ladder Map**\n- Max Gamma Strike: {gl['max_gamma_strike']:,.0f}\n- Concentration: {gl['gamma_concentration']*100:.1f}%\n- Symmetry: {gl['gamma_symmetry']}")
+    st.info(f"**Gamma Ladder Anchor**\n- Max Gamma Strike: {gl['max_gamma_strike']:,.0f}\n- Concentration: {gl['gamma_concentration']*100:.1f}%\n- Symmetry: {gl['gamma_symmetry']}")
 
 st.markdown("---")
-st.caption(f"Vipul Professional Terminal v4.3 • Last Scan: {datetime.now():%H:%M:%S} IST")
+st.caption(f"Vipul Professional Terminal v4.4 • Last Scan: {datetime.now():%H:%M:%S} IST")
