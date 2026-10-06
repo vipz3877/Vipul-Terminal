@@ -56,7 +56,7 @@ def auth_headers(token):
 
 def require_token(token):
     if not token:
-        st.error("❌ DHAN Token required. Paste it in the sidebar.")
+        st.error("DHAN Token required. Paste it in the sidebar.")
         st.stop()
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -113,21 +113,21 @@ def detect_iv_spike_vs_gamma_blast(df):
     pe_build = df[df["PE_OI_Chg"] > 1000]["PE_OI_Chg"].sum()
 
     if ce_exits < -3000 and pe_build > 3000:
-        return {"status": "BULLISH GAMMA BLAST", "signal": "BUY", "desc": "Call writers capitulating + Put writers aggressively building floors."}
+        return {"status": "BULLISH GAMMA BLAST", "signal": "BUY", "desc": "Call writers capitulating and Put writers building floors."}
     elif pe_exits < -3000 and ce_build > 3000:
-        return {"status": "BEARISH GAMMA BLAST", "signal": "SELL", "desc": "Put writers capitulating + Call writers aggressively building ceilings."}
+        return {"status": "BEARISH GAMMA BLAST", "signal": "SELL", "desc": "Put writers capitulating and Call writers building ceilings."}
     elif ce_exits < -3000 and pe_build <= 1000:
-        return {"status": "IV SPIKE (BULL TRAP)", "signal": "WAIT", "desc": "Isolated Call short-covering without Put support. High trap risk!"}
+        return {"status": "IV SPIKE BULL TRAP", "signal": "WAIT", "desc": "Isolated Call short covering without Put support. Trap risk."}
     elif pe_exits < -3000 and ce_build <= 1000:
-        return {"status": "IV SPIKE (BEAR TRAP)", "signal": "WAIT", "desc": "Isolated Put short-covering without Call support. High trap risk!"}
+        return {"status": "IV SPIKE BEAR TRAP", "signal": "WAIT", "desc": "Isolated Put short covering without Call support. Trap risk."}
     else:
-        return {"status": "BALANCED ACCUMULATION", "signal": "WAIT", "desc": "Market in range compression. Awaiting institutional trigger."}
+        return {"status": "BALANCED ACCUMULATION", "signal": "WAIT", "desc": "Market in range compression. Awaiting trigger."}
 
 # ============================================================
 # SIDEBAR
 # ============================================================
 with st.sidebar:
-    st.markdown("### 🏛️ VIPUL TERMINAL v4.5")
+    st.markdown("### VIPUL TERMINAL v4.5")
     dhan_token = st.text_input("DHAN TOKEN", type="password", value=DEFAULT_DHAN_TOKEN)
     idx_name = st.selectbox("INDEX", list(INDEX_MAP.keys()))
     info = INDEX_MAP[idx_name]
@@ -148,9 +148,8 @@ analysis = detect_iv_spike_vs_gamma_blast(df)
 # ============================================================
 # HIGH-SPEED DASHBOARD INTERFACE
 # ============================================================
-st.markdown(f"## 🏛️ {idx_name} Spot: `{spot:,.2f}`")
+st.markdown(f"## {idx_name} Spot: {spot:,.2f}")
 
-# GIANT FLASH STATUS BANNER
 status = analysis["status"]
 if "BULLISH GAMMA BLAST" in status:
     st.markdown('
