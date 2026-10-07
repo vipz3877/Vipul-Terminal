@@ -13,6 +13,8 @@ Fixes in v7.1
  - build_signal now enforces a minimum R:R instead of a near-useless ordering check.
  - AI text is HTML-escaped before rendering.
  - Minimum gap between option-chain calls (Dhan limit: ~1 request / 3 sec).
+ - Dual-Force engine v2: near-spot strikes only, thresholds relative to OI (%), dominance test,
+   CONFLICTED state, and full flow breakdown passed to the AI Council.
 """
 
 import os
@@ -100,6 +102,9 @@ YEAR_DAYS = 365
 VELOCITY_WINDOW_SEC = 150
 MIN_CHAIN_GAP_SEC = 3.0   # Dhan option chain limit: ~1 request / 3 sec
 MIN_RR = 1.0              # minimum reward:risk to accept a BUY/SELL
+MIN_FLOW_PCT = 2.0        # a side's OI change must be >= this % of its near-spot total OI to count
+NOISE_PCT = 0.5           # ignore single strikes whose change is < this % of that side's near-spot OI
+DOMINANCE = 1.5           # winning force must be >= this multiple of the opposing force
 
 INDEX_MAP = {
     "NIFTY 50": {"scrip": 13, "seg": "IDX_I", "step": 50, "default_prev": 24500.0},
@@ -261,29 +266,77 @@ def compute_bias(dce, dpe, spot, prev_close, pcr):
     return score, label
 
 
-def engine_sums(df):
-    """The four sums the Dual-Force engine decides on (strikes with |chg| > 1000 only)."""
-    return {
-        "ce_exits": float(df[df["CE_OI_Chg"] < -1000]["CE_OI_Chg"].sum()),
-        "pe_exits": float(df[df["PE_OI_Chg"] < -1000]["PE_OI_Chg"].sum()),
-        "ce_build": float(df[df["CE_OI_Chg"] > 1000]["CE_OI_Chg"].sum()),
-        "pe_build": float(df[df["PE_OI_Chg"] > 1000]["PE_OI_Chg"].sum()),
-    }
+def engine_sums(near):
+    """
+    Dual-Force inputs, computed on NEAR-SPOT strikes only and expressed relative to OI.
+    Quantities are summed over strikes whose change exceeds NOISE_PCT of that side's near-spot OI.
+    Percentages are |quantity| / that side's total near-spot OI * 100.
+    """
+    out = {k: 0.0 for k in ("ce_exits", "pe_exits", "ce_build", "pe_build",
+                            "ce_exit_pct", "pe_exit_pct", "ce_build_pct", "pe_build_pct",
+                            "ce_net_flow", "pe_net_flow", "bull_force", "bear_force", "force_ratio",
+                            "ce_oi_near", "pe_oi_near")}
+    if near is None or near.empty:
+        return out
+
+    ce_tot = float(near["CE_OI"].sum())
+    pe_tot = float(near["PE_OI"].sum())
+    ce_noise = ce_tot * NOISE_PCT / 100.0
+    pe_noise = pe_tot * NOISE_PCT / 100.0
+
+    ce_chg, pe_chg = near["CE_OI_Chg"], near["PE_OI_Chg"]
+    out["ce_exits"] = float(ce_chg[ce_chg < -ce_noise].sum())
+    out["pe_exits"] = float(pe_chg[pe_chg < -pe_noise].sum())
+    out["ce_build"] = float(ce_chg[ce_chg > ce_noise].sum())
+    out["pe_build"] = float(pe_chg[pe_chg > pe_noise].sum())
+    out["ce_oi_near"], out["pe_oi_near"] = ce_tot, pe_tot
+
+    pct = lambda q, tot: abs(q) / tot * 100.0 if tot > 0 else 0.0
+    out["ce_exit_pct"] = pct(out["ce_exits"], ce_tot)
+    out["pe_exit_pct"] = pct(out["pe_exits"], pe_tot)
+    out["ce_build_pct"] = pct(out["ce_build"], ce_tot)
+    out["pe_build_pct"] = pct(out["pe_build"], pe_tot)
+
+    # Net flow per side (positive = that side is adding OI)
+    out["ce_net_flow"] = out["ce_build"] + out["ce_exits"]
+    out["pe_net_flow"] = out["pe_build"] + out["pe_exits"]
+
+    # Bullish force = puts building + calls leaving; bearish force = calls building + puts leaving
+    out["bull_force"] = out["pe_build_pct"] + out["ce_exit_pct"]
+    out["bear_force"] = out["ce_build_pct"] + out["pe_exit_pct"]
+    hi, lo = max(out["bull_force"], out["bear_force"]), min(out["bull_force"], out["bear_force"])
+    out["force_ratio"] = (hi / lo) if lo > 0 else (999.0 if hi > 0 else 1.0)
+    return out
 
 
-def detect_gamma_blast(df):
-    sums = engine_sums(df)
-    ce_exits, pe_exits = sums["ce_exits"], sums["pe_exits"]
-    ce_build, pe_build = sums["ce_build"], sums["pe_build"]
+def detect_gamma_blast(near):
+    e = engine_sums(near)
+    if near is None or near.empty:
+        return "BALANCED ACCUMULATION", "WAIT", "No near-spot strikes available."
 
-    if ce_exits < -3000 and pe_build > 3000:
-        return "BULLISH GAMMA BLAST", "BUY", "Call writers capitulating + Put writers building floors."
-    if pe_exits < -3000 and ce_build > 3000:
-        return "BEARISH GAMMA BLAST", "SELL", "Put writers capitulating + Call writers building ceilings."
-    if ce_exits < -3000 and pe_build <= 1000:
-        return "IV SPIKE BULL TRAP", "WAIT", "Isolated Call short covering without Put support. Trap risk."
-    if pe_exits < -3000 and ce_build <= 1000:
-        return "IV SPIKE BEAR TRAP", "WAIT", "Isolated Put short covering without Call support. Trap risk."
+    base_bull = e["ce_exit_pct"] >= MIN_FLOW_PCT and e["pe_build_pct"] >= MIN_FLOW_PCT
+    base_bear = e["pe_exit_pct"] >= MIN_FLOW_PCT and e["ce_build_pct"] >= MIN_FLOW_PCT
+    bull_ok = base_bull and e["bull_force"] >= DOMINANCE * e["bear_force"]
+    bear_ok = base_bear and e["bear_force"] >= DOMINANCE * e["bull_force"]
+
+    if bull_ok:
+        return ("BULLISH GAMMA BLAST", "BUY",
+                f"Call writers exiting ({e['ce_exit_pct']:.1f}%) + put writers building ({e['pe_build_pct']:.1f}%); "
+                f"bull force {e['bull_force']:.1f} vs bear {e['bear_force']:.1f}.")
+    if bear_ok:
+        return ("BEARISH GAMMA BLAST", "SELL",
+                f"Put writers exiting ({e['pe_exit_pct']:.1f}%) + call writers building ({e['ce_build_pct']:.1f}%); "
+                f"bear force {e['bear_force']:.1f} vs bull {e['bull_force']:.1f}.")
+    if base_bull or base_bear:
+        return ("CONFLICTED", "WAIT",
+                f"Opposing flows both active with no clear winner (bull force {e['bull_force']:.1f} vs "
+                f"bear force {e['bear_force']:.1f}, ratio {e['force_ratio']:.2f} < {DOMINANCE}). Stand aside.")
+
+    weak = MIN_FLOW_PCT / 2.0
+    if e["ce_exit_pct"] >= MIN_FLOW_PCT and e["pe_build_pct"] < weak:
+        return "IV SPIKE BULL TRAP", "WAIT", "Isolated call short covering without put support. Trap risk."
+    if e["pe_exit_pct"] >= MIN_FLOW_PCT and e["ce_build_pct"] < weak:
+        return "IV SPIKE BEAR TRAP", "WAIT", "Isolated put short covering without call support. Trap risk."
     return "BALANCED ACCUMULATION", "WAIT", "Market in range compression. Awaiting trigger."
 
 
@@ -351,7 +404,8 @@ def compute_metrics(df, spot, prev_close, expiry_str, step):
             pe_trap = float(near.loc[j, "Strike"]) - 35
 
     score, bias = compute_bias(dce, dpe, spot, prev_close, pcr)
-    status, signal, desc = detect_gamma_blast(df)
+    status, signal, desc = detect_gamma_blast(near)
+    engine = engine_sums(near)
     jobber = calculate_jobber_microstructure(df, spot)
 
     return {
@@ -362,7 +416,7 @@ def compute_metrics(df, spot, prev_close, expiry_str, step):
         "gamma_strike": gamma_strike, "call_wall": call_wall, "put_wall": put_wall, "max_pain": max_pain,
         "ce_trap": ce_trap, "pe_trap": pe_trap,
         "score": score, "bias": bias, "status": status, "engine_signal": signal, "desc": desc,
-        "jobber": jobber,
+        "jobber": jobber, "engine": engine,
     }
 
 
@@ -444,6 +498,7 @@ def run_council(m, vel, news, api_key, model):
     if not api_key:
         return {"error": "No GROQ API key provided in sidebar."}
 
+    eg = m["engine"]
     strike_log = []
     for _, r in m["near"].iterrows():
         strike_log.append(
@@ -458,6 +513,11 @@ MARKET DATA:
 - Spot: {m['spot']:.2f} | PCR: {m['pcr']:.3f} | Bias: {m['bias']} (score {m['score']}/100)
 - Jobber Microstructure: Ladder Imbalance={m['jobber']['ladder_imbalance']}, Pocket Support={m['jobber']['pocket_support']}, Micro-Turn={m['jobber']['micro_turn']}
 - Engine status: {m['status']} | OI battle: {m['battle']}
+- Dual-Force flow (near-spot strikes only, % = share of that side's near-spot OI):
+  CE exits {eg['ce_exits']:,.0f} ({eg['ce_exit_pct']:.1f}%) | CE builds {eg['ce_build']:,.0f} ({eg['ce_build_pct']:.1f}%) | CE net flow {eg['ce_net_flow']:+,.0f}
+  PE exits {eg['pe_exits']:,.0f} ({eg['pe_exit_pct']:.1f}%) | PE builds {eg['pe_build']:,.0f} ({eg['pe_build_pct']:.1f}%) | PE net flow {eg['pe_net_flow']:+,.0f}
+  Bull force {eg['bull_force']:.1f} vs Bear force {eg['bear_force']:.1f} (ratio {eg['force_ratio']:.2f}; a winner needs >= {DOMINANCE})
+- Whole-chain net OI change: CE {m['dce']:+,.0f} | PE {m['dpe']:+,.0f} (compare net call vs net put writing before claiming either side is unwinding)
 - Expected Move: +/-{m['exp_move']} pts [{m['lower_1sigma']} - {m['upper_1sigma']}] | ATM IV {m['atm_iv']:.1f}% | DTE {m['dte']}
 - Call Wall: {m['call_wall']:.0f} | Put Wall: {m['put_wall']:.0f} | Max Pain: {m['max_pain']:.0f} | Gamma strike: {m['gamma_strike']:.0f}
 - 35pt traps: CE resistance={m['ce_trap']} | PE support={m['pe_trap']}
@@ -471,7 +531,7 @@ AGENTS:
 2. Order Flow Agent: OI changes and 35pt traps
 3. Volatility Agent: IV regime, DTE decay, gamma
 4. Sentiment Agent: news impact on direction
-5. Risk Officer: final approval; reject if evidence is conflicting
+5. Risk Officer: final approval; reject if evidence is conflicting or engine status is CONFLICTED
 
 Return ONLY this JSON:
 {{"price_action_agent":"1 sentence","order_flow_agent":"1 sentence","volatility_agent":"1 sentence",
@@ -668,7 +728,7 @@ if "BULLISH GAMMA BLAST" in status:
     color, flash = "#00e676", "flash-green"
 elif "BEARISH GAMMA BLAST" in status:
     color, flash = "#ff1744", "flash-red"
-elif "TRAP" in status:
+elif "TRAP" in status or "CONFLICTED" in status:
     color, flash = "#ffab00", "flash-amber"
 else:
     color, flash = "#90a4ae", ""
@@ -685,15 +745,19 @@ if abs(prev_close - spot) / spot > 0.05:
                "It is probably stale or wrong, and it skews the BIAS SCORE.")
 
 # ---- ENGINE DEBUG ROW ----
-es = engine_sums(m["df"])
-st.caption("DUAL-FORCE ENGINE INPUTS (OI change summed over strikes with |chg| > 1,000)")
+es = m["engine"]
+st.caption(f"DUAL-FORCE ENGINE INPUTS (near-spot strikes, % of that side's OI | each leg needs >= {MIN_FLOW_PCT:.1f}%)")
 d1, d2, d3, d4 = st.columns(4)
-d1.metric("CE EXITS", f"{es['ce_exits']:+,.0f}", "needs < -3,000", delta_color="off")
-d2.metric("PE BUILDS", f"{es['pe_build']:+,.0f}", "needs > +3,000", delta_color="off")
-d3.metric("PE EXITS", f"{es['pe_exits']:+,.0f}", "needs < -3,000", delta_color="off")
-d4.metric("CE BUILDS", f"{es['ce_build']:+,.0f}", "needs > +3,000", delta_color="off")
-st.caption("Bullish blast = CE EXITS and PE BUILDS both hit. Bearish blast = PE EXITS and CE BUILDS both hit. "
-           "Trap = one side exits while the opposite build is <= 1,000.")
+d1.metric("CE EXITS", f"{es['ce_exit_pct']:.1f}%", f"{es['ce_exits']:+,.0f} qty", delta_color="off")
+d2.metric("PE BUILDS", f"{es['pe_build_pct']:.1f}%", f"{es['pe_build']:+,.0f} qty", delta_color="off")
+d3.metric("PE EXITS", f"{es['pe_exit_pct']:.1f}%", f"{es['pe_exits']:+,.0f} qty", delta_color="off")
+d4.metric("CE BUILDS", f"{es['ce_build_pct']:.1f}%", f"{es['ce_build']:+,.0f} qty", delta_color="off")
+f1, f2, f3 = st.columns(3)
+f1.metric("BULL FORCE (PE build + CE exit)", f"{es['bull_force']:.1f}")
+f2.metric("BEAR FORCE (CE build + PE exit)", f"{es['bear_force']:.1f}")
+f3.metric("FORCE RATIO", f"{min(es['force_ratio'], 99):.2f}x", f"winner needs >= {DOMINANCE}x", delta_color="off")
+st.caption("Bullish blast = CE exits + PE builds both >= threshold AND bull force >= 1.5x bear force. "
+           "Bearish blast = mirror image. Both sides active with no clear winner = CONFLICTED | WAIT.")
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("BIAS SCORE", f"{m['score']}/100", m["bias"])
