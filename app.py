@@ -1,12 +1,25 @@
 """
-VIPUL BLOOMBERG PROFESSIONAL TERMINAL v7.0
+VIPUL BLOOMBERG PROFESSIONAL TERMINAL v7.1 (debugged)
 Unified: v5.0/v6.0 engine (Gamma Blast / IV Spike, walls, traps, expected move, AI Council)
-       + Jobber Microstructure Engine (Immediate ladder imbalance, pocket support, micro-turns)
+       + Jobber Microstructure Engine (ladder imbalance, pocket support, micro-turns)
+
+Fixes in v7.1
+ - Client ID is now an editable sidebar input and is passed to every API call
+   (it used to be a hardcoded fallback that st.secrets could silently override).
+ - Token is sanitised (whitespace / quotes / "Bearer " prefix removed).
+ - API errors now show Dhan's real response body instead of a bare "401".
+ - Diagnostics panel with a /v2/profile token test.
+ - OI velocity bug fixed (PE delta used CE current OI).
+ - build_signal now enforces a minimum R:R instead of a near-useless ordering check.
+ - AI text is HTML-escaped before rendering.
+ - Minimum gap between option-chain calls (Dhan limit: ~1 request / 3 sec).
 """
 
 import os
 import json
 import math
+import html
+import time
 from datetime import datetime, date
 
 import numpy as np
@@ -24,7 +37,7 @@ try:
 except ImportError:
     Groq = None
 
-st.set_page_config(page_title="Vipul Bloomberg Terminal v7.0", layout="wide")
+st.set_page_config(page_title="Vipul Bloomberg Terminal v7.1", layout="wide")
 
 # ============================================================
 # CSS
@@ -58,22 +71,34 @@ h1,h2,h3,h4 { color:#ff9800 !important; font-family:'Courier New',monospace; let
 def get_secret(name, default=""):
     try:
         if name in st.secrets:
-            return st.secrets[name]
+            return str(st.secrets[name])
     except Exception:
         pass
     return os.getenv(name, default)
 
 
-CLIENT_ID = get_secret("DHAN_CLIENT_ID", "1108425500")
-DEFAULT_DHAN_TOKEN = get_secret("DHAN_ACCESS_TOKEN", "")
-DEFAULT_GROQ_KEY = get_secret("GROQ_API_KEY", "")
+def clean(s):
+    """Remove whitespace, quotes and an accidental 'Bearer ' prefix."""
+    s = (s or "").strip().strip('"').strip("'").strip()
+    if s.lower().startswith("bearer "):
+        s = s[7:].strip()
+    return s.replace("\n", "").replace("\r", "").replace(" ", "")
+
+
+DEFAULT_CLIENT_ID = clean(get_secret("DHAN_CLIENT_ID", "1108425500"))
+DEFAULT_DHAN_TOKEN = clean(get_secret("DHAN_ACCESS_TOKEN", ""))
+DEFAULT_GROQ_KEY = get_secret("GROQ_API_KEY", "").strip()
 GROQ_MODEL = get_secret("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-OPTIONCHAIN_URL = "https://api.dhan.co/v2/optionchain"
-EXPIRY_URL = "https://api.dhan.co/v2/optionchain/expirylist"
+BASE_URL = "https://api.dhan.co/v2"
+OPTIONCHAIN_URL = f"{BASE_URL}/optionchain"
+EXPIRY_URL = f"{BASE_URL}/optionchain/expirylist"
+PROFILE_URL = f"{BASE_URL}/profile"
 
 YEAR_DAYS = 365
 VELOCITY_WINDOW_SEC = 150
+MIN_CHAIN_GAP_SEC = 3.0   # Dhan option chain limit: ~1 request / 3 sec
+MIN_RR = 1.0              # minimum reward:risk to accept a BUY/SELL
 
 INDEX_MAP = {
     "NIFTY 50": {"scrip": 13, "seg": "IDX_I", "step": 50, "default_prev": 24500.0},
@@ -83,24 +108,32 @@ INDEX_MAP = {
 }
 
 
-def auth_headers(token):
-    return {"Content-Type": "application/json", "access-token": token, "client-id": CLIENT_ID}
+def auth_headers(token, client_id):
+    return {"Content-Type": "application/json", "Accept": "application/json",
+            "access-token": token, "client-id": client_id}
 
 
-def require_token(token):
-    if not token:
-        st.error("DHAN Token required. Paste it in the sidebar.")
-        st.stop()
+def check(r):
+    """Raise with Dhan's real error body, not just the status code."""
+    if r.ok:
+        return
+    hint = ""
+    if r.status_code == 401:
+        hint = (" -> token expired/invalid, or client-id does not match the token. "
+                "Make sure you pasted the ACCESS TOKEN (JWT starting with 'eyJ'), not the API key.")
+    elif r.status_code == 429:
+        hint = " -> rate limited, wait a few seconds."
+    raise RuntimeError(f"HTTP {r.status_code} | {r.text[:300]}{hint}")
 
 
 # ============================================================
 # DATA
 # ============================================================
 @st.cache_data(ttl=300, show_spinner=False)
-def get_expiries(scrip, seg, token):
-    r = requests.post(EXPIRY_URL, headers=auth_headers(token),
+def get_expiries(scrip, seg, token, client_id):
+    r = requests.post(EXPIRY_URL, headers=auth_headers(token, client_id),
                       json={"UnderlyingScrip": scrip, "UnderlyingSeg": seg}, timeout=10)
-    r.raise_for_status()
+    check(r)
     return r.json().get("data", [])
 
 
@@ -112,11 +145,19 @@ def _n(x):
 
 
 @st.cache_data(ttl=30, show_spinner=False)
-def fetch_option_chain(scrip, seg, expiry, token):
-    r = requests.post(OPTIONCHAIN_URL, headers=auth_headers(token),
-                      json={"UnderlyingScrip": scrip, "UnderlyingSeg": seg, "Expiry": expiry}, timeout=12)
-    r.raise_for_status()
-    data = r.json().get("data", {})
+def fetch_option_chain(scrip, seg, expiry, token, client_id):
+    # Simple throttle to respect the 1 req / 3 sec limit
+    last = st.session_state.get("_last_chain_call", 0.0)
+    wait = MIN_CHAIN_GAP_SEC - (time.time() - last)
+    if wait > 0:
+        time.sleep(wait)
+    st.session_state["_last_chain_call"] = time.time()
+
+    r = requests.post(OPTIONCHAIN_URL, headers=auth_headers(token, client_id),
+                      json={"UnderlyingScrip": scrip, "UnderlyingSeg": seg, "Expiry": expiry},
+                      timeout=12)
+    check(r)
+    data = r.json().get("data", {}) or {}
     spot = float(data.get("last_price") or 0)
 
     rows = []
@@ -219,26 +260,21 @@ def detect_gamma_blast(df):
 def calculate_jobber_microstructure(df, spot):
     df = df.copy()
     df["dist"] = (df["Strike"] - spot).abs()
-    ladder = df.sort_values("dist").head(10).sort_values("Strike")
-    
+    ladder = df.sort_values("dist").head(10).sort_values("Strike").copy()
+
     if ladder.empty:
         return {"ladder_imbalance": 0.0, "pocket_support": spot, "micro_turn": "NEUTRAL AUCTION"}
 
-    total_near_ce_oi = ladder["CE_OI"].sum()
-    total_near_pe_oi = ladder["PE_OI"].sum()
-    
-    if (total_near_ce_oi + total_near_pe_oi) > 0:
-        ladder_imbalance = (total_near_pe_oi - total_near_ce_oi) / (total_near_ce_oi + total_near_pe_oi)
-    else:
-        ladder_imbalance = 0.0
+    total_ce = ladder["CE_OI"].sum()
+    total_pe = ladder["PE_OI"].sum()
+    ladder_imbalance = (total_pe - total_ce) / (total_ce + total_pe) if (total_ce + total_pe) > 0 else 0.0
 
     ladder["Net_OI_Flow"] = ladder["PE_OI_Chg"] - ladder["CE_OI_Chg"]
-    max_pressure_row = ladder.loc[ladder["Net_OI_Flow"].idxmax()] if not ladder.empty else None
-    pocket_support = float(max_pressure_row["Strike"]) if max_pressure_row is not None else spot
+    pocket_support = float(ladder.loc[ladder["Net_OI_Flow"].idxmax(), "Strike"])
 
     ce_unwind_sum = ladder[ladder["CE_OI_Chg"] < 0]["CE_OI_Chg"].sum()
     pe_unwind_sum = ladder[ladder["PE_OI_Chg"] < 0]["PE_OI_Chg"].sum()
-    
+
     if ce_unwind_sum < -5000 and pe_unwind_sum > -2000:
         micro_turn_signal = "ABSORPTION BULLISH (Shorts Trapped)"
     elif pe_unwind_sum < -5000 and ce_unwind_sum > -2000:
@@ -247,9 +283,9 @@ def calculate_jobber_microstructure(df, spot):
         micro_turn_signal = "NEUTRAL AUCTION (Balanced)"
 
     return {
-        "ladder_imbalance": round(ladder_imbalance, 3),
+        "ladder_imbalance": round(float(ladder_imbalance), 3),
         "pocket_support": pocket_support,
-        "micro_turn": micro_turn_signal
+        "micro_turn": micro_turn_signal,
     }
 
 
@@ -262,7 +298,7 @@ def compute_metrics(df, spot, prev_close, expiry_str, step):
     dce, dpe = float(df["CE_OI_Chg"].sum()), float(df["PE_OI_Chg"].sum())
 
     atm_idx = (df["Strike"] - spot).abs().idxmin()
-    atm_iv = float(df.loc[atm_idx, "CE_IV"]) or 12.0
+    atm_iv = float(df.loc[atm_idx, "CE_IV"]) or float(df.loc[atm_idx, "PE_IV"]) or 12.0
     dte = parse_dte(expiry_str)
     exp_move = spot * (atm_iv / 100) * math.sqrt(dte / YEAR_DAYS)
 
@@ -296,7 +332,7 @@ def compute_metrics(df, spot, prev_close, expiry_str, step):
         "gamma_strike": gamma_strike, "call_wall": call_wall, "put_wall": put_wall, "max_pain": max_pain,
         "ce_trap": ce_trap, "pe_trap": pe_trap,
         "score": score, "bias": bias, "status": status, "engine_signal": signal, "desc": desc,
-        "jobber": jobber
+        "jobber": jobber,
     }
 
 
@@ -324,7 +360,7 @@ def update_oi_velocity(m, key):
         if stk not in snap["map"]:
             continue
         p_ce, p_pe = snap["map"][stk]
-        d_ce, d_pe = c_ce - p_ce, c_ce - p_pe
+        d_ce, d_pe = c_ce - p_ce, c_pe - p_pe          # FIXED (was c_ce - p_pe)
         if d_ce > 0:
             vel["ce_builds"] += d_ce
         elif d_ce < 0:
@@ -374,7 +410,7 @@ def evaluate_market_state_change(m, vel):
 # ============================================================
 def run_council(m, vel, news, api_key):
     if Groq is None:
-        return {"error": "groq package not installed."}
+        return {"error": "groq package not installed (pip install groq)."}
     if not api_key:
         return {"error": "No GROQ API key provided in sidebar."}
 
@@ -434,8 +470,15 @@ def build_signal(m, ai):
     sig = str(ai.get("signal", "WAIT")).upper()
     if sig not in ("BUY", "SELL", "WAIT"):
         sig = "WAIT"
+    try:
+        conf = int(float(ai.get("confidence", 0)))
+    except (TypeError, ValueError):
+        conf = 0
+
     entry = m["spot"]
     note = ""
+    target = sl = None
+    valid = True
 
     if sig == "BUY":
         target, sl = m["call_wall"], m["put_wall"]
@@ -443,21 +486,26 @@ def build_signal(m, ai):
     elif sig == "SELL":
         target, sl = m["put_wall"], m["call_wall"]
         valid = sl > entry > target
-    else:
-        target, sl, valid = None, None, True
 
-    if not valid:
+    if sig != "WAIT" and not valid:
         note = f"{sig} rejected: entry/target/SL ordering invalid vs walls."
         sig, target, sl = "WAIT", None, None
 
     rr = None
     if target is not None and sl is not None and abs(entry - sl) > 0:
         rr = abs(target - entry) / abs(entry - sl)
-        if target is not None and abs(target - entry) > m["exp_move"] * 1.5:
+        if rr < MIN_RR:
+            note = (note + " " if note else "") + f"{sig} rejected: R:R 1:{rr:.2f} below minimum 1:{MIN_RR:.1f}."
+            sig, target, sl, rr = "WAIT", None, None, None
+        elif abs(target - entry) > m["exp_move"] * 1.5:
             note = (note + " " if note else "") + "Target is beyond 1.5x expected move."
 
     return {"signal": sig, "entry": entry, "target": target, "sl": sl, "rr": rr,
-            "confidence": ai.get("confidence", 0), "note": note}
+            "confidence": conf, "note": note}
+
+
+def esc(x):
+    return html.escape(str(x if x is not None else "-"))
 
 
 # ============================================================
@@ -465,26 +513,51 @@ def build_signal(m, ai):
 # ============================================================
 with st.sidebar:
     st.markdown("### BBG // TERMINAL CONFIG")
-    dhan_token = st.text_input("DHAN TOKEN", type="password", value=DEFAULT_DHAN_TOKEN)
-    groq_key = st.text_input("GROQ API KEY", type="password", value=DEFAULT_GROQ_KEY, help="Paste your Groq API key here to activate the AI Council.")
-    require_token(dhan_token)
+    dhan_token = clean(st.text_input("DHAN ACCESS TOKEN", type="password", value=DEFAULT_DHAN_TOKEN,
+                                     help="The long JWT (starts with 'eyJ'). NOT the API key/secret."))
+    client_id = clean(st.text_input("DHAN CLIENT ID", value=DEFAULT_CLIENT_ID))
+    groq_key = st.text_input("GROQ API KEY", type="password", value=DEFAULT_GROQ_KEY,
+                             help="Paste your Groq API key here to activate the AI Council.").strip()
+
+    if not dhan_token:
+        st.error("DHAN access token required. Paste it above.")
+        st.stop()
+    if not client_id:
+        st.error("DHAN client ID required.")
+        st.stop()
+
+    with st.expander("🔧 DIAGNOSTICS"):
+        st.write(f"Token length: **{len(dhan_token)}** | starts: `{dhan_token[:3]}…`")
+        st.write(f"Client ID: `{client_id}`")
+        st.write(f"Token pre-filled from secrets/env: **{bool(DEFAULT_DHAN_TOKEN)}**")
+        if not dhan_token.startswith("eyJ"):
+            st.warning("Token does not start with 'eyJ' - this may be the API key, not the access token.")
+        if st.button("Test token (/v2/profile)"):
+            try:
+                pr = requests.get(PROFILE_URL,
+                                  headers={"access-token": dhan_token, "client-id": client_id},
+                                  timeout=10)
+                st.code(f"{pr.status_code}\n{pr.text[:600]}")
+            except Exception as e:
+                st.error(e)
 
     idx_name = st.selectbox("INDEX SELECTION", list(INDEX_MAP.keys()))
     info = INDEX_MAP[idx_name]
 
     try:
-        expiries = get_expiries(info["scrip"], info["seg"], dhan_token)
+        expiries = get_expiries(info["scrip"], info["seg"], dhan_token, client_id)
     except Exception as e:
         expiries = []
         st.error(f"Could not load expiries: {e}")
     if not expiries:
-        st.warning("No expiries available. Check your token.")
+        st.warning("No expiries available. Use DIAGNOSTICS → Test token.")
         st.stop()
 
     expiry = st.selectbox("EXPIRY DATE", expiries)
     prev_close = st.number_input("PREV CLOSE", value=info["default_prev"], step=float(info["step"]),
                                  help="Yesterday's close. Used by the bias score.")
-    news = st.text_area("NEWS / MACRO NOTES", placeholder="Paste headlines for the Sentiment agent (optional)", height=80)
+    news = st.text_area("NEWS / MACRO NOTES", placeholder="Paste headlines for the Sentiment agent (optional)",
+                        height=80)
     force_run = st.button("FORCE AI RUN")
 
     auto_refresh = st.toggle("AUTO REFRESH (3 MIN)", value=True)
@@ -495,7 +568,7 @@ with st.sidebar:
 # FETCH + ANALYZE
 # ============================================================
 try:
-    spot, df = fetch_option_chain(info["scrip"], info["seg"], expiry, dhan_token)
+    spot, df = fetch_option_chain(info["scrip"], info["seg"], expiry, dhan_token, client_id)
 except Exception as e:
     st.error(f"Option chain fetch failed: {e}")
     st.stop()
@@ -521,8 +594,10 @@ if force_run or changed:
         }
         gate_label = f"FRESH ({'FORCED' if force_run else reason})"
     else:
-        ai = st.session_state.get("last_ai_verdict") or ai
-        gate_label = f"AI ERROR: {ai.get('error', '')}" if "error" in ai else "AI ERROR (showing cached)"
+        err = ai["error"]
+        cached = st.session_state.get("last_ai_verdict")
+        ai = cached if cached else ai
+        gate_label = f"AI ERROR: {err}" + (" (showing cached)" if cached else "")
 else:
     ai = st.session_state.get("last_ai_verdict", {"error": "No verdict yet."})
     t = st.session_state.get("last_ai_time")
@@ -573,7 +648,7 @@ st.markdown("#### ⚡ JOBBER MICRO-LADDER & ABSORPTION FEED")
 j1, j2, j3 = st.columns(3)
 j1.metric("LADDER IMBALANCE", f"{m['jobber']['ladder_imbalance']:+.3f}", "Range: -1.0 to +1.0")
 j2.metric("MAX PRESSURE POCKET", f"{m['jobber']['pocket_support']:,.0f}", "Closest High-Liquidity Node")
-j3.metric("MICRO-TURN STATUS", m['jobber']['micro_turn'])
+j3.metric("MICRO-TURN STATUS", m["jobber"]["micro_turn"])
 
 st.markdown("#### 3-MIN OI VELOCITY (near spot)")
 v1, v2, v3, v4 = st.columns(4)
@@ -601,15 +676,15 @@ else:
       <div class="bbg-title">Risk-Validated Signal</div>
       <div class="bbg-big" style="color:{scolor};">{sig['signal']} &nbsp;|&nbsp; Confidence {sig['confidence']}%</div>
       <div class="bbg-desc">{lv}</div>
-      <div class="bbg-desc" style="color:#ffab00;">{sig['note']}</div>
+      <div class="bbg-desc" style="color:#ffab00;">{esc(sig['note']) if sig['note'] else ''}</div>
     </div>""", unsafe_allow_html=True)
     st.markdown(f"""
     <div class="bbg-panel">
-      <div class="agent"><b>Price Action:</b> {ai.get('price_action_agent', '-')}</div>
-      <div class="agent"><b>Order Flow:</b> {ai.get('order_flow_agent', '-')}</div>
-      <div class="agent"><b>Volatility:</b> {ai.get('volatility_agent', '-')}</div>
-      <div class="agent"><b>Sentiment:</b> {ai.get('news_agent', '-')}</div>
-      <div class="agent"><b>Risk Officer:</b> {ai.get('final_approval', '-')}</div>
+      <div class="agent"><b>Price Action:</b> {esc(ai.get('price_action_agent'))}</div>
+      <div class="agent"><b>Order Flow:</b> {esc(ai.get('order_flow_agent'))}</div>
+      <div class="agent"><b>Volatility:</b> {esc(ai.get('volatility_agent'))}</div>
+      <div class="agent"><b>Sentiment:</b> {esc(ai.get('news_agent'))}</div>
+      <div class="agent"><b>Risk Officer:</b> {esc(ai.get('final_approval'))}</div>
     </div>""", unsafe_allow_html=True)
 
 st.caption(f"1σ range: {m['lower_1sigma']:,.0f} to {m['upper_1sigma']:,.0f}  |  Updated {datetime.now().strftime('%H:%M:%S')}")
