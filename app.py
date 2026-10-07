@@ -182,6 +182,26 @@ def fetch_option_chain(scrip, seg, expiry, token, client_id):
     return spot, df.sort_values("Strike").reset_index(drop=True)
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_prev_close(scrip, seg, token, client_id):
+    """Best-effort previous close via Dhan market quote. Returns (value or None, source/message)."""
+    try:
+        r = requests.post(f"{BASE_URL}/marketfeed/quote", headers=auth_headers(token, client_id),
+                          json={seg: [scrip]}, timeout=10)
+        check(r)
+        q = (r.json().get("data") or {}).get(seg, {}).get(str(scrip)) or {}
+        ltp = _n(q.get("last_price"))
+        net = _n(q.get("net_change"))
+        if ltp > 0 and net != 0:
+            return round(ltp - net, 2), "quote: LTP - net_change"
+        close = _n((q.get("ohlc") or {}).get("close"))
+        if close > 0:
+            return round(close, 2), "quote: ohlc.close (may equal today's close after market hours)"
+        return None, "quote returned no usable close"
+    except Exception as e:
+        return None, f"auto fetch failed: {e}"
+
+
 def parse_dte(expiry_str):
     try:
         exp_date = datetime.strptime(str(expiry_str)[:10], "%Y-%m-%d").date()
@@ -241,11 +261,20 @@ def compute_bias(dce, dpe, spot, prev_close, pcr):
     return score, label
 
 
+def engine_sums(df):
+    """The four sums the Dual-Force engine decides on (strikes with |chg| > 1000 only)."""
+    return {
+        "ce_exits": float(df[df["CE_OI_Chg"] < -1000]["CE_OI_Chg"].sum()),
+        "pe_exits": float(df[df["PE_OI_Chg"] < -1000]["PE_OI_Chg"].sum()),
+        "ce_build": float(df[df["CE_OI_Chg"] > 1000]["CE_OI_Chg"].sum()),
+        "pe_build": float(df[df["PE_OI_Chg"] > 1000]["PE_OI_Chg"].sum()),
+    }
+
+
 def detect_gamma_blast(df):
-    ce_exits = df[df["CE_OI_Chg"] < -1000]["CE_OI_Chg"].sum()
-    pe_exits = df[df["PE_OI_Chg"] < -1000]["PE_OI_Chg"].sum()
-    ce_build = df[df["CE_OI_Chg"] > 1000]["CE_OI_Chg"].sum()
-    pe_build = df[df["PE_OI_Chg"] > 1000]["PE_OI_Chg"].sum()
+    sums = engine_sums(df)
+    ce_exits, pe_exits = sums["ce_exits"], sums["pe_exits"]
+    ce_build, pe_build = sums["ce_build"], sums["pe_build"]
 
     if ce_exits < -3000 and pe_build > 3000:
         return "BULLISH GAMMA BLAST", "BUY", "Call writers capitulating + Put writers building floors."
@@ -568,8 +597,20 @@ with st.sidebar:
         st.stop()
 
     expiry = st.selectbox("EXPIRY DATE", expiries)
-    prev_close = st.number_input("PREV CLOSE", value=info["default_prev"], step=float(info["step"]),
-                                 help="Yesterday's close. Used by the bias score.")
+    auto_prev = st.toggle("AUTO PREV CLOSE", value=True,
+                          help="Fetch yesterday's close from Dhan. Turn off to type it manually.")
+    auto_val, auto_src = (None, "")
+    if auto_prev:
+        auto_val, auto_src = fetch_prev_close(info["scrip"], info["seg"], dhan_token, client_id)
+    if auto_prev and auto_val:
+        prev_close = float(auto_val)
+        st.caption(f"PREV CLOSE = {prev_close:,.2f}  ({auto_src})")
+    else:
+        if auto_prev:
+            st.warning(f"Auto prev close unavailable: {auto_src}. Enter it manually.")
+        prev_close = st.number_input("PREV CLOSE", value=info["default_prev"], step=float(info["step"]),
+                                     key=f"prev_{idx_name}",
+                                     help="Yesterday's close. Used by the bias score.")
     news = st.text_area("NEWS / MACRO NOTES", placeholder="Paste headlines for the Sentiment agent (optional)",
                         height=80)
     force_run = st.button("FORCE AI RUN")
@@ -638,6 +679,21 @@ st.markdown(f"""
   <div class="bbg-big" style="color:{color};">{status} &nbsp;|&nbsp; {m['engine_signal']}</div>
   <div class="bbg-desc">{m['desc']}</div>
 </div>""", unsafe_allow_html=True)
+
+if abs(prev_close - spot) / spot > 0.05:
+    st.warning(f"PREV CLOSE ({prev_close:,.0f}) is more than 5% away from spot ({spot:,.0f}). "
+               "It is probably stale or wrong, and it skews the BIAS SCORE.")
+
+# ---- ENGINE DEBUG ROW ----
+es = engine_sums(m["df"])
+st.caption("DUAL-FORCE ENGINE INPUTS (OI change summed over strikes with |chg| > 1,000)")
+d1, d2, d3, d4 = st.columns(4)
+d1.metric("CE EXITS", f"{es['ce_exits']:+,.0f}", "needs < -3,000", delta_color="off")
+d2.metric("PE BUILDS", f"{es['pe_build']:+,.0f}", "needs > +3,000", delta_color="off")
+d3.metric("PE EXITS", f"{es['pe_exits']:+,.0f}", "needs < -3,000", delta_color="off")
+d4.metric("CE BUILDS", f"{es['ce_build']:+,.0f}", "needs > +3,000", delta_color="off")
+st.caption("Bullish blast = CE EXITS and PE BUILDS both hit. Bearish blast = PE EXITS and CE BUILDS both hit. "
+           "Trap = one side exits while the opposite build is <= 1,000.")
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("BIAS SCORE", f"{m['score']}/100", m["bias"])
