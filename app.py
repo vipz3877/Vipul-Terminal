@@ -88,7 +88,8 @@ def clean(s):
 DEFAULT_CLIENT_ID = clean(get_secret("DHAN_CLIENT_ID", "1108425500"))
 DEFAULT_DHAN_TOKEN = clean(get_secret("DHAN_ACCESS_TOKEN", ""))
 DEFAULT_GROQ_KEY = get_secret("GROQ_API_KEY", "").strip()
-GROQ_MODEL = get_secret("GROQ_MODEL", "llama-3.3-70b-versatile")
+# OpenAI open-weight models hosted on Groq (llama-3.3-70b-versatile is no longer used)
+GROQ_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
 
 BASE_URL = "https://api.dhan.co/v2"
 OPTIONCHAIN_URL = f"{BASE_URL}/optionchain"
@@ -408,7 +409,7 @@ def evaluate_market_state_change(m, vel):
 # ============================================================
 # GROQ MULTI-AGENT COUNCIL
 # ============================================================
-def run_council(m, vel, news, api_key):
+def run_council(m, vel, news, api_key, model):
     if Groq is None:
         return {"error": "groq package not installed (pip install groq)."}
     if not api_key:
@@ -447,20 +448,31 @@ Return ONLY this JSON:
 {{"price_action_agent":"1 sentence","order_flow_agent":"1 sentence","volatility_agent":"1 sentence",
 "news_agent":"1 sentence","final_approval":"synthesis","signal":"BUY or SELL or WAIT","confidence":0-100}}"""
 
-    try:
-        client = Groq(api_key=api_key)
-        resp = client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=800,
-            response_format={"type": "json_object"},
-        )
-        txt = resp.choices[0].message.content.strip()
-        txt = txt.replace("```json", "").replace("```", "").strip()
-        return json.loads(txt)
-    except Exception as e:
-        return {"error": f"Groq call failed: {e}"}
+    client = Groq(api_key=api_key)
+    # Try the selected model first, then the other OpenAI model as fallback
+    candidates = [model] + [x for x in GROQ_MODELS if x != model]
+    last_err = ""
+    for mdl in candidates:
+        try:
+            resp = client.chat.completions.create(
+                model=mdl,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=2500,  # gpt-oss spends tokens on reasoning, so keep headroom
+                response_format={"type": "json_object"},
+                extra_body={"reasoning_effort": "low"},
+            )
+            txt = (resp.choices[0].message.content or "").strip()
+            txt = txt.replace("```json", "").replace("```", "").strip()
+            out = json.loads(txt)
+            out["_model"] = mdl
+            return out
+        except Exception as e:
+            last_err = f"{mdl}: {e}"
+            if "model_not_found" in str(e) or "404" in str(e):
+                continue  # try next model
+            break
+    return {"error": f"Groq call failed: {last_err}"}
 
 
 # ============================================================
@@ -518,6 +530,8 @@ with st.sidebar:
     client_id = clean(st.text_input("DHAN CLIENT ID", value=DEFAULT_CLIENT_ID))
     groq_key = st.text_input("GROQ API KEY", type="password", value=DEFAULT_GROQ_KEY,
                              help="Paste your Groq API key here to activate the AI Council.").strip()
+
+    groq_model = st.selectbox("GROQ MODEL", GROQ_MODELS, index=0)
 
     if not dhan_token:
         st.error("DHAN access token required. Paste it above.")
@@ -583,7 +597,7 @@ vel = update_oi_velocity(m, key=f"{idx_name}|{expiry}")
 # ---- AI gating + cache ----
 changed, reason = evaluate_market_state_change(m, vel)
 if force_run or changed:
-    ai = run_council(m, vel, news, groq_key)
+    ai = run_council(m, vel, news, groq_key, groq_model)
     if "error" not in ai:
         st.session_state.last_ai_verdict = ai
         st.session_state.last_ai_time = datetime.now()
@@ -592,7 +606,7 @@ if force_run or changed:
             "put_wall": m["put_wall"], "gamma_strike": m["gamma_strike"], "status": m["status"],
             "trap_active": bool(m["ce_trap"] or m["pe_trap"]),
         }
-        gate_label = f"FRESH ({'FORCED' if force_run else reason})"
+        gate_label = f"FRESH ({'FORCED' if force_run else reason}) | {ai.get('_model', groq_model)}"
     else:
         err = ai["error"]
         cached = st.session_state.get("last_ai_verdict")
