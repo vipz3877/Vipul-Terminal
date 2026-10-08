@@ -1,7 +1,6 @@
 """
-VIPUL BLOOMBERG PROFESSIONAL TERMINAL v7.1
-Unified: v5.0/v6.0 engine (Gamma Blast / IV Spike, walls, traps, expected move, AI Council)
-       + Jobber Microstructure Engine (ladder imbalance, pocket support, micro-turns)
+VIPUL BLOOMBERG PROFESSIONAL TERMINAL v7.3 (Multi-Tab Architecture)
+Unified: v5.0/v6.0 engine + Jobber Microstructure + Exhaustion + Scanner + Tabs
 """
 
 import os
@@ -32,7 +31,15 @@ try:
 except ImportError:
     Groq = None
 
-st.set_page_config(page_title="Vipul Bloomberg Terminal v7.1", layout="wide")
+st.set_page_config(page_title="Vipul Bloomberg Terminal v7.3", layout="wide")
+
+# ============================================================
+# SESSION STATE SAFEGUARD DEFAULTS
+# ============================================================
+if "hist" not in st.session_state:
+    st.session_state["hist"] = []
+if "oi_snap" not in st.session_state:
+    st.session_state["oi_snap"] = None
 
 # ============================================================
 # CSS
@@ -621,7 +628,7 @@ def evaluate_market_state_change(m, vel, nhash=""):
 
 def run_council(m, vel, news, api_key, model):
     if Groq is None:
-        return {"error": "groq package not installed."}
+        return {"error": "groq package not installed (pip install groq)."}
     if not api_key:
         return {"error": "No GROQ API key provided in sidebar."}
 
@@ -657,16 +664,26 @@ MARKET DATA:
   PE exits {eg['pe_exits']:,.0f} ({eg['pe_exit_pct']:.1f}%) | PE builds {eg['pe_build']:,.0f} ({eg['pe_build_pct']:.1f}%) | PE net flow {eg['pe_net_flow']:+,.0f}
   Bull force {eg['bull_force']:.1f} vs Bear force {eg['bear_force']:.1f} (ratio {eg['force_ratio']:.2f}; a winner needs >= {DOMINANCE})
 - OI structure around spot: {struct_txt}
-- Exhaustion monitor: {exh_txt}
+- Definitions: Bull force = PE builds% + CE exits%; Bear force = CE builds% + PE exits%. Put OI BUILDING is bullish support, call OI BUILDING is bearish resistance. Do not call put builds bearish.
+- Exhaustion monitor (is the current trend running out of fuel?): {exh_txt}
+- Whole-chain net OI change: CE {m['dce']:+,.0f} | PE {m['dpe']:+,.0f} (compare net call vs net put writing before claiming either side is unwinding)
 - Expected Move: +/-{m['exp_move']} pts [{m['lower_1sigma']} - {m['upper_1sigma']}] | ATM IV {m['atm_iv']:.1f}% | DTE {m['dte']}
 - Call Wall: {m['call_wall']:.0f} | Put Wall: {m['put_wall']:.0f} | Max Pain: {m['max_pain']:.0f} | Gamma strike: {m['gamma_strike']:.0f}
 - 35pt traps: CE resistance={m['ce_trap']} | PE support={m['pe_trap']}
+- 3-Min Flow: CE build={vel['ce_builds']:,.0f}, CE unwind={vel['ce_unwinds']:,.0f} | PE build={vel['pe_builds']:,.0f}, PE unwind={vel['pe_unwinds']:,.0f}
 - Strikes near spot:
 {chain_summary}
-- LIVE HEADLINES:
+- LIVE HEADLINES (latest first, fetched just now):
 {news}
 
-Return ONLY JSON:
+AGENTS:
+1. Price Action Agent: spot vs structural levels
+2. Order Flow Agent: OI changes and 35pt traps
+3. Volatility Agent: IV regime, DTE decay, gamma
+4. Sentiment Agent: judge ONLY from the LIVE HEADLINES list; name the headline(s) driving the view. If the list says NO HEADLINES FETCHED, say that instead of claiming "no news impact"
+5. Risk Officer: final approval; reject if evidence is conflicting or engine status is CONFLICTED
+
+Return ONLY this JSON:
 {{"price_action_agent":"1 sentence","order_flow_agent":"1 sentence","volatility_agent":"1 sentence",
 "news_agent":"1 sentence","news_score":-100 to 100,"final_approval":"synthesis","signal":"BUY or SELL or WAIT","confidence":0-100}}"""
 
@@ -685,7 +702,14 @@ Return ONLY JSON:
             )
             txt = (resp.choices[0].message.content or "").strip()
             txt = txt.replace("```json", "").replace("```", "").strip()
-            out = json.loads(txt)
+            try:
+                out = json.loads(txt)
+            except json.JSONDecodeError:
+                match = re.search(r"\{.*\}", txt, re.DOTALL)
+                if match:
+                    out = json.loads(match.group(0))
+                else:
+                    raise
             out["_model"] = mdl
             return out
         except Exception as e:
@@ -705,19 +729,26 @@ def chain_checks(m):
 
     st_ = m["status"]
     add("Dual-Force engine", 1 if "BULLISH GAMMA" in st_ else -1 if "BEARISH GAMMA" in st_ else 0, st_)
+
     ce_pct = e["ce_net_flow"] / e["ce_oi_near"] * 100 if e["ce_oi_near"] > 0 else 0.0
     pe_pct = e["pe_net_flow"] / e["pe_oi_near"] * 100 if e["pe_oi_near"] > 0 else 0.0
     gap = pe_pct - ce_pct
     add("Near-spot net OI flow", 1 if gap >= FLOW_EDGE_PCT else -1 if gap <= -FLOW_EDGE_PCT else 0,
-        f"PE {pe_pct:+.1f}% vs CE {ce_pct:+.1f}%")
+        f"PE {pe_pct:+.1f}% vs CE {ce_pct:+.1f}% of near-spot OI")
+
     li = j["ladder_imbalance"]
-    add("Ladder OI imbalance", 1 if li >= 0.10 else -1 if li <= -0.10 else 0, f"{li:+.3f}")
+    add("Ladder OI imbalance", 1 if li >= 0.10 else -1 if li <= -0.10 else 0, f"{li:+.3f} (PE-heavy is +)")
+
     mt = j["micro_turn"]
     add("Micro-turn", 1 if "BULLISH" in mt else -1 if "BEARISH" in mt else 0, mt)
+
     add("PCR (whole chain)", 1 if m["pcr"] > 1.2 else -1 if m["pcr"] < 0.8 else 0, f"{m['pcr']:.2f}")
-    add("Bias score", 1 if m["score"] > 55 else -1 if m["score"] < 45 else 0, f"{m['score']}/100")
+
+    add("Bias score", 1 if m["score"] > 55 else -1 if m["score"] < 45 else 0, f"{m['score']}/100 {m['bias']}")
+
     mp_gap = m["spot"] - m["max_pain"]
-    add("Spot vs max pain", -1 if mp_gap > m["step"] else 1 if mp_gap < -m["step"] else 0, f"{mp_gap:+,.0f}")
+    add("Spot vs max pain", -1 if mp_gap > m["step"] else 1 if mp_gap < -m["step"] else 0,
+        f"spot {m['spot']:,.0f} vs max pain {m['max_pain']:,.0f} ({mp_gap:+,.0f})")
     return checks
 
 
@@ -739,20 +770,24 @@ def build_signal(m, ai):
     notes = []
     sig, target, sl, rr = ai_sig, None, None, None
 
-    if sig != "WAIT" and net < MIN_CONFIRM:
-        notes.append(f"{sig} rejected: agreement {net:+d} below +{MIN_CONFIRM}.")
-        sig = "WAIT"
+    if sig != "WAIT":
+        if net < MIN_CONFIRM:
+            notes.append(f"{sig} rejected: option-chain agreement {net:+d} is below the required +{MIN_CONFIRM}.")
+            sig = "WAIT"
 
     exh = m.get("exh") or {}
     if sig != "WAIT" and exh.get("ready"):
         mine = exh["buyer"] if sig == "BUY" else exh["seller"]
         if mine["flag"] == "CONFIRMED":
-            notes.append(f"{sig} rejected: trend exhaustion confirmed.")
+            notes.append(f"{sig} rejected: {'buyer' if sig == 'BUY' else 'seller'} exhaustion confirmed "
+                         f"({mine['score']}/100), the move you would join is running out of fuel.")
             sig = "WAIT"
+        elif mine["flag"] == "WATCH":
+            notes.append(f"Caution: {'buyer' if sig == 'BUY' else 'seller'} exhaustion building ({mine['score']}/100).")
 
     if sig != "WAIT":
         if res is None or sup is None:
-            notes.append(f"{sig} rejected: no usable OI wall.")
+            notes.append(f"{sig} rejected: no usable OI wall on one side of spot.")
             sig = "WAIT"
         elif sig == "BUY":
             target, sl = res["level"], sup["level"] - SL_BUFFER
@@ -764,7 +799,9 @@ def build_signal(m, ai):
         reward = abs(target - entry)
         rr = reward / risk if risk > 0 else None
         if rr is None or rr < MIN_RR:
-            notes.append(f"{sig} rejected: R:R below minimum.")
+            rr_txt = f"1:{rr:.2f}" if rr else "n/a"
+            notes.append(f"{sig} rejected: R:R {rr_txt} from the nearest OI walls "
+                         f"(target {target:,.0f}, SL {sl:,.0f}) is below 1:{MIN_RR:.1f}.")
             sig, target, sl, rr = "WAIT", None, None, None
 
     return {"signal": sig, "ai_signal": ai_sig, "entry": entry, "target": target, "sl": sl, "rr": rr,
@@ -821,7 +858,7 @@ def compute_day_levels(candles, spot, sd, m, prev_close_fallback):
         basis = f"session {ref['date']} (H {h:,.0f} / L {l:,.0f} / C {c:,.0f})"
     else:
         c, h, l = prev_close_fallback, None, None
-        basis = f"previous close {c:,.0f} (no candle data)"
+        basis = f"previous close {c:,.0f} (no candle data, pivots unavailable)"
 
     for k in (2, 1):
         add(f"Close +{k}σ", c + k * sd, "σ")
@@ -848,6 +885,8 @@ def compute_day_levels(candles, spot, sd, m, prev_close_fallback):
         add("Today open", live["o"], "today")
         add("Open +1σ", live["o"] + sd, "today")
         add("Open -1σ", live["o"] - sd, "today")
+        add("Today high", live["h"], "today")
+        add("Today low", live["l"], "today")
 
     oi_refs = {"Call wall": m["call_wall"], "Put wall": m["put_wall"], "Max pain": m["max_pain"],
                "Gamma strike": m["gamma_strike"]}
@@ -950,7 +989,7 @@ def exhaustion(hist, m, prev_close, lb_min):
     ref = _nearest(older, now["ts"] - lb_min * 60)
     age = (now["ts"] - ref["ts"]) / 60
     if age < max(5.0, 0.5 * lb_min):
-        out["why"] = f"Collecting history: have {age:.0f} min."
+        out["why"] = f"Collecting history: have {age:.0f} min, need about {max(5.0, 0.5 * lb_min):.0f}+ min."
         return out
     mid = _nearest(older, now["ts"] - age * 30)
     out["ready"] = True
@@ -958,8 +997,9 @@ def exhaustion(hist, m, prev_close, lb_min):
     spot = now["spot"]
     in_win = [h for h in hist if h["ts"] >= ref["ts"]]
     lb_high, lb_low = max(h["spot"] for h in in_win), min(h["spot"] for h in in_win)
+    h_high, h_low = max(h["spot"] for h in hist), min(h["spot"] for h in hist)
     pc = prev_close if prev_close and prev_close > 0 else spot
-    ext = {1: max(spot - lb_low, spot - pc, 0) / sd, -1: max(lb_high - spot, pc - spot, 0) / sd}
+    ext = {1: max(spot - h_low, spot - pc, 0) / sd, -1: max(h_high - spot, pc - spot, 0) / sd}
 
     iv_peak = max(h["iv"] for h in in_win)
     iv_off_peak = (1 - now["iv"] / iv_peak) * 100 if iv_peak > 0 else 0.0
@@ -970,51 +1010,87 @@ def exhaustion(hist, m, prev_close, lb_min):
     pct = lambda q, b: q / b * 100 if b > 0 else 0.0
     ce_b, pe_b = pct(fl["ce_build"], fl["ce_base"]), pct(fl["pe_build"], fl["pe_base"])
 
+    def wall_oi_chg(level, idx):
+        if level is None:
+            return None
+        k = str(int(level))
+        if k in now["oi"] and k in ref["oi"] and ref["oi"][k][idx] > 0:
+            return (now["oi"][k][idx] / ref["oi"][k][idx] - 1) * 100
+        return None
+
     def side(sgn):
         sig = []
         name = "call" if sgn > 0 else "put"
         level = now["res"] if sgn > 0 else now["sup"]
-        chg = None
-        if level is not None:
-            k = str(int(level))
-            if k in now["oi"] and k in ref["oi"] and ref["oi"][k][0 if sgn > 0 else 1] > 0:
-                chg = (now["oi"][k][0 if sgn > 0 else 1] / ref["oi"][k][0 if sgn > 0 else 1] - 1) * 100
+        chg = wall_oi_chg(level, 0 if sgn > 0 else 1)
         if level is None:
-            sig.append(("Wall absorption", 0.0, "no wall"))
+            sig.append(("Wall absorption", 0.0, "no nearby OI wall"))
         else:
             gap = abs(level - spot) / sd
             if gap <= 0.35 and chg is not None and chg >= 1:
-                sig.append(("Wall absorption", 1.0, f"near wall, OI {chg:+.1f}%"))
+                sig.append(("Wall absorption", 1.0, f"spot {gap:.2f}σ from {level:,.0f} wall; its {name} OI {chg:+.1f}% over {age:.0f}m"))
+            elif gap <= 0.35:
+                sig.append(("Wall absorption", 0.5, f"spot {gap:.2f}σ from {level:,.0f} wall; OI not growing"))
             else:
-                sig.append(("Wall absorption", 0.0, "away from wall"))
+                sig.append(("Wall absorption", 0.0, f"{gap:.2f}σ away from the {level:,.0f} wall"))
 
         extreme = (lb_high - spot if sgn > 0 else spot - lb_low) / sd
         if extreme <= 0.3 and iv_off_peak >= 3:
-            sig.append(("IV rollover", 1.0, f"IV {iv_off_peak:.1f}% off peak"))
+            sig.append(("IV rollover at extreme", 1.0, f"IV {iv_off_peak:.1f}% off its window peak while price is at the extreme"))
+        elif extreme <= 0.3 and iv_off_peak >= 1.5:
+            sig.append(("IV rollover at extreme", 0.5, f"IV {iv_off_peak:.1f}% off peak"))
         else:
-            sig.append(("IV rollover", 0.0, "stable IV"))
+            sig.append(("IV rollover at extreme", 0.0, f"IV {iv_chg:+.1f}% over window, {iv_off_peak:.1f}% off peak"))
 
         ed = -sgn * edge_d
-        sig.append(("Flow edge flipping", 1.0 if ed >= 3 else 0.0, f"edge {edge_d:+.1f}"))
+        sig.append(("Flow edge flipping", 1.0 if ed >= 3 else 0.5 if ed >= 1.5 else 0.0,
+                    f"PE-vs-CE net flow edge {edge_d:+.1f} pts over window"))
+
         pd_ = -sgn * pcr_d
-        sig.append(("PCR turning", 1.0 if pd_ >= 0.03 else 0.0, f"PCR {pcr_d:+.3f}"))
-        mine = ce_b if sgn > 0 else pe_b
-        sig.append((f"Fresh {name} writing", 1.0 if mine >= 1 else 0.0, f"{mine:.1f}%"))
-        sig.append(("Max pain pull", 1.0 if now["dte"] <= 2 else 0.0, "dte check"))
-        sig.append(("Momentum stall", 1.0, "stall check"))
+        sig.append(("PCR turning", 1.0 if pd_ >= 0.03 else 0.5 if pd_ >= 0.015 else 0.0, f"PCR {pcr_d:+.3f} over window"))
+
+        mine, other = (ce_b, pe_b) if sgn > 0 else (pe_b, ce_b)
+        mq, oq = (fl["ce_build"], fl["pe_build"]) if sgn > 0 else (fl["pe_build"], fl["ce_build"])
+        if mine >= 1 and mq >= 1.5 * oq:
+            sig.append((f"Fresh {name} writing", 1.0, f"{name} builds {mine:.1f}% vs {other:.1f}% opposite (near spot, {age:.0f}m)"))
+        elif mq > oq and mine >= 0.5:
+            sig.append((f"Fresh {name} writing", 0.5, f"{name} builds {mine:.1f}% vs {other:.1f}% opposite"))
+        else:
+            sig.append((f"Fresh {name} writing", 0.0, f"{name} builds {mine:.1f}% vs {other:.1f}% opposite"))
+
+        mp = sgn * (spot - now["max_pain"]) / sd
+        if now["dte"] > 2:
+            sig.append(("Max pain pull", 0.0, f"{now['dte']}d to expiry, pull is weak"))
+        else:
+            sig.append(("Max pain pull", 1.0 if mp >= 0.5 else 0.5 if mp >= 0.3 else 0.0,
+                        f"spot {mp:+.2f}σ beyond max pain {now['max_pain']:,.0f}"))
+
+        first = sgn * (mid["spot"] - ref["spot"]) / sd
+        second = sgn * (spot - mid["spot"]) / sd
+        if mid is ref or first < 0.15:
+            sig.append(("Momentum stall", 0.0, f"no clear first-leg move ({first:+.2f}σ)"))
+        elif second <= 0:
+            sig.append(("Momentum stall", 1.0, f"first leg {first:+.2f}σ, then {second:+.2f}σ (stalled/reversed)"))
+        elif second < 0.4 * first:
+            sig.append(("Momentum stall", 0.5, f"first leg {first:+.2f}σ, then only {second:+.2f}σ"))
+        else:
+            sig.append(("Momentum stall", 0.0, f"first leg {first:+.2f}σ, then {second:+.2f}σ (still running)"))
 
         score = sum(x[1] for x in sig) / len(sig) * 100
         ctx = ext[sgn]
         turned = ((lb_high - spot) if sgn > 0 else (spot - lb_low)) / sd >= 0.1
         if ctx < EXH_CONTEXT_SIGMA:
-            status, flag = "TREND NOT EXTENDED", ""
+            status, flag = f"NO {'UP' if sgn > 0 else 'DOWN'}TREND TO EXHAUST (extension {ctx:.2f}σ)", ""
         elif score >= EXH_ALERT and turned:
-            status, flag = "CONFIRMED", "CONFIRMED"
+            status, flag = "CONFIRMED: signals aligned and price has turned", "CONFIRMED"
         elif score >= EXH_ALERT:
-            status, flag = "WATCH", "WATCH"
+            status, flag = "WATCH: exhaustion building, price has NOT turned yet", "WATCH"
+        elif score >= EXH_WATCH:
+            status, flag = "EARLY SIGNS", "EARLY"
         else:
-            status, flag = "TACTICAL", ""
-        return {"score": round(score), "signals": sig, "status": status, "flag": flag, "ext": ctx, "turned": turned}
+            status, flag = "TREND INTACT", ""
+        return {"score": round(score), "signals": sig, "status": status, "flag": flag,
+                "ext": ctx, "turned": turned}
 
     out["buyer"], out["seller"] = side(1), side(-1)
     out.update({"age": age, "lb_high": lb_high, "lb_low": lb_low, "spot_chg_sigma": (spot - ref["spot"]) / sd})
@@ -1028,9 +1104,20 @@ def exh_flag(exh):
 
 
 def data_quality(m):
-    return ""
+    near = m["near"]
+    msgs = []
+    for side in ("CE", "PE"):
+        live = near[near[f"{side}_OI"] > 0]
+        if len(live) >= 3:
+            frac = (live[f"{side}_PrevOI"] == 0).mean()
+            if frac >= 0.25:
+                msgs.append(f"{frac:.0%} of near-spot {side} strikes have previous OI = 0, so their 'builds' may be inflated")
+    return "; ".join(msgs)
 
 
+# ============================================================
+# PREMIUM POTENTIAL SCANNER (scenario repricing, not a forecast)
+# ============================================================
 def _ncdf(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
@@ -1097,15 +1184,48 @@ def premium_scanner(m, horizon_days=0.25, iv_shock=15.0):
             m_wrong = mult(S0 - sign * 0.5 * sd)
             x = lambda v: (v / ltp) if v is not None else None
 
+            need2 = None
+            lo, hi = 0.0, 4.0
+            if (mult(Sfav(hi)) or 0) >= 2 * ltp:
+                for _i in range(40):
+                    mid = (lo + hi) / 2
+                    if (mult(Sfav(mid)) or 0) >= 2 * ltp:
+                        hi = mid
+                    else:
+                        lo = mid
+                need2 = hi
+
+            bid, ask = float(r.get(f"{side}_Bid", 0) or 0), float(r.get(f"{side}_Ask", 0) or 0)
+            spread = (ask - bid) / ((ask + bid) / 2) * 100 if bid > 0 and ask > 0 else float("nan")
+            d_now = abs(float(r.get(f"{side}_Delta", 0) or 0)) or abs(bs_delta(S0, K, T0, iv0, is_call))
+            d_1s = abs(bs_delta(Sfav(1.0), K, T1, iv0, is_call))
+            money = (K - S0) if is_call else (S0 - K)
             rows.append({
-                "Side": side, "Strike": K, "LTP": ltp, "Delta": abs(bs_delta(S0, K, T0, iv0, is_call)),
-                "Spread%": 1.0, "Vol": 100.0, "OI": float(r[f"{side}_OI"]), "OIchg": float(r[f"{side}_OI_Chg"]),
+                "Side": side, "Strike": K,
+                "Money": f"OTM {money:.0f}" if money > step * 0.4 else ("ITM " + f"{-money:.0f}" if money < -step * 0.4 else "ATM"),
+                "LTP": ltp, "Delta": d_now, "Delta@1σ": d_1s, "Spread%": spread,
+                "Vol": float(r.get(f"{side}_Vol", 0) or 0),
+                "OI": float(r[f"{side}_OI"]), "OIchg": float(r[f"{side}_OI_Chg"]),
                 "x0.5σ": x(m05), "x1σ": x(m1), "x1.5σ": x(m15), "xWall": x(m_wall),
                 "x1σ crush": x(m_crush), "x1σ spike": x(m_spike), "xWrong": x(m_wrong),
-                "Needs2x(σ)": 1.0, "Score": 1.0,
+                "Needs2x(σ)": need2,
             })
     out = pd.DataFrame(rows)
     meta = {"sd": sd, "T0d": T0 * 365, "T1d": T1 * 365, "crush": iv_shock}
+    if out.empty:
+        return out, meta
+
+    out["vol_pct"] = out["Vol"].rank(pct=True)
+    fuel = out["OIchg"].clip(lower=0)
+    max_fuel = fuel.max()
+    out["fuel_pct"] = fuel / max_fuel if max_fuel and max_fuel > 0 else 0.0
+    reward = 0.5 * (out["x1σ"] - 1) + 0.5 * (out["x1σ crush"] - 1)
+    loss = (1 - out["xWrong"]).clip(lower=0, upper=1)
+    liq = out["Spread%"].apply(lambda v: 0.5 if pd.isna(v) else 1.0 if v <= 3 else 0.7 if v <= 6 else 0.4 if v <= 12 else 0.15)
+    prob = (2 * out["Delta"]).clip(upper=1.0) ** 0.5
+    activity = 0.5 + 0.25 * out["vol_pct"] + 0.25 * out["fuel_pct"]
+    out["Score"] = (reward.clip(lower=0) / (0.25 + loss)) * liq * prob * activity
+    out = out.sort_values("Score", ascending=False).reset_index(drop=True)
     return out, meta
 
 
@@ -1113,7 +1233,16 @@ def fmt_scanner(df):
     d = df.copy()
     for c in ("x0.5σ", "x1σ", "x1.5σ", "xWall", "x1σ crush", "x1σ spike", "xWrong"):
         d[c] = d[c].map(lambda v: "-" if v is None or pd.isna(v) else f"{v:.2f}x")
-    cols = ["Side", "Strike", "LTP", "x0.5σ", "x1σ", "Score"]
+    d["Strike"] = d["Strike"].map(lambda v: f"{v:,.0f}")
+    d["LTP"] = d["LTP"].map(lambda v: f"{v:,.1f}")
+    d["Δ"] = d.apply(lambda r: f"{r['Delta']:.2f}→{r['Delta@1σ']:.2f}", axis=1)
+    d["Spread%"] = d["Spread%"].map(lambda v: "-" if pd.isna(v) else f"{v:.1f}")
+    d["Vol"] = d["Vol"].map(lambda v: f"{v:,.0f}")
+    d["OIchg"] = d["OIchg"].map(lambda v: f"{v:+,.0f}")
+    d["Needs2x(σ)"] = d["Needs2x(σ)"].map(lambda v: ">4" if v is None or pd.isna(v) else f"{v:.2f}")
+    d["Score"] = d["Score"].map(lambda v: f"{v:.2f}")
+    cols = ["Side", "Strike", "Money", "LTP", "Δ", "Spread%", "Vol", "OIchg", "x0.5σ", "x1σ", "x1.5σ",
+            "xWall", "x1σ crush", "x1σ spike", "xWrong", "Needs2x(σ)", "Score"]
     return d[cols]
 
 
@@ -1126,9 +1255,12 @@ def esc(x):
 # ============================================================
 with st.sidebar:
     st.markdown("### BBG // TERMINAL CONFIG")
-    dhan_token = clean(st.text_input("DHAN ACCESS TOKEN", type="password", value=DEFAULT_DHAN_TOKEN))
+    dhan_token = clean(st.text_input("DHAN ACCESS TOKEN", type="password", value=DEFAULT_DHAN_TOKEN,
+                                     help="The long JWT (starts with 'eyJ'). NOT the API key/secret."))
     client_id = clean(st.text_input("DHAN CLIENT ID", value=DEFAULT_CLIENT_ID))
-    groq_key = st.text_input("GROQ API KEY", type="password", value=DEFAULT_GROQ_KEY).strip()
+    groq_key = st.text_input("GROQ API KEY", type="password", value=DEFAULT_GROQ_KEY,
+                             help="Paste your Groq API key here to activate the AI Council.").strip()
+
     groq_model = st.selectbox("GROQ MODEL", GROQ_MODELS, index=0)
 
     if not dhan_token:
@@ -1137,6 +1269,21 @@ with st.sidebar:
     if not client_id:
         st.error("DHAN client ID required.")
         st.stop()
+
+    with st.expander("🔧 DIAGNOSTICS"):
+        st.write(f"Token length: **{len(dhan_token)}** | starts: `{dhan_token[:3]}…`")
+        st.write(f"Client ID: `{client_id}`")
+        st.write(f"Token pre-filled from secrets/env: **{bool(DEFAULT_DHAN_TOKEN)}**")
+        if not dhan_token.startswith("eyJ"):
+            st.warning("Token does not start with 'eyJ' - this may be the API key, not the access token.")
+        if st.button("Test token (/v2/profile)"):
+            try:
+                pr = requests.get(PROFILE_URL,
+                                 headers={"access-token": dhan_token, "client-id": client_id},
+                                 timeout=10)
+                st.code(f"{pr.status_code}\n{pr.text[:600]}")
+            except Exception as e:
+                st.error(e)
 
     idx_name = st.selectbox("INDEX SELECTION", list(INDEX_MAP.keys()))
     info = INDEX_MAP[idx_name]
@@ -1147,29 +1294,44 @@ with st.sidebar:
         expiries = []
         st.error(f"Could not load expiries: {e}")
     if not expiries:
-        st.warning("No expiries available.")
+        st.warning("No expiries available. Use DIAGNOSTICS → Test token.")
         st.stop()
 
     expiry = st.selectbox("EXPIRY DATE", expiries)
-    auto_prev = st.toggle("AUTO PREV CLOSE", value=True)
+    auto_prev = st.toggle("AUTO PREV CLOSE", value=True,
+                         help="Fetch yesterday's close from Dhan. Turn off to type it manually.")
     auto_val, auto_src = (None, "")
     if auto_prev:
         auto_val, auto_src = fetch_prev_close(info["scrip"], info["seg"], dhan_token, client_id)
     if auto_prev and auto_val:
         prev_close = float(auto_val)
+        st.caption(f"PREV CLOSE = {prev_close:,.2f}  ({auto_src})")
     else:
-        prev_close = st.number_input("PREV CLOSE", value=info["default_prev"], step=float(info["step"]))
-    live_news = st.toggle("LIVE NEWS FEED", value=True)
-    news = st.text_area("EXTRA NEWS / MACRO NOTES", height=80)
-    horizon_days = 0.25
-    iv_shock = 15
-    exh_lookback = 15
+        if auto_prev:
+            st.warning(f"Auto prev close unavailable: {auto_src}. Enter it manually.")
+        prev_close = st.number_input("PREV CLOSE", value=info["default_prev"], step=float(info["step"]),
+                                     key=f"prev_{idx_name}",
+                                     help="Yesterday's close. Used by the bias score.")
+    live_news = st.toggle("LIVE NEWS FEED", value=True,
+                          help="Fetch fresh market headlines (Google News RSS) for the Sentiment agent.")
+    news = st.text_area("EXTRA NEWS / MACRO NOTES", placeholder="Optional: add your own notes on top of the live feed",
+                        height=80)
+    horizon_label = st.selectbox("SCENARIO HORIZON (premium scanner)",
+                                 ["Intraday (0.25d)", "1 day", "2 days"], index=0)
+    horizon_days = {"Intraday (0.25d)": 0.25, "1 day": 1.0, "2 days": 2.0}[horizon_label]
+    iv_shock = st.slider("IV CRUSH / SPIKE SHOCK (%)", 5, 40, 15, step=5,
+                         help="Relative change applied to IV in the crush / spike scenarios.")
+    exh_lookback = st.slider("EXHAUSTION LOOKBACK (min)", 6, 45, 15, step=3,
+                             help="History window used by the exhaustion monitor. With a 3-min refresh, 15 min = 5 snapshots.")
     force_run = st.button("FORCE AI RUN")
 
     auto_refresh = st.toggle("AUTO REFRESH (3 MIN)", value=True)
     if auto_refresh and st_autorefresh:
         st_autorefresh(interval=180000, limit=None, key="bbg")
 
+# ============================================================
+# FETCH + ANALYZE
+# ============================================================
 try:
     spot, df = fetch_option_chain(info["scrip"], info["seg"], expiry, dhan_token, client_id)
 except Exception as e:
@@ -1177,7 +1339,7 @@ except Exception as e:
     st.stop()
 
 if df.empty or spot == 0:
-    st.warning("Option chain returned no data.")
+    st.warning("Option chain returned no data (market closed or invalid expiry).")
     st.stop()
 
 m = compute_metrics(df, spot, prev_close, expiry, info["step"])
@@ -1186,6 +1348,7 @@ hist = record_snapshot(m, f"{idx_name}|{expiry}")
 m["exh"] = exhaustion(hist, m, prev_close, exh_lookback)
 m["exh_flag"] = exh_flag(m["exh"])
 
+# ---- live news ----
 news_items, news_status = ([], ["LIVE NEWS: off"])
 if live_news:
     try:
@@ -1196,6 +1359,7 @@ if live_news:
 news_text = news_for_ai(news_items, news)
 nhash = news_hash(news_items)
 
+# ---- AI gating + cache ----
 changed, reason = evaluate_market_state_change(m, vel, nhash)
 if force_run or changed:
     ai = run_council(m, vel, news_text, groq_key, groq_model)
@@ -1209,43 +1373,273 @@ if force_run or changed:
             "news_hash": nhash,
             "exh_flag": m.get("exh_flag", ""),
         }
-        gate_label = f"FRESH | {ai.get('_model', groq_model)}"
+        gate_label = f"FRESH ({'FORCED' if force_run else reason}) | {ai.get('_model', groq_model)}"
     else:
         err = ai["error"]
         cached = st.session_state.get("last_ai_verdict")
         ai = cached if cached else ai
-        gate_label = f"AI ERROR: {err}"
+        gate_label = f"AI ERROR: {err}" + (" (showing cached)" if cached else "")
 else:
     ai = st.session_state.get("last_ai_verdict", {"error": "No verdict yet."})
     t = st.session_state.get("last_ai_time")
     gate_label = f"CACHED {t.strftime('%H:%M:%S') if t else ''}"
 
+# ============================================================
+# MAIN TITLE
+# ============================================================
 st.markdown(f"## {idx_name} // SPOT {spot:,.2f}  ({spot - prev_close:+,.2f})")
 
-status = m["status"]
-color = "#00e676" if "BULLISH" in status else "#ff1744" if "BEARISH" in status else "#ffab00"
-st.markdown(f"""
-<div class="bbg-panel" style="border:2px solid {color};">
-  <div class="bbg-title">Dual-Force Engine</div>
-  <div class="bbg-big" style="color:{color};">{status} &nbsp;|&nbsp; {m['engine_signal']}</div>
-  <div class="bbg-desc">{m['desc']}</div>
-</div>""", unsafe_allow_html=True)
+if abs(prev_close - spot) / spot > 0.05:
+    st.warning(f"PREV CLOSE ({prev_close:,.0f}) is more than 5% away from spot ({spot:,.0f}). "
+               "It is probably stale or wrong, and it skews the BIAS SCORE.")
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("BIAS SCORE", f"{m['score']}/100", m["bias"])
-c2.metric("PCR", f"{m['pcr']:.2f}")
-c3.metric("EXPECTED MOVE (±)", f"{m['exp_move']:,.0f}")
-c4.metric("OI BATTLE", m["battle"])
+# ============================================================
+# MULTI-TAB ARCHITECTURE
+# ============================================================
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "📊 Dashboard & Engine", 
+    "📐 Day Levels & Exhaustion", 
+    "🎯 Premium Scanner", 
+    "🤖 Live News & AI Council", 
+    "📋 Raw Option Chain"
+])
 
-st.markdown("#### AI COUNCIL")
-st.caption(f"Gate: {gate_label}")
-if "error" in ai and "signal" not in ai:
-    st.warning(ai["error"])
-else:
-    sig = build_signal(m, ai)
+# ------------------------------------------------------------
+# TAB 1: DASHBOARD & ENGINE
+# ------------------------------------------------------------
+with tab1:
+    status = m["status"]
+    if "BULLISH GAMMA BLAST" in status:
+        color, flash = "#00e676", "flash-green"
+    elif "BEARISH GAMMA BLAST" in status:
+        color, flash = "#ff1744", "flash-red"
+    elif "TRAP" in status or "CONFLICTED" in status:
+        color, flash = "#ffab00", "flash-amber"
+    else:
+        color, flash = "#90a4ae", ""
+
     st.markdown(f"""
-    <div class="bbg-panel">
-      <div class="bbg-title">Risk-Validated Signal</div>
-      <div class="bbg-big">{sig['signal']} &nbsp;|&nbsp; Confidence {sig['confidence']}%</div>
-      <div class="bbg-desc">{esc(sig['note'])}</div>
+    <div class="bbg-panel {flash}" style="border:2px solid {color};">
+      <div class="bbg-title">Dual-Force Engine</div>
+      <div class="bbg-big" style="color:{color};">{status} &nbsp;|&nbsp; {m['engine_signal']}</div>
+      <div class="bbg-desc">{m['desc']}</div>
     </div>""", unsafe_allow_html=True)
+
+    # ---- ENGINE DEBUG ROW ----
+    es = m["engine"]
+    st.caption(f"DUAL-FORCE ENGINE INPUTS (near-spot strikes, % of that side's OI | each leg needs >= {MIN_FLOW_PCT:.1f}%)")
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("CE EXITS", f"{es['ce_exit_pct']:.1f}%", f"{es['ce_exits']:+,.0f} qty", delta_color="off")
+    d2.metric("PE BUILDS", f"{es['pe_build_pct']:.1f}%", f"{es['pe_build']:+,.0f} qty", delta_color="off")
+    d3.metric("PE EXITS", f"{es['pe_exit_pct']:.1f}%", f"{es['pe_exits']:+,.0f} qty", delta_color="off")
+    d4.metric("CE BUILDS", f"{es['ce_build_pct']:.1f}%", f"{es['ce_build']:+,.0f} qty", delta_color="off")
+    
+    f1, f2, f3 = st.columns(3)
+    f1.metric("BULL FORCE (PE build + CE exit)", f"{es['bull_force']:.1f}")
+    f2.metric("BEAR FORCE (CE build + PE exit)", f"{es['bear_force']:.1f}")
+    f3.metric("FORCE RATIO", f"{min(es['force_ratio'], 99):.2f}x", f"winner needs >= {DOMINANCE}x", delta_color="off")
+
+    if m["iv_gap"] > 3:
+        st.caption(f"⚠ ATM IV mismatch: CE {m['atm_iv_ce']:.1f}% vs PE {m['atm_iv_pe']:.1f}% (stale quotes). Expected move uses average ({m['atm_iv']:.1f}%).")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("BIAS SCORE", f"{m['score']}/100", m["bias"])
+    c2.metric("PCR", f"{m['pcr']:.2f}")
+    c3.metric("EXPECTED MOVE (±)", f"{m['exp_move']:,.0f}", f"IV {m['atm_iv']:.1f}% | {m['dte']}d")
+    c4.metric("OI BATTLE", m["battle"])
+
+    c5, c6, c7, c8 = st.columns(4)
+    c5.metric("CALL WALL", f"{m['call_wall']:,.0f}")
+    c6.metric("PUT WALL", f"{m['put_wall']:,.0f}")
+    c7.metric("MAX PAIN", f"{m['max_pain']:,.0f}")
+    c8.metric("GAMMA STRIKE", f"{m['gamma_strike']:,.0f}", f"{m['gamma_strike'] - spot:+,.0f} vs spot")
+
+    c9, c10, c11, c12 = st.columns(4)
+    c9.metric("CE TRAP (RES)", f"{m['ce_trap']:,.0f}" if m["ce_trap"] else "—")
+    c10.metric("PE TRAP (SUPP)", f"{m['pe_trap']:,.0f}" if m["pe_trap"] else "—")
+    c11.metric("NET CE OI Δ", f"{m['dce']:+,.0f}")
+    c12.metric("NET PE OI Δ", f"{m['dpe']:+,.0f}")
+
+    # ---- JOBBER MICRO-LADDER PANEL ----
+    st.markdown("#### ⚡ JOBBER MICRO-LADDER & ABSORPTION FEED")
+    j1, j2, j3 = st.columns(3)
+    j1.metric("LADDER IMBALANCE", f"{m['jobber']['ladder_imbalance']:+.3f}", "Range: -1.0 to +1.0")
+    j2.metric("MAX PRESSURE POCKET", f"{m['jobber']['pocket_support']:,.0f}", "Closest High-Liquidity Node")
+    j3.metric("MICRO-TURN STATUS", m["jobber"]["micro_turn"])
+
+    st.markdown("#### 3-MIN OI VELOCITY (near spot)")
+    v1, v2, v3, v4 = st.columns(4)
+    v1.metric("CE BUILDS", f"{vel['ce_builds']:,.0f}")
+    v2.metric("CE UNWINDS", f"{vel['ce_unwinds']:,.0f}")
+    v3.metric("PE BUILDS", f"{vel['pe_builds']:,.0f}")
+    v4.metric("PE UNWINDS", f"{vel['pe_unwinds']:,.0f}")
+    if sum(vel.values()) == 0:
+        st.caption("Velocity needs two snapshots ~3 min apart. It will populate after the next refresh.")
+
+# ------------------------------------------------------------
+# TAB 2: DAY LEVELS & EXHAUSTION
+# ------------------------------------------------------------
+with tab2:
+    st.markdown("#### 📐 DAY MOVEMENT LEVELS")
+    try:
+        candles = fetch_daily_candles(info["scrip"], info["seg"], dhan_token, client_id)
+        candle_err = ""
+    except Exception as e:
+        candles, candle_err = [], str(e)
+    dl = compute_day_levels(candles, m["spot"], daily_sigma(m), m, prev_close)
+    if candle_err:
+        st.warning(f"Daily candles unavailable ({candle_err[:160]}). Showing sigma bands around PREV CLOSE.")
+    st.caption(f"Basis: {dl['basis']} | 1σ daily ≈ {dl['sd']:,.0f} pts" + (f" | ATR(14) ≈ {dl['atr']:,.0f} pts" if dl["atr"] else ""))
+    
+    lc1, lc2, lc3 = st.columns(3)
+    lc1.metric("1σ RANGE (68%)", f"{dl['band1'][0]:,.0f} – {dl['band1'][1]:,.0f}")
+    lc2.metric("2σ RANGE (95%)", f"{dl['band2'][0]:,.0f} – {dl['band2'][1]:,.0f}")
+    lc3.metric("MOVE SO FAR", f"{dl['moved_sigma']:+.2f}σ", f"{m['spot'] - dl['ref_close']:+,.0f} pts vs ref close", delta_color="off")
+    
+    show = dl["table"].copy()
+    show["Price"] = show["Price"].map(lambda v: f"{v:,.0f}")
+    show["Dist pts"] = show["Dist pts"].map(lambda v: f"{v:+,.0f}")
+    show["Dist σ"] = show["Dist σ"].map(lambda v: f"{v:+.2f}")
+    st.dataframe(show, width="stretch", hide_index=True)
+
+    st.markdown("---")
+    st.markdown("#### 🧭 EXHAUSTION MONITOR")
+    ex = m["exh"]
+    if not ex["ready"]:
+        st.info(ex["why"] + " History saves per day and builds while this page is open.")
+    else:
+        st.caption(f"Window {ex['age']:.0f} min ({ex['n']} snapshots stored) | spot {ex['spot_chg_sigma']:+.2f}σ over window")
+        ecol1, ecol2 = st.columns(2)
+        for col, key, title in ((ecol1, "buyer", "BUYER EXHAUSTION (uptrend fading)"),
+                                (ecol2, "seller", "SELLER EXHAUSTION (downtrend fading)")):
+            side_ = ex[key]
+            scol = "#ff1744" if side_["flag"] == "CONFIRMED" else "#ffab00" if side_["flag"] in ("WATCH", "EARLY") else "#90a4ae"
+            rows = "".join(f'<div class="agent">{"🔴" if v >= 1 else "🟠" if v >= 0.5 else "⚪"} <b>{esc(n)}:</b> {esc(d)}</div>' for n, v, d in side_["signals"])
+            col.markdown(f"""<div class="bbg-panel" style="border:2px solid {scol};">
+              <div class="bbg-title">{title}</div>
+              <div class="bbg-big" style="color:{scol};">{side_['score']}/100</div>
+              <div class="bbg-desc" style="color:{scol};">{esc(side_['status'])}</div>
+              {rows}</div>""", unsafe_allow_html=True)
+    
+    with st.expander("SESSION HISTORY (spot / IV / PCR)"):
+        if len(hist) >= 2:
+            hdf = pd.DataFrame([{"Time": datetime.fromtimestamp(h["ts"], IST).strftime("%H:%M:%S"), "Spot": h["spot"],
+                                 "ATM IV": round(h["iv"], 2), "PCR": round(h["pcr"], 3), "Flow edge": round(h["edge"], 2),
+                                 "Status": h["status"]} for h in hist])
+            st.line_chart(hdf.set_index("Time")[["Spot"]])
+            st.line_chart(hdf.set_index("Time")[["ATM IV"]])
+            st.dataframe(hdf.iloc[::-1], width="stretch", hide_index=True)
+        else:
+            st.write("Waiting for more snapshots.")
+
+# ------------------------------------------------------------
+# TAB 3: PREMIUM SCANNER
+# ------------------------------------------------------------
+with tab3:
+    st.markdown("#### 🎯 PREMIUM POTENTIAL SCANNER")
+    scan, smeta = premium_scanner(m, horizon_days, iv_shock)
+    lean_now = sum(c["v"] for c in chain_checks(m))
+    fav = "CE" if lean_now > 0 else "PE" if lean_now < 0 else None
+    if "BULLISH GAMMA" in m["status"]:
+        fav = "CE"
+    elif "BEARISH GAMMA" in m["status"]:
+        fav = "PE"
+    
+    if scan.empty:
+        st.info("No priced options found (market closed or premiums below minimum threshold).")
+    else:
+        fav_txt = {"CE": "CALLS (bullish side)", "PE": "PUTS (bearish side)"}.get(fav, "NO CLEAR SIDE - both shown")
+        st.caption(f"Chain lean {lean_now:+d} | status {m['status']} → favoured: {fav_txt}. Horizon: {horizon_label} | IV shock: ±{smeta['crush']:.0f}%.")
+        
+        top = scan[scan["Side"] == fav].head(5) if fav else scan.head(6)
+        other = scan[scan["Side"] != fav].head(3) if fav else None
+        
+        st.dataframe(fmt_scanner(top), width="stretch", hide_index=True)
+        if other is not None and not other.empty:
+            with st.expander("Counter-trend side (against chain lean)"):
+                st.dataframe(fmt_scanner(other), width="stretch", hide_index=True)
+
+        b = top.iloc[0]
+        sgn = 1 if b["Side"] == "CE" else -1
+        s1 = m["spot"] + sgn * smeta["sd"]
+        st.markdown(f"""<div class="bbg-panel">
+          <div class="bbg-title">Top pick walk-through: {m['spot']:,.0f} spot, {b['Strike']:,.0f} {b['Side']} ({b['Money']}) at ₹{b['LTP']:,.1f}</div>
+          <div class="agent">If spot moves 1σ in favour to ≈ <b>{s1:,.0f}</b>: premium ≈ <b>{b['x1σ']:.2f}x</b> (₹{b['LTP']*b['x1σ']:,.1f}); delta rises {b['Delta']:.2f} → {b['Delta@1σ']:.2f}.</div>
+          <div class="agent">With IV crush −{smeta['crush']:.0f}%: <b>{b['x1σ crush']:.2f}x</b> (₹{b['LTP']*b['x1σ crush']:,.1f}) | IV spike +{smeta['crush']:.0f}%: <b>{b['x1σ spike']:.2f}x</b> (₹{b['LTP']*b['x1σ spike']:,.1f}).</div>
+        </div>""", unsafe_allow_html=True)
+
+# ------------------------------------------------------------
+# TAB 4: LIVE NEWS & AI COUNCIL
+# ------------------------------------------------------------
+with tab4:
+    col_n, col_ai = st.columns(2)
+    
+    with col_n:
+        st.markdown("#### 📰 LIVE MARKET NEWS")
+        if news_items:
+            tone = headline_tone(news_items)
+            tcol = "#00e676" if tone > 15 else "#ff1744" if tone < -15 else "#90a4ae"
+            rows = []
+            for i in news_items:
+                link = i["link"] if i["link"].startswith(("http://", "https://")) else ""
+                t = esc(i["title"])
+                t = f'<a href="{html.escape(link, quote=True)}" target="_blank" style="color:#ddd;">{t}</a>' if link else t
+                rows.append(f'<div class="agent"><b>{esc(age_label(i["age_min"]))}</b> · {esc(i["source"])} — {t}</div>')
+            st.markdown(f"""<div class="bbg-panel">
+              <div class="bbg-title">Headline tone: <span style="color:{tcol};">{tone:+d}</span></div>
+              {''.join(rows)}</div>""", unsafe_allow_html=True)
+        else:
+            st.warning("No headlines available. " + " | ".join(news_status))
+
+    with col_ai:
+        st.markdown("#### 🤖 AI COUNCIL")
+        st.caption(f"Gate: {gate_label}")
+        if "error" in ai and "signal" not in ai:
+            st.warning(ai["error"])
+        else:
+            sig = build_signal(m, ai)
+            scolor = {"BUY": "#00e676", "SELL": "#ff1744"}.get(sig["signal"], "#90a4ae")
+            lv = ""
+            if sig["target"] is not None:
+                rr_txt = f"1:{sig['rr']:.1f}" if sig["rr"] else "n/a"
+                lv = (f"Entry {sig['entry']:,.0f} | Target {sig['target']:,.0f} | SL {sig['sl']:,.0f} | R:R {rr_txt}")
+            ai_note = f" (AI said {sig['ai_signal']})" if sig["ai_signal"] != sig["signal"] else ""
+            
+            st.markdown(f"""
+            <div class="bbg-panel" style="border:2px solid {scolor};">
+              <div class="bbg-title">Risk-Validated Signal</div>
+              <div class="bbg-big" style="color:{scolor};">{sig['signal']}{esc(ai_note)} &nbsp;|&nbsp; Confidence {sig['confidence']}%</div>
+              <div class="bbg-desc">{lv}</div>
+              <div class="bbg-desc" style="color:#ffab00;">{esc(sig['note']) if sig['note'] else ''}</div>
+            </div>""", unsafe_allow_html=True)
+
+            d = sig["direction"]
+            def icon(v):
+                if d == 0:
+                    return "🟢" if v > 0 else "🔴" if v < 0 else "⚪"
+                return "✅" if v * d > 0 else "❌" if v * d < 0 else "➖"
+            crow = "".join(f'<div class="agent">{icon(c["v"])} <b>{esc(c["name"])}:</b> {esc(c["detail"])}</div>' for c in sig["checks"])
+            
+            st.markdown(f"""
+            <div class="bbg-panel">
+              <div class="bbg-title">Option-chain cross-check</div>
+              {crow}
+            </div>""", unsafe_allow_html=True)
+
+            st.markdown(f"""
+            <div class="bbg-panel">
+              <div class="agent"><b>Price Action:</b> {esc(ai.get('price_action_agent'))}</div>
+              <div class="agent"><b>Order Flow:</b> {esc(ai.get('order_flow_agent'))}</div>
+              <div class="agent"><b>Volatility:</b> {esc(ai.get('volatility_agent'))}</div>
+              <div class="agent"><b>Sentiment:</b> {esc(ai.get('news_agent'))}</div>
+              <div class="agent"><b>Risk Officer:</b> {esc(ai.get('final_approval'))}</div>
+            </div>""", unsafe_allow_html=True)
+
+# ------------------------------------------------------------
+# TAB 5: RAW OPTION CHAIN
+# ------------------------------------------------------------
+with tab5:
+    st.markdown("#### 📋 RAW OPTION CHAIN DATA")
+    st.dataframe(m["df"], width="stretch", hide_index=True)
+
+st.caption(f"1σ range: {m['lower_1sigma']:,.0f} to {m['upper_1sigma']:,.0f}  |  Updated {datetime.now(IST).strftime('%H:%M:%S')}")
