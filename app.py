@@ -1,5 +1,5 @@
 """
-VIPUL BLOOMBERG PROFESSIONAL TERMINAL v7.4 (Paper/Live Automated Trading Edition)
+VIPUL BLOOMBERG PROFESSIONAL TERMINAL v7.5 (Full Production Edition)
 Unified: v5.0/v6.0 engine + Jobber Microstructure + Exhaustion + Scanner + Paper Ledger + Excel Export + Auto-Execution
 """
 
@@ -32,7 +32,7 @@ try:
 except ImportError:
     Groq = None
 
-st.set_page_config(page_title="Vipul Bloomberg Terminal v7.4", layout="wide")
+st.set_page_config(page_title="Vipul Bloomberg Terminal v7.5", layout="wide")
 
 # ============================================================
 # SESSION STATE & PAPER LEDGER DEFAULTS (₹1,00,000 Capital)
@@ -43,7 +43,7 @@ if "oi_snap" not in st.session_state:
     st.session_state["oi_snap"] = None
 
 def paper_ledger_path():
-    return os.path.join(tempfile.gettempdir(), f"bbg_paper_ledger_1l_{datetime.now(IST).date().isoformat()}.json")
+    return os.path.join(tempfile.gettempdir(), f"bbg_paper_ledger_1l_{datetime.now(timezone(timedelta(hours=5, minutes=30))).date().isoformat()}.json")
 
 def load_paper_ledger():
     try:
@@ -960,9 +960,7 @@ def bs_price(S, K, T, iv_pct, is_call):
         return max(0.0, (S - K) if is_call else (K - S))
     sq = sigma * math.sqrt(T)
     d1 = (math.log(S / K) + (RISK_FREE + 0.5 * sigma * sigma) * T) / sq
-    d2 = d1 - sq
-    disc = math.exp(-RISK_FREE * T)
-    return S * _ncdf(d1) - K * disc * _ncdf(d2) if is_call else K * disc * _ncdf(-d2) - S * _ncdf(-d1)
+    return S * _ncdf(d1) - K * math.exp(-RISK_FREE * T) * _ncdf(d1 - sq) if is_call else K * math.exp(-RISK_FREE * T) * _ncdf(- (d1 - sq)) - S * _ncdf(-d1)
 
 def bs_delta(S, K, T, iv_pct, is_call):
     sigma = iv_pct / 100.0
@@ -972,18 +970,11 @@ def bs_delta(S, K, T, iv_pct, is_call):
     d1 = (math.log(S / K) + (RISK_FREE + 0.5 * sigma * sigma) * T) / sq
     return _ncdf(d1) if is_call else _ncdf(d1) - 1.0
 
-def reprice(ltp, S0, S1, K, T0, T1, iv0, iv1, is_call):
-    base = bs_price(S0, K, T0, iv0, is_call)
-    if base < 1e-6:
-        return None
-    return ltp * bs_price(S1, K, T1, iv1, is_call) / base
-
 def premium_scanner(m, horizon_days=0.25, iv_shock=15.0):
     df, S0, step = m["df"], m["spot"], m["step"]
     atm_iv = m["atm_iv"]
     sd = S0 * atm_iv / 100.0 * math.sqrt(1.0 / 365.0)
     T0 = max(m["dte"], 0.25) / 365.0
-    T1 = max(T0 - horizon_days / 365.0, 0.05 / 365.0)
     span = max(2.5 * sd, 8 * step)
     cand = df[(df["Strike"] >= S0 - span) & (df["Strike"] <= S0 + span)]
     
@@ -991,12 +982,11 @@ def premium_scanner(m, horizon_days=0.25, iv_shock=15.0):
     for _, r in cand.iterrows():
         K = float(r["Strike"])
         for side in ("CE", "PE"):
-            is_call = side == "CE"
             ltp = float(r.get(f"{side}_LTP", 0) or 0)
             if ltp < MIN_PREMIUM:
                 continue
             iv0 = float(r.get(f"{side}_IV", 0) or 0) or atm_iv
-            d_now = abs(float(r.get(f"{side}_Delta", 0) or 0)) or abs(bs_delta(S0, K, T0, iv0, is_call))
+            d_now = abs(float(r.get(f"{side}_Delta", 0) or 0)) or abs(bs_delta(S0, K, T0, iv0, side == "CE"))
             rows.append({
                 "Side": side, "Strike": K, "LTP": ltp, "Delta": d_now,
                 "OI": float(r[f"{side}_OI"]), "Score": 1.0
@@ -1157,9 +1147,8 @@ with tab4:
             ledger = st.session_state["paper_ledger"]
             open_paper = [t for t in ledger["trades"] if t["status"] == "OPEN"]
             if not open_paper:
-                # Calculate lots using 2% risk rule on ₹1,00,000 capital
                 bal = ledger["balance"]
-                allowed_lots = max(1, int((bal * 0.02) / (30 * 65))) # example risk sizing
+                allowed_lots = max(1, int((bal * 0.02) / (30 * 65)))
                 auto_trade = {
                     "id": hashlib.md5(str(time.time()).encode()).hexdigest()[:6],
                     "time": datetime.now(IST).strftime("%H:%M:%S"),
