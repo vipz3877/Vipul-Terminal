@@ -1,6 +1,6 @@
 """
-VIPUL BLOOMBERG PROFESSIONAL TERMINAL v7.5 (Full Production Edition)
-Unified: v5.0/v6.0 engine + Jobber Microstructure + Exhaustion + Scanner + Paper Ledger + Excel Export + Auto-Execution
+VIPUL BLOOMBERG PROFESSIONAL TERMINAL v7.6 (Dhan Matching Trade History)
+Unified: v5.0/v6.0 engine + Jobber Microstructure + Exhaustion + Scanner + Dhan-Matched Excel Export
 """
 
 import os
@@ -32,18 +32,20 @@ try:
 except ImportError:
     Groq = None
 
-st.set_page_config(page_title="Vipul Bloomberg Terminal v7.5", layout="wide")
+st.set_page_config(page_title="Vipul Bloomberg Terminal v7.6", layout="wide")
 
 # ============================================================
 # SESSION STATE & PAPER LEDGER DEFAULTS (₹1,00,000 Capital)
 # ============================================================
+IST = timezone(timedelta(hours=5, minutes=30))
+
 if "hist" not in st.session_state:
     st.session_state["hist"] = []
 if "oi_snap" not in st.session_state:
     st.session_state["oi_snap"] = None
 
 def paper_ledger_path():
-    return os.path.join(tempfile.gettempdir(), f"bbg_paper_ledger_1l_{datetime.now(timezone(timedelta(hours=5, minutes=30))).date().isoformat()}.json")
+    return os.path.join(tempfile.gettempdir(), f"bbg_paper_ledger_1l_{datetime.now(IST).date().isoformat()}.json")
 
 def load_paper_ledger():
     try:
@@ -125,7 +127,6 @@ DOMINANCE = 1.5
 MIN_CONFIRM = 2
 SL_BUFFER = 35
 FLOW_EDGE_PCT = 2.0
-IST = timezone(timedelta(hours=5, minutes=30))
 
 HIST_MIN_GAP_SEC = 60
 HIST_MAX = 400
@@ -254,7 +255,6 @@ def _strip_source(title, source):
         return title[: -(len(source) + 3)]
     return title
 
-
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_news(idx_name, extra_feeds=()):
     queries = ['Nifty OR Sensex OR "Dalal Street"', "India stocks FII DII", 'RBI OR "US Fed" OR "crude oil" OR rupee']
@@ -296,7 +296,6 @@ def fetch_news(idx_name, extra_feeds=()):
     items.sort(key=lambda x: x["ts"], reverse=True)
     return items, status
 
-
 def recent_news(items, max_age_h=NEWS_MAX_AGE_H, top_n=NEWS_TOP_N):
     now = time.time()
     fresh = [i for i in items if i["ts"] and (now - i["ts"]) <= max_age_h * 3600]
@@ -309,14 +308,12 @@ def recent_news(items, max_age_h=NEWS_MAX_AGE_H, top_n=NEWS_TOP_N):
         out.append(d)
     return out
 
-
 def age_label(mins):
     if mins < 60:
         return f"{mins}m ago"
     if mins < 1440:
         return f"{mins // 60}h ago"
     return f"{mins // 1440}d ago"
-
 
 def headline_tone(items):
     pos = neg = 0
@@ -326,7 +323,6 @@ def headline_tone(items):
         neg += sum(1 for w in NEG_WORDS if re.search(rf"\b{re.escape(w)}\b", t))
     return round((pos - neg) / (pos + neg) * 100) if (pos + neg) else 0
 
-
 def news_for_ai(items, manual_notes):
     lines = [f"- [{age_label(i['age_min'])}] {i['source']}: {i['title']}" for i in items]
     text = "\n".join(lines) if lines else "NO HEADLINES FETCHED"
@@ -334,12 +330,10 @@ def news_for_ai(items, manual_notes):
         text += f"\n- [USER NOTE] {manual_notes.strip()}"
     return text
 
-
 def news_hash(items):
     if not items:
         return ""
     return hashlib.md5("|".join(i["title"] for i in items[:5]).encode()).hexdigest()
-
 
 def parse_dte(expiry_str):
     try:
@@ -347,7 +341,6 @@ def parse_dte(expiry_str):
         return max(1, (exp_date - datetime.now(IST).date()).days)
     except ValueError:
         return 1
-
 
 def interpret_oi_battle(ce_chg, pe_chg):
     if ce_chg > 5000 and pe_chg <= 0:
@@ -362,14 +355,12 @@ def interpret_oi_battle(ce_chg, pe_chg):
         return "Straddle Build"
     return "Liquidation"
 
-
 def calc_max_pain(df):
     strikes = df["Strike"].values
     ce_oi, pe_oi = df["CE_OI"].values, df["PE_OI"].values
     pain = [(ce_oi * np.maximum(0, k - strikes)).sum() + (pe_oi * np.maximum(0, strikes - k)).sum()
             for k in strikes]
     return float(strikes[int(np.argmin(pain))])
-
 
 def compute_bias(dce, dpe, spot, prev_close, pcr):
     score = 50
@@ -395,7 +386,6 @@ def compute_bias(dce, dpe, spot, prev_close, pcr):
     score = max(0, min(100, score))
     label = "BULLISH" if score > 55 else "BEARISH" if score < 45 else "NEUTRAL"
     return score, label
-
 
 def engine_sums(near):
     out = {k: 0.0 for k in ("ce_exits", "pe_exits", "ce_build", "pe_build",
@@ -432,7 +422,6 @@ def engine_sums(near):
     out["force_ratio"] = (hi / lo) if lo > 0 else (999.0 if hi > 0 else 1.0)
     return out
 
-
 def detect_gamma_blast(near):
     e = engine_sums(near)
     if near is None or near.empty:
@@ -462,7 +451,6 @@ def detect_gamma_blast(near):
     if e["pe_exit_pct"] >= MIN_FLOW_PCT and e["ce_build_pct"] < weak:
         return "IV SPIKE BEAR TRAP", "WAIT", "Isolated put short covering without call support. Trap risk."
     return "BALANCED ACCUMULATION", "WAIT", "Market in range compression. Awaiting trigger."
-
 
 def calculate_jobber_microstructure(df, spot):
     df = df.copy()
@@ -494,7 +482,6 @@ def calculate_jobber_microstructure(df, spot):
         "pocket_support": pocket_support,
         "micro_turn": micro_turn_signal,
     }
-
 
 def find_structure(df, spot, step, exp_move, call_wall, put_wall):
     reach = max(exp_move * 1.5, step * 4)
@@ -590,7 +577,7 @@ def update_oi_velocity(m, key):
         if stk not in snap["map"]:
             continue
         p_ce, p_pe = snap["map"][stk]
-        d_ce, d_pe = c_ce - p_ce, c_ce - p_pe
+        d_ce, d_pe = c_ce - p_ce, c_pe - p_pe
         if d_ce > 0:
             vel["ce_builds"] += d_ce
         elif d_ce < 0:
@@ -847,10 +834,8 @@ def compute_day_levels(candles, spot, sd, m, prev_close_fallback):
             "ref_close": c, "basis": f"session {ref['date']}" if ref else "fallback", "sd": sd, "tol": tol,
             "band1": (c - sd, c + sd), "band2": (c - 2 * sd, c + 2 * sd), "moved_sigma": (spot - c) / sd if sd else 0.0}
 
-
 def daily_sigma(m):
     return m["spot"] * m["atm_iv"] / 100.0 * math.sqrt(1.0 / 365.0)
-
 
 def hist_path(key):
     safe = re.sub(r"[^A-Za-z0-9]+", "_", key)
@@ -949,7 +934,78 @@ def data_quality(m):
 
 
 # ============================================================
-# PREMIUM SCANNER & EXCEL EXPORT
+# EXCEL EXPORT (FORMAT MATCHING DHAN CSV)
+# ============================================================
+def generate_excel_report(trades_list, virtual_balance, initial_capital):
+    """
+    Generates a double-entry (Entry/Exit rows) Excel workbook 
+    that perfectly matches the exact 11 columns in Dhan's Trade History CSV, 
+    plus an appended Realized PnL column for the exit row.
+    """
+    if not trades_list:
+        return None
+        
+    formatted_trades = []
+    
+    for t in trades_list:
+        # 1. Entry Leg
+        formatted_trades.append({
+            "Date": t.get("date", datetime.now(IST).strftime("%Y-%m-%d")),
+            "Time": t.get("time", ""),
+            "Name": f"{t.get('index', 'INDEX')} SPOT TRACKING",
+            "Buy/Sell": t.get("side", ""),
+            "Order": "MARGIN",
+            "Exchange": "NSE",
+            "Segment": "Derivative",
+            "Quantity/Lot": t.get("lots", 1),
+            "Trade Price": t.get("entry_price", 0.0),
+            "Trade Value": round(t.get("entry_price", 0.0) * t.get("lots", 1), 2),
+            "Status": "Traded",
+            "Realized PnL": ""  # PnL only booked on exit
+        })
+        
+        # 2. Exit Leg (only if trade is CLOSED)
+        if t.get("status") == "CLOSED" and t.get("exit_price") is not None:
+            exit_side = "SELL" if t.get("side") == "BUY" else "BUY"
+            formatted_trades.append({
+                "Date": t.get("exit_date", t.get("date", "")),
+                "Time": t.get("exit_time", "EOD"),
+                "Name": f"{t.get('index', 'INDEX')} SPOT TRACKING",
+                "Buy/Sell": exit_side,
+                "Order": "MARGIN",
+                "Exchange": "NSE",
+                "Segment": "Derivative",
+                "Quantity/Lot": t.get("lots", 1),
+                "Trade Price": t.get("exit_price", 0.0),
+                "Trade Value": round(t.get("exit_price", 0.0) * t.get("lots", 1), 2),
+                "Status": "Traded",
+                "Realized PnL": round(t.get("pnl", 0.0), 2)
+            })
+            
+    df_trades = pd.DataFrame(formatted_trades)
+    
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        # Sheet 1: Exact Dhan Formatted Trade Ledger
+        df_trades.to_excel(writer, index=False, sheet_name='Trade_History')
+        
+        # Sheet 2: PnL Performance Summary
+        closed_trades = [t for t in trades_list if t["status"] == "CLOSED"]
+        total_pnl = sum(t["pnl"] for t in closed_trades)
+        win_count = len([t for t in closed_trades if t["pnl"] > 0])
+        win_rate = (win_count / len(closed_trades) * 100) if closed_trades else 0.0
+        
+        summary_data = {
+            "Metric": ["Initial Capital (₹)", "Current Virtual Equity (₹)", "Overall Realized PnL (₹)", "Total Trades Executed", "Win Rate (%)"],
+            "Value": [initial_capital, virtual_balance, total_pnl, len(trades_list), f"{win_rate:.2f}%"]
+        }
+        pd.DataFrame(summary_data).to_excel(writer, index=False, sheet_name='Performance_Summary')
+        
+    return output.getvalue()
+
+
+# ============================================================
+# PREMIUM SCANNER
 # ============================================================
 def _ncdf(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
@@ -1001,25 +1057,6 @@ def fmt_scanner(df):
         d["LTP"] = d["LTP"].map(lambda v: f"{v:,.1f}")
         d["Delta"] = d["Delta"].map(lambda v: f"{v:.2f}")
     return d
-
-def generate_excel_report(trades_list, virtual_balance, initial_capital):
-    if not trades_list:
-        return None
-    df_trades = pd.DataFrame(trades_list)
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df_trades.to_excel(writer, index=False, sheet_name='Trade_History')
-        closed_trades = [t for t in trades_list if t["status"] == "CLOSED"]
-        total_pnl = sum(t["pnl"] for t in closed_trades)
-        win_count = len([t for t in closed_trades if t["pnl"] > 0])
-        win_rate = (win_count / len(closed_trades) * 100) if closed_trades else 0.0
-        
-        summary_data = {
-            "Metric": ["Initial Capital (₹)", "Current Virtual Equity (₹)", "Overall Realized PnL (₹)", "Total Trades", "Win Rate (%)"],
-            "Value": [initial_capital, virtual_balance, total_pnl, len(trades_list), f"{win_rate:.2f}%"]
-        }
-        pd.DataFrame(summary_data).to_excel(writer, index=False, sheet_name='Performance_Summary')
-    return output.getvalue()
 
 def esc(x):
     return html.escape(str(x if x is not None else "-"))
@@ -1151,10 +1188,11 @@ with tab4:
                 allowed_lots = max(1, int((bal * 0.02) / (30 * 65)))
                 auto_trade = {
                     "id": hashlib.md5(str(time.time()).encode()).hexdigest()[:6],
+                    "date": datetime.now(IST).strftime("%Y-%m-%d"),
                     "time": datetime.now(IST).strftime("%H:%M:%S"),
                     "index": idx_name, "side": sig["signal"], "entry_price": spot,
                     "lots": allowed_lots, "target": sig["target"], "sl": sig["sl"],
-                    "status": "OPEN", "exit_price": None, "pnl": 0.0
+                    "status": "OPEN", "exit_price": None, "exit_date": None, "exit_time": None, "pnl": 0.0
                 }
                 ledger["trades"].append(auto_trade)
                 save_paper_ledger(ledger)
@@ -1178,10 +1216,60 @@ with tab6:
     p2.metric("TOTAL TRADES", len(ledger["trades"]))
     p3.metric("WIN RATE", f"{win_rate:.1f}%")
     p4.metric("ACTIVE POSITIONS", len([t for t in ledger["trades"] if t["status"] == "OPEN"]))
+    
+    st.markdown("---")
+    st.markdown("#### ⚡ Execute Virtual Trade Manually")
+    if "sig" in locals() and sig["signal"] != "WAIT":
+        col_pt1, col_pt2 = st.columns(2)
+        sim_lots = col_pt1.number_input("Virtual Lots", min_value=1, value=1, step=1)
+        if col_pt2.button("🚀 SIMULATE ENTRY (PAPER TRADE)"):
+            new_trade = {
+                "id": hashlib.md5(str(time.time()).encode()).hexdigest()[:6],
+                "date": datetime.now(IST).strftime("%Y-%m-%d"),
+                "time": datetime.now(IST).strftime("%H:%M:%S"),
+                "index": idx_name, 
+                "side": sig["signal"], 
+                "entry_price": spot,
+                "lots": sim_lots, 
+                "target": sig["target"], 
+                "sl": sig["sl"],
+                "status": "OPEN", 
+                "exit_price": None, 
+                "exit_date": None,
+                "exit_time": None,
+                "pnl": 0.0
+            }
+            ledger["trades"].append(new_trade)
+            save_paper_ledger(ledger)
+            st.rerun()
 
+    st.markdown("---")
+    st.markdown("#### 📊 Trade History & Active Exits")
     if ledger["trades"]:
-        st.dataframe(pd.DataFrame(ledger["trades"]).iloc[::-1], width="stretch", hide_index=True)
+        tdf = pd.DataFrame(ledger["trades"])
+        st.dataframe(tdf.iloc[::-1], width="stretch", hide_index=True)
         
+        # Manual Trade Closure Logic
+        open_ids = [t["id"] for t in ledger["trades"] if t["status"] == "OPEN"]
+        if open_ids:
+            selected_close_id = st.selectbox("Select Open Trade ID to Close", open_ids)
+            if st.button("⏹ CLOSE SELECTED PAPER TRADE"):
+                for t in ledger["trades"]:
+                    if t["id"] == selected_close_id:
+                        t["status"] = "CLOSED"
+                        t["exit_price"] = spot
+                        t["exit_date"] = datetime.now(IST).strftime("%Y-%m-%d")
+                        t["exit_time"] = datetime.now(IST).strftime("%H:%M:%S")
+                        
+                        # Calculate rough PnL multiplier (e.g. standard points * 50 to simulate an index lot value)
+                        diff = (spot - t["entry_price"]) if t["side"] == "BUY" else (t["entry_price"] - spot)
+                        t["pnl"] = round(diff * t["lots"] * 50, 2)
+                        
+                save_paper_ledger(ledger)
+                st.success(f"Trade {selected_close_id} closed at {spot:,.2f}.")
+                st.rerun()
+        
+        # Dhan-Matched CSV/Excel Export Button
         excel_data = generate_excel_report(ledger["trades"], current_virtual_balance, ledger["initial_capital"])
         if excel_data:
             st.download_button(
