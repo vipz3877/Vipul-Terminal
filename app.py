@@ -17,6 +17,9 @@ Fixes in v7.1
    derives target/SL from the nearest OI walls instead of the far global walls.
  - Live news: Google News RSS headlines feed the Sentiment agent; news changes can re-trigger the AI.
  - ATM IV for expected move = average of CE and PE IV.
+ - Day Movement Levels: sigma bands, classic pivots, ATR(14), today-open bands, with OI-level confluence.
+ - Exhaustion Monitor: session history (spot, IV, PCR, OI flow) -> buyer/seller exhaustion scores, wired into signal validation.
+ - Premium Potential Scanner: reprices near-spot CE/PE under spot-move, IV crush and IV spike scenarios.
  - Dual-Force engine v2: near-spot strikes only, thresholds relative to OI (%), dominance test,
    CONFLICTED state, and full flow breakdown passed to the AI Council.
 """
@@ -28,6 +31,7 @@ import math
 import html
 import time
 import hashlib
+import tempfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, date, timezone, timedelta
 from email.utils import parsedate_to_datetime
@@ -119,6 +123,18 @@ SL_BUFFER = 35            # points beyond the OI wall for the stop-loss
 FLOW_EDGE_PCT = 2.0       # near-spot net flow gap (PE% vs CE%) needed to count as directional
 IST = timezone(timedelta(hours=5, minutes=30))
 
+# ---- exhaustion monitor ----
+HIST_MIN_GAP_SEC = 60     # minimum spacing between stored snapshots
+HIST_MAX = 400            # snapshots kept per session/day
+OI_MAP_SPAN = 800         # strikes within +/- this many points of spot are stored for lookback OI deltas
+EXH_CONTEXT_SIGMA = 0.4   # a trend must be extended at least this many daily-sigmas to be "exhaustible"
+EXH_WATCH = 35            # exhaustion score (0-100) for "early signs"
+EXH_ALERT = 60            # exhaustion score for "watch / confirmed"
+
+# ---- premium scanner ----
+RISK_FREE = 0.065         # annual rate used in the Black-Scholes repricer
+MIN_PREMIUM = 5.0         # ignore options trading below this premium (points)
+
 # ---- live news ----
 NEWS_MAX_AGE_H = 24       # headlines older than this are ignored
 NEWS_TOP_N = 10           # headlines sent to the AI / shown on screen
@@ -200,6 +216,11 @@ def fetch_option_chain(scrip, seg, expiry, token, client_id):
             "CE_PrevOI": _n(ce.get("previous_oi")), "PE_PrevOI": _n(pe.get("previous_oi")),
             "CE_IV": _n(ce.get("implied_volatility")), "PE_IV": _n(pe.get("implied_volatility")),
             "CE_Gamma": _n(ce_g.get("gamma")), "PE_Gamma": _n(pe_g.get("gamma")),
+            "CE_LTP": _n(ce.get("last_price")), "PE_LTP": _n(pe.get("last_price")),
+            "CE_Bid": _n(ce.get("top_bid_price")), "CE_Ask": _n(ce.get("top_ask_price")),
+            "PE_Bid": _n(pe.get("top_bid_price")), "PE_Ask": _n(pe.get("top_ask_price")),
+            "CE_Vol": _n(ce.get("volume")), "PE_Vol": _n(pe.get("volume")),
+            "CE_Delta": _n(ce_g.get("delta")), "PE_Delta": _n(pe_g.get("delta")),
         })
     df = pd.DataFrame(rows)
     if df.empty:
@@ -640,6 +661,8 @@ def evaluate_market_state_change(m, vel, nhash=""):
         return True, "35PT_TRAP_DETECTED"
     if vel["ce_unwinds"] > 40000 or vel["pe_unwinds"] > 40000:
         return True, "HIGH_UNWIND_VELOCITY"
+    if m.get("exh_flag", "") != last.get("exh_flag", "") and "CONFIRMED" in m.get("exh_flag", ""):
+        return True, "EXHAUSTION_CONFIRMED"
     t = st.session_state.get("last_ai_time")
     gap_ok = t is None or (datetime.now() - t).total_seconds() >= NEWS_MIN_GAP_SEC
     if nhash and nhash != last.get("news_hash", "") and gap_ok:
@@ -663,6 +686,12 @@ def run_council(m, vel, news, api_key, model):
         if sres else "no nearby OI resistance") + " | " + (
         f"nearest OI support {ssup['level']:.0f} (PE OI {ssup['oi']:,.0f}, chg {ssup['chg']:+,.0f})"
         if ssup else "no nearby OI support")
+    ex = m.get("exh") or {}
+    if ex.get("ready"):
+        exh_txt = (f"buyer exhaustion {ex['buyer']['score']}/100 ({ex['buyer']['status']}); "
+                   f"seller exhaustion {ex['seller']['score']}/100 ({ex['seller']['status']}); window {ex['age']:.0f} min")
+    else:
+        exh_txt = ex.get("why", "not available")
     strike_log = []
     for _, r in m["near"].iterrows():
         strike_log.append(
@@ -683,6 +712,7 @@ MARKET DATA:
   Bull force {eg['bull_force']:.1f} vs Bear force {eg['bear_force']:.1f} (ratio {eg['force_ratio']:.2f}; a winner needs >= {DOMINANCE})
 - OI structure around spot: {struct_txt}
 - Definitions: Bull force = PE builds% + CE exits%; Bear force = CE builds% + PE exits%. Put OI BUILDING is bullish support, call OI BUILDING is bearish resistance. Do not call put builds bearish.
+- Exhaustion monitor (is the current trend running out of fuel?): {exh_txt}
 - Whole-chain net OI change: CE {m['dce']:+,.0f} | PE {m['dpe']:+,.0f} (compare net call vs net put writing before claiming either side is unwinding)
 - Expected Move: +/-{m['exp_move']} pts [{m['lower_1sigma']} - {m['upper_1sigma']}] | ATM IV {m['atm_iv']:.1f}% | DTE {m['dte']}
 - Call Wall: {m['call_wall']:.0f} | Put Wall: {m['put_wall']:.0f} | Max Pain: {m['max_pain']:.0f} | Gamma strike: {m['gamma_strike']:.0f}
@@ -791,6 +821,17 @@ def build_signal(m, ai):
             notes.append(f"{sig} rejected: option-chain agreement {net:+d} is below the required +{MIN_CONFIRM}.")
             sig = "WAIT"
 
+    exh = m.get("exh") or {}
+    if sig != "WAIT" and exh.get("ready"):
+        # 1b) Is the trade joining a trend that is already exhausted?
+        mine = exh["buyer"] if sig == "BUY" else exh["seller"]
+        if mine["flag"] == "CONFIRMED":
+            notes.append(f"{sig} rejected: {'buyer' if sig == 'BUY' else 'seller'} exhaustion confirmed "
+                         f"({mine['score']}/100), the move you would join is running out of fuel.")
+            sig = "WAIT"
+        elif mine["flag"] == "WATCH":
+            notes.append(f"Caution: {'buyer' if sig == 'BUY' else 'seller'} exhaustion building ({mine['score']}/100).")
+
     if sig != "WAIT":
         # 2) Levels from the nearest OI walls
         if res is None or sup is None:
@@ -814,6 +855,475 @@ def build_signal(m, ai):
     return {"signal": sig, "ai_signal": ai_sig, "entry": entry, "target": target, "sl": sl, "rr": rr,
             "confidence": conf, "note": " ".join(notes), "checks": checks, "net": net, "lean": lean,
             "direction": direction}
+
+
+# ============================================================
+# DAY MOVEMENT LEVELS (sigma bands, pivots, ATR) + OI confluence
+# ============================================================
+def _candle_date(ts):
+    """Dhan v2 returns epoch seconds; guard against the older 1980-based epoch."""
+    today = datetime.now(IST).date()
+    d = datetime.fromtimestamp(float(ts), IST).date()
+    if d < today - timedelta(days=400):
+        d = datetime.fromtimestamp(float(ts) + 315532800, IST).date()
+    return d
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_daily_candles(scrip, seg, token, client_id):
+    """Daily OHLC for the index (last ~35 days) from POST /v2/charts/historical. Returns list of dicts."""
+    today = datetime.now(IST).date()
+    last_err = None
+    for to_date in (today + timedelta(days=1), today):      # toDate may be exclusive; fall back if rejected
+        try:
+            r = requests.post(f"{BASE_URL}/charts/historical", headers=auth_headers(token, client_id),
+                              json={"securityId": str(scrip), "exchangeSegment": seg, "instrument": "INDEX",
+                                    "expiryCode": 0, "fromDate": (today - timedelta(days=35)).isoformat(),
+                                    "toDate": to_date.isoformat()}, timeout=12)
+            check(r)
+            d = r.json()
+            n = len(d.get("close", []))
+            if n == 0:
+                raise RuntimeError("empty candle response")
+            return [{"date": _candle_date(d["timestamp"][i]).isoformat(), "o": float(d["open"][i]),
+                     "h": float(d["high"][i]), "l": float(d["low"][i]), "c": float(d["close"][i])}
+                    for i in range(n)]
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(f"daily candles failed: {last_err}")
+
+
+def compute_day_levels(candles, spot, sd, m, prev_close_fallback):
+    """Sigma bands around the reference close, classic pivots, ATR(14), today's open bands, plus OI confluence."""
+    now_ist = datetime.now(IST)
+    today = now_ist.date().isoformat()
+    after_close = now_ist.hour * 60 + now_ist.minute >= 15 * 60 + 40
+    done = [c for c in candles if c["date"] < today or (c["date"] == today and after_close)]
+    live = next((c for c in candles if c["date"] == today and not after_close), None)
+
+    ref = done[-1] if done else None
+    levels = []                      # (name, price, kind)
+
+    def add(name, price, kind):
+        levels.append((name, float(price), kind))
+
+    if ref:
+        c, h, l = ref["c"], ref["h"], ref["l"]
+        basis = f"session {ref['date']} (H {h:,.0f} / L {l:,.0f} / C {c:,.0f})"
+    else:
+        c, h, l = prev_close_fallback, None, None
+        basis = f"previous close {c:,.0f} (no candle data, pivots unavailable)"
+
+    for k in (2, 1):
+        add(f"Close +{k}σ", c + k * sd, "σ")
+    add("Close (ref)", c, "ref")
+    for k in (1, 2):
+        add(f"Close -{k}σ", c - k * sd, "σ")
+
+    atr = None
+    if h is not None:
+        P = (h + l + c) / 3
+        for nm, v in (("R3", h + 2 * (P - l)), ("R2", P + (h - l)), ("R1", 2 * P - l), ("Pivot", P),
+                      ("S1", 2 * P - h), ("S2", P - (h - l)), ("S3", l - 2 * (h - P))):
+            add(nm, v, "pivot")
+        trs = []
+        for i in range(1, len(done)):
+            pc = done[i - 1]["c"]
+            trs.append(max(done[i]["h"] - done[i]["l"], abs(done[i]["h"] - pc), abs(done[i]["l"] - pc)))
+        if len(trs) >= 5:
+            atr = sum(trs[-14:]) / len(trs[-14:])
+            add("Close +ATR", c + atr, "atr")
+            add("Close -ATR", c - atr, "atr")
+
+    if live:
+        add("Today open", live["o"], "today")
+        add("Open +1σ", live["o"] + sd, "today")
+        add("Open -1σ", live["o"] - sd, "today")
+        add("Today high", live["h"], "today")
+        add("Today low", live["l"], "today")
+
+    # OI reference levels for confluence
+    oi_refs = {"Call wall": m["call_wall"], "Put wall": m["put_wall"], "Max pain": m["max_pain"],
+               "Gamma strike": m["gamma_strike"]}
+    if m["struct"]["res"]:
+        oi_refs["Nearest OI resistance"] = m["struct"]["res"]["level"]
+    if m["struct"]["sup"]:
+        oi_refs["Nearest OI support"] = m["struct"]["sup"]["level"]
+    tol = max(m["step"] * 0.5, 0.15 * sd)
+
+    rows = []
+    for name, price, kind in levels:
+        hits = [f"{n} {v:,.0f}" for n, v in oi_refs.items() if abs(v - price) <= tol]
+        rows.append({"Level": name, "Price": price, "Dist pts": price - spot, "Dist σ": (price - spot) / sd,
+                     "OI confluence": ("★ " + ", ".join(hits)) if hits else ""})
+    rows.append({"Level": "◄ SPOT", "Price": spot, "Dist pts": 0.0, "Dist σ": 0.0, "OI confluence": ""})
+    tbl = pd.DataFrame(rows).sort_values("Price", ascending=False).reset_index(drop=True)
+    return {"table": tbl, "ref_close": c, "basis": basis, "atr": atr, "sd": sd, "tol": tol,
+            "band1": (c - sd, c + sd), "band2": (c - 2 * sd, c + 2 * sd), "live": live,
+            "moved_sigma": (spot - c) / sd if sd else 0.0}
+
+
+# ============================================================
+# SESSION HISTORY + EXHAUSTION MONITOR
+# ============================================================
+def daily_sigma(m):
+    return m["spot"] * m["atm_iv"] / 100.0 * math.sqrt(1.0 / 365.0)
+
+
+def hist_path(key):
+    safe = re.sub(r"[^A-Za-z0-9]+", "_", key)
+    return os.path.join(tempfile.gettempdir(), f"bbg_hist_{date.today().isoformat()}_{safe}.json")
+
+
+def load_hist(key):
+    try:
+        with open(hist_path(key)) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_hist(key, hist):
+    try:
+        with open(hist_path(key), "w") as f:
+            json.dump(hist, f)
+    except Exception:
+        pass
+
+
+def build_snapshot(m):
+    df, spot = m["df"], m["spot"]
+    sub = df[(df["Strike"] >= spot - OI_MAP_SPAN) & (df["Strike"] <= spot + OI_MAP_SPAN)]
+    oi_map = {str(int(k)): [float(c), float(p)] for k, c, p in zip(sub["Strike"], sub["CE_OI"], sub["PE_OI"])}
+    e = m["engine"]
+    ce_pct = e["ce_net_flow"] / e["ce_oi_near"] * 100 if e["ce_oi_near"] > 0 else 0.0
+    pe_pct = e["pe_net_flow"] / e["pe_oi_near"] * 100 if e["pe_oi_near"] > 0 else 0.0
+    res, sup = m["struct"]["res"], m["struct"]["sup"]
+    return {"ts": time.time(), "spot": spot, "iv": m["atm_iv"], "pcr": m["pcr"], "edge": pe_pct - ce_pct,
+            "max_pain": m["max_pain"], "dte": m["dte"], "status": m["status"],
+            "res": res["level"] if res else None, "sup": sup["level"] if sup else None, "oi": oi_map}
+
+
+def record_snapshot(m, key):
+    """Append one snapshot per refresh (>= HIST_MIN_GAP_SEC apart); survives browser refresh via a temp file."""
+    if st.session_state.get("hist_key") != key:
+        st.session_state["hist_key"] = key
+        st.session_state["hist"] = load_hist(key)
+    hist = st.session_state["hist"]
+    if hist and time.time() - hist[-1]["ts"] < HIST_MIN_GAP_SEC:
+        return hist
+    hist.append(build_snapshot(m))
+    del hist[:-HIST_MAX]
+    save_hist(key, hist)
+    return hist
+
+
+def _nearest(hist, ts):
+    return min(hist, key=lambda h: abs(h["ts"] - ts))
+
+
+def lb_flows(then, now, spot, window):
+    """OI added / removed on the SAME strikes between two snapshots, near the current spot."""
+    out = {"ce_build": 0.0, "ce_unw": 0.0, "pe_build": 0.0, "pe_unw": 0.0, "ce_base": 0.0, "pe_base": 0.0}
+    for k, (c1, p1) in now["oi"].items():
+        if abs(float(k) - spot) > window:
+            continue
+        out["ce_base"] += c1
+        out["pe_base"] += p1
+        if k in then["oi"]:
+            c0, p0 = then["oi"][k]
+            dc, dp = c1 - c0, p1 - p0
+            out["ce_build" if dc > 0 else "ce_unw"] += abs(dc)
+            out["pe_build" if dp > 0 else "pe_unw"] += abs(dp)
+    return out
+
+
+def exhaustion(hist, m, prev_close, lb_min):
+    """
+    Scores buyer exhaustion (uptrend running out of fuel) and seller exhaustion (downtrend running out of fuel)
+    from 7 signals each, using snapshots from the last `lb_min` minutes. Needs history; cannot predict a reversal.
+    """
+    sd = daily_sigma(m)
+    out = {"ready": False, "n": len(hist), "lb_min": lb_min, "sd": sd, "why": ""}
+    if len(hist) < 3:
+        out["why"] = f"Collecting history ({len(hist)} snapshot(s)). Needs at least 3 refreshes."
+        return out
+    now = hist[-1]
+    older = hist[:-1]
+    ref = _nearest(older, now["ts"] - lb_min * 60)
+    age = (now["ts"] - ref["ts"]) / 60
+    if age < max(5.0, 0.5 * lb_min):
+        out["why"] = f"Collecting history: have {age:.0f} min, need about {max(5.0, 0.5 * lb_min):.0f}+ min."
+        return out
+    mid = _nearest(older, now["ts"] - age * 30)
+    out["ready"] = True
+
+    spot = now["spot"]
+    in_win = [h for h in hist if h["ts"] >= ref["ts"]]
+    lb_high, lb_low = max(h["spot"] for h in in_win), min(h["spot"] for h in in_win)
+    h_high, h_low = max(h["spot"] for h in hist), min(h["spot"] for h in hist)
+    pc = prev_close if prev_close and prev_close > 0 else spot
+    ext = {1: max(spot - h_low, spot - pc, 0) / sd, -1: max(h_high - spot, pc - spot, 0) / sd}
+
+    iv_peak = max(h["iv"] for h in in_win)
+    iv_off_peak = (1 - now["iv"] / iv_peak) * 100 if iv_peak > 0 else 0.0
+    iv_chg = (now["iv"] / ref["iv"] - 1) * 100 if ref["iv"] > 0 else 0.0
+    pcr_d = now["pcr"] - ref["pcr"]
+    edge_d = now["edge"] - ref["edge"]
+    fl = lb_flows(ref, now, spot, max(300, m["step"] * 6))
+    pct = lambda q, b: q / b * 100 if b > 0 else 0.0
+    ce_b, pe_b = pct(fl["ce_build"], fl["ce_base"]), pct(fl["pe_build"], fl["pe_base"])
+
+    def wall_oi_chg(level, idx):
+        if level is None:
+            return None
+        k = str(int(level))
+        if k in now["oi"] and k in ref["oi"] and ref["oi"][k][idx] > 0:
+            return (now["oi"][k][idx] / ref["oi"][k][idx] - 1) * 100
+        return None
+
+    def side(sgn):
+        # sgn=+1: buyer exhaustion (uptrend). sgn=-1: seller exhaustion (downtrend).
+        sig = []
+        name = "call" if sgn > 0 else "put"
+
+        # 1 wall absorption
+        level = now["res"] if sgn > 0 else now["sup"]
+        chg = wall_oi_chg(level, 0 if sgn > 0 else 1)
+        if level is None:
+            sig.append(("Wall absorption", 0.0, "no nearby OI wall"))
+        else:
+            gap = abs(level - spot) / sd
+            if gap <= 0.35 and chg is not None and chg >= 1:
+                sig.append(("Wall absorption", 1.0, f"spot {gap:.2f}σ from {level:,.0f} wall; its {name} OI {chg:+.1f}% over {age:.0f}m"))
+            elif gap <= 0.35:
+                sig.append(("Wall absorption", 0.5, f"spot {gap:.2f}σ from {level:,.0f} wall; OI not growing"))
+            else:
+                sig.append(("Wall absorption", 0.0, f"{gap:.2f}σ away from the {level:,.0f} wall"))
+
+        # 2 IV rolls over while price sits at its extreme
+        extreme = (lb_high - spot if sgn > 0 else spot - lb_low) / sd
+        if extreme <= 0.3 and iv_off_peak >= 3:
+            sig.append(("IV rollover at extreme", 1.0, f"IV {iv_off_peak:.1f}% off its window peak while price is at the extreme"))
+        elif extreme <= 0.3 and iv_off_peak >= 1.5:
+            sig.append(("IV rollover at extreme", 0.5, f"IV {iv_off_peak:.1f}% off peak"))
+        else:
+            sig.append(("IV rollover at extreme", 0.0, f"IV {iv_chg:+.1f}% over window, {iv_off_peak:.1f}% off peak"))
+
+        # 3 net OI flow edge flips against the trend
+        ed = -sgn * edge_d   # buyer exhaustion wants edge falling; seller exhaustion wants edge rising
+        sig.append(("Flow edge flipping", 1.0 if ed >= 3 else 0.5 if ed >= 1.5 else 0.0,
+                    f"PE-vs-CE net flow edge {edge_d:+.1f} pts over window"))
+
+        # 4 PCR turning against the trend
+        pd_ = -sgn * pcr_d
+        sig.append(("PCR turning", 1.0 if pd_ >= 0.03 else 0.5 if pd_ >= 0.015 else 0.0, f"PCR {pcr_d:+.3f} over window"))
+
+        # 5 fresh writing leaning the other way near spot
+        mine, other = (ce_b, pe_b) if sgn > 0 else (pe_b, ce_b)
+        mq, oq = (fl["ce_build"], fl["pe_build"]) if sgn > 0 else (fl["pe_build"], fl["ce_build"])
+        if mine >= 1 and mq >= 1.5 * oq:
+            sig.append((f"Fresh {name} writing", 1.0, f"{name} builds {mine:.1f}% vs {other:.1f}% opposite (near spot, {age:.0f}m)"))
+        elif mq > oq and mine >= 0.5:
+            sig.append((f"Fresh {name} writing", 0.5, f"{name} builds {mine:.1f}% vs {other:.1f}% opposite"))
+        else:
+            sig.append((f"Fresh {name} writing", 0.0, f"{name} builds {mine:.1f}% vs {other:.1f}% opposite"))
+
+        # 6 max pain pull, only meaningful close to expiry
+        mp = sgn * (spot - now["max_pain"]) / sd
+        if now["dte"] > 2:
+            sig.append(("Max pain pull", 0.0, f"{now['dte']}d to expiry, pull is weak"))
+        else:
+            sig.append(("Max pain pull", 1.0 if mp >= 0.5 else 0.5 if mp >= 0.3 else 0.0,
+                        f"spot {mp:+.2f}σ beyond max pain {now['max_pain']:,.0f}"))
+
+        # 7 momentum stall: first half of window moved with the trend, second half did not
+        first = sgn * (mid["spot"] - ref["spot"]) / sd
+        second = sgn * (spot - mid["spot"]) / sd
+        if mid is ref or first < 0.15:
+            sig.append(("Momentum stall", 0.0, f"no clear first-leg move ({first:+.2f}σ)"))
+        elif second <= 0:
+            sig.append(("Momentum stall", 1.0, f"first leg {first:+.2f}σ, then {second:+.2f}σ (stalled/reversed)"))
+        elif second < 0.4 * first:
+            sig.append(("Momentum stall", 0.5, f"first leg {first:+.2f}σ, then only {second:+.2f}σ"))
+        else:
+            sig.append(("Momentum stall", 0.0, f"first leg {first:+.2f}σ, then {second:+.2f}σ (still running)"))
+
+        score = sum(x[1] for x in sig) / len(sig) * 100
+        ctx = ext[sgn]
+        turned = ((lb_high - spot) if sgn > 0 else (spot - lb_low)) / sd >= 0.1
+        if ctx < EXH_CONTEXT_SIGMA:
+            status, flag = f"NO {'UP' if sgn > 0 else 'DOWN'}TREND TO EXHAUST (extension {ctx:.2f}σ)", ""
+        elif score >= EXH_ALERT and turned:
+            status, flag = "CONFIRMED: signals aligned and price has turned", "CONFIRMED"
+        elif score >= EXH_ALERT:
+            status, flag = "WATCH: exhaustion building, price has NOT turned yet", "WATCH"
+        elif score >= EXH_WATCH:
+            status, flag = "EARLY SIGNS", "EARLY"
+        else:
+            status, flag = "TREND INTACT", ""
+        return {"score": round(score), "signals": sig, "status": status, "flag": flag,
+                "ext": ctx, "turned": turned}
+
+    out["buyer"], out["seller"] = side(1), side(-1)
+    out.update({"age": age, "lb_high": lb_high, "lb_low": lb_low, "spot_chg_sigma": (spot - ref["spot"]) / sd})
+    return out
+
+
+def exh_flag(exh):
+    if not exh or not exh.get("ready"):
+        return ""
+    return f"B:{exh['buyer']['flag']}|S:{exh['seller']['flag']}"
+
+
+def data_quality(m):
+    near = m["near"]
+    msgs = []
+    for side in ("CE", "PE"):
+        live = near[near[f"{side}_OI"] > 0]
+        if len(live) >= 3:
+            frac = (live[f"{side}_PrevOI"] == 0).mean()
+            if frac >= 0.25:
+                msgs.append(f"{frac:.0%} of near-spot {side} strikes have previous OI = 0, so their 'builds' may be inflated")
+    return "; ".join(msgs)
+
+
+# ============================================================
+# PREMIUM POTENTIAL SCANNER (scenario repricing, not a forecast)
+# ============================================================
+def _ncdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def bs_price(S, K, T, iv_pct, is_call):
+    sigma = iv_pct / 100.0
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return max(0.0, (S - K) if is_call else (K - S))
+    sq = sigma * math.sqrt(T)
+    d1 = (math.log(S / K) + (RISK_FREE + 0.5 * sigma * sigma) * T) / sq
+    d2 = d1 - sq
+    disc = math.exp(-RISK_FREE * T)
+    if is_call:
+        return S * _ncdf(d1) - K * disc * _ncdf(d2)
+    return K * disc * _ncdf(-d2) - S * _ncdf(-d1)
+
+
+def bs_delta(S, K, T, iv_pct, is_call):
+    sigma = iv_pct / 100.0
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return (1.0 if S > K else 0.0) if is_call else (-1.0 if S < K else 0.0)
+    sq = sigma * math.sqrt(T)
+    d1 = (math.log(S / K) + (RISK_FREE + 0.5 * sigma * sigma) * T) / sq
+    return _ncdf(d1) if is_call else _ncdf(d1) - 1.0
+
+
+def reprice(ltp, S0, S1, K, T0, T1, iv0, iv1, is_call):
+    """Premium after a scenario, anchored to today's traded price (ratio of two model prices)."""
+    base = bs_price(S0, K, T0, iv0, is_call)
+    if base < 1e-6:
+        return None
+    return ltp * bs_price(S1, K, T1, iv1, is_call) / base
+
+
+def premium_scanner(m, horizon_days=0.25, iv_shock=15.0):
+    """
+    For each near-spot CE/PE: reprice under (a) favourable spot moves of 0.5/1/1.5 daily-sigma, (b) a move to the
+    nearest OI wall, (c) 1-sigma move with IV crush / IV spike, (d) a wrong-way 0.5-sigma move.
+    Ranks by a heuristic potential score. Returns (DataFrame, meta).
+    """
+    df, S0, step = m["df"], m["spot"], m["step"]
+    atm_iv = m["atm_iv"]
+    sd = S0 * atm_iv / 100.0 * math.sqrt(1.0 / 365.0)              # daily 1-sigma in index points
+    T0 = max(m["dte"], 0.25) / 365.0
+    T1 = max(T0 - horizon_days / 365.0, 0.05 / 365.0)
+    span = max(2.5 * sd, 8 * step)
+    cand = df[(df["Strike"] >= S0 - span) & (df["Strike"] <= S0 + span)]
+    res, sup = m["struct"]["res"], m["struct"]["sup"]
+    crush, spike = 1.0 - iv_shock / 100.0, 1.0 + iv_shock / 100.0
+
+    rows = []
+    for _, r in cand.iterrows():
+        K = float(r["Strike"])
+        for side in ("CE", "PE"):
+            is_call = side == "CE"
+            sign = 1.0 if is_call else -1.0
+            ltp = float(r.get(f"{side}_LTP", 0) or 0)
+            if ltp < MIN_PREMIUM:
+                continue
+            iv0 = float(r.get(f"{side}_IV", 0) or 0) or atm_iv
+            mult = lambda S1, iv1=iv0: reprice(ltp, S0, S1, K, T0, T1, iv0, iv1, is_call)
+            Sfav = lambda k: S0 + sign * k * sd
+            m05, m1, m15 = mult(Sfav(0.5)), mult(Sfav(1.0)), mult(Sfav(1.5))
+            if None in (m05, m1, m15):
+                continue
+            wall = (res if is_call else sup)
+            m_wall = mult(wall["level"]) if wall else None
+            m_crush = mult(Sfav(1.0), iv0 * crush)
+            m_spike = mult(Sfav(1.0), iv0 * spike)
+            m_wrong = mult(S0 - sign * 0.5 * sd)
+            x = lambda v: (v / ltp) if v is not None else None
+
+            # spot needed to double the premium (flat IV), searched out to 4 daily sigmas
+            need2 = None
+            lo, hi = 0.0, 4.0
+            if (mult(Sfav(hi)) or 0) >= 2 * ltp:
+                for _i in range(40):
+                    mid = (lo + hi) / 2
+                    if (mult(Sfav(mid)) or 0) >= 2 * ltp:
+                        hi = mid
+                    else:
+                        lo = mid
+                need2 = hi
+
+            bid, ask = float(r.get(f"{side}_Bid", 0) or 0), float(r.get(f"{side}_Ask", 0) or 0)
+            spread = (ask - bid) / ((ask + bid) / 2) * 100 if bid > 0 and ask > 0 else float("nan")
+            d_now = abs(float(r.get(f"{side}_Delta", 0) or 0)) or abs(bs_delta(S0, K, T0, iv0, is_call))
+            d_1s = abs(bs_delta(Sfav(1.0), K, T1, iv0, is_call))
+            money = (K - S0) if is_call else (S0 - K)               # >0 means OTM by that many points
+            rows.append({
+                "Side": side, "Strike": K,
+                "Money": f"OTM {money:.0f}" if money > step * 0.4 else ("ITM " + f"{-money:.0f}" if money < -step * 0.4 else "ATM"),
+                "LTP": ltp, "Delta": d_now, "Delta@1σ": d_1s, "Spread%": spread,
+                "Vol": float(r.get(f"{side}_Vol", 0) or 0),
+                "OI": float(r[f"{side}_OI"]), "OIchg": float(r[f"{side}_OI_Chg"]),
+                "x0.5σ": x(m05), "x1σ": x(m1), "x1.5σ": x(m15), "xWall": x(m_wall),
+                "x1σ crush": x(m_crush), "x1σ spike": x(m_spike), "xWrong": x(m_wrong),
+                "Needs2x(σ)": need2,
+            })
+    out = pd.DataFrame(rows)
+    meta = {"sd": sd, "T0d": T0 * 365, "T1d": T1 * 365, "crush": iv_shock}
+    if out.empty:
+        return out, meta
+
+    # --- heuristic potential score ---
+    out["vol_pct"] = out["Vol"].rank(pct=True)
+    fuel = out["OIchg"].clip(lower=0)
+    out["fuel_pct"] = fuel / fuel.max() if fuel.max() > 0 else 0.0     # fresh writing = trapped writers if price runs through
+    reward = 0.5 * (out["x1σ"] - 1) + 0.5 * (out["x1σ crush"] - 1)     # reward that survives an IV crush
+    loss = (1 - out["xWrong"]).clip(lower=0, upper=1)
+    liq = out["Spread%"].apply(lambda v: 0.5 if pd.isna(v) else 1.0 if v <= 3 else 0.7 if v <= 6 else 0.4 if v <= 12 else 0.15)
+    prob = (2 * out["Delta"]).clip(upper=1.0) ** 0.5                    # rough odds of finishing in the money
+    activity = 0.5 + 0.25 * out["vol_pct"] + 0.25 * out["fuel_pct"]
+    out["Score"] = (reward.clip(lower=0) / (0.25 + loss)) * liq * prob * activity
+    out = out.sort_values("Score", ascending=False).reset_index(drop=True)
+    return out, meta
+
+
+def fmt_scanner(df):
+    d = df.copy()
+    for c in ("x0.5σ", "x1σ", "x1.5σ", "xWall", "x1σ crush", "x1σ spike", "xWrong"):
+        d[c] = d[c].map(lambda v: "-" if v is None or pd.isna(v) else f"{v:.2f}x")
+    d["Strike"] = d["Strike"].map(lambda v: f"{v:,.0f}")
+    d["LTP"] = d["LTP"].map(lambda v: f"{v:,.1f}")
+    d["Δ"] = d.apply(lambda r: f"{r['Delta']:.2f}→{r['Delta@1σ']:.2f}", axis=1)
+    d["Spread%"] = d["Spread%"].map(lambda v: "-" if pd.isna(v) else f"{v:.1f}")
+    d["Vol"] = d["Vol"].map(lambda v: f"{v:,.0f}")
+    d["OIchg"] = d["OIchg"].map(lambda v: f"{v:+,.0f}")
+    d["Needs2x(σ)"] = d["Needs2x(σ)"].map(lambda v: ">4" if v is None or pd.isna(v) else f"{v:.2f}")
+    d["Score"] = d["Score"].map(lambda v: f"{v:.2f}")
+    cols = ["Side", "Strike", "Money", "LTP", "Δ", "Spread%", "Vol", "OIchg", "x0.5σ", "x1σ", "x1.5σ",
+            "xWall", "x1σ crush", "x1σ spike", "xWrong", "Needs2x(σ)", "Score"]
+    return d[cols]
 
 
 def esc(x):
@@ -886,6 +1396,13 @@ with st.sidebar:
                           help="Fetch fresh market headlines (Google News RSS) for the Sentiment agent.")
     news = st.text_area("EXTRA NEWS / MACRO NOTES", placeholder="Optional: add your own notes on top of the live feed",
                         height=80)
+    horizon_label = st.selectbox("SCENARIO HORIZON (premium scanner)",
+                                 ["Intraday (0.25d)", "1 day", "2 days"], index=0)
+    horizon_days = {"Intraday (0.25d)": 0.25, "1 day": 1.0, "2 days": 2.0}[horizon_label]
+    iv_shock = st.slider("IV CRUSH / SPIKE SHOCK (%)", 5, 40, 15, step=5,
+                         help="Relative change applied to IV in the crush / spike scenarios.")
+    exh_lookback = st.slider("EXHAUSTION LOOKBACK (min)", 6, 45, 15, step=3,
+                             help="History window used by the exhaustion monitor. With a 3-min refresh, 15 min = 5 snapshots.")
     force_run = st.button("FORCE AI RUN")
 
     auto_refresh = st.toggle("AUTO REFRESH (3 MIN)", value=True)
@@ -907,6 +1424,9 @@ if df.empty or spot == 0:
 
 m = compute_metrics(df, spot, prev_close, expiry, info["step"])
 vel = update_oi_velocity(m, key=f"{idx_name}|{expiry}")
+hist = record_snapshot(m, f"{idx_name}|{expiry}")
+m["exh"] = exhaustion(hist, m, prev_close, exh_lookback)
+m["exh_flag"] = exh_flag(m["exh"])
 
 # ---- live news ----
 news_items, news_status = ([], ["LIVE NEWS: off"])
@@ -931,6 +1451,7 @@ if force_run or changed:
             "put_wall": m["put_wall"], "gamma_strike": m["gamma_strike"], "status": m["status"],
             "trap_active": bool(m["ce_trap"] or m["pe_trap"]),
             "news_hash": nhash,
+            "exh_flag": m.get("exh_flag", ""),
         }
         gate_label = f"FRESH ({'FORCED' if force_run else reason}) | {ai.get('_model', groq_model)}"
     else:
@@ -981,6 +1502,14 @@ f1, f2, f3 = st.columns(3)
 f1.metric("BULL FORCE (PE build + CE exit)", f"{es['bull_force']:.1f}")
 f2.metric("BEAR FORCE (CE build + PE exit)", f"{es['bear_force']:.1f}")
 f3.metric("FORCE RATIO", f"{min(es['force_ratio'], 99):.2f}x", f"winner needs >= {DOMINANCE}x", delta_color="off")
+_zero = [n for n, k in (("CE EXITS", "ce_exit_pct"), ("PE BUILDS", "pe_build_pct"),
+                        ("PE EXITS", "pe_exit_pct"), ("CE BUILDS", "ce_build_pct")) if es[k] == 0]
+if _zero:
+    st.caption(f"{', '.join(_zero)} = 0.0% means no near-spot strike moved that way by more than {NOISE_PCT}% of that side's OI. "
+               "These legs compare today's OI with the PREVIOUS DAY's close, not with the last refresh.")
+_dq = data_quality(m)
+if _dq:
+    st.warning("Data quality: " + _dq + ".")
 st.caption("Bullish blast = CE exits + PE builds both >= threshold AND bull force >= 1.5x bear force. "
            "Bearish blast = mirror image. Both sides active with no clear winner = CONFLICTED | WAIT.")
 
@@ -1021,6 +1550,102 @@ v3.metric("PE BUILDS", f"{vel['pe_builds']:,.0f}")
 v4.metric("PE UNWINDS", f"{vel['pe_unwinds']:,.0f}")
 if sum(vel.values()) == 0:
     st.caption("Velocity needs two snapshots ~3 min apart. It will populate after the next refresh.")
+
+# ---- DAY MOVEMENT LEVELS ----
+st.markdown("#### 📐 DAY MOVEMENT LEVELS")
+try:
+    candles = fetch_daily_candles(info["scrip"], info["seg"], dhan_token, client_id)
+    candle_err = ""
+except Exception as e:
+    candles, candle_err = [], str(e)
+dl = compute_day_levels(candles, m["spot"], daily_sigma(m), m, prev_close)
+if candle_err:
+    st.warning(f"Daily candles unavailable ({candle_err[:160]}). Showing sigma bands around the sidebar PREV CLOSE only.")
+st.caption(f"Basis: {dl['basis']} | 1σ daily = Spot × ATM IV × √(1/365) ≈ {dl['sd']:,.0f} pts"
+           + (f" | ATR(14) ≈ {dl['atr']:,.0f} pts" if dl["atr"] else ""))
+lc1, lc2, lc3 = st.columns(3)
+lc1.metric("1σ RANGE (68%)", f"{dl['band1'][0]:,.0f} – {dl['band1'][1]:,.0f}")
+lc2.metric("2σ RANGE (95%)", f"{dl['band2'][0]:,.0f} – {dl['band2'][1]:,.0f}")
+lc3.metric("MOVE SO FAR", f"{dl['moved_sigma']:+.2f}σ", f"{m['spot'] - dl['ref_close']:+,.0f} pts vs ref close", delta_color="off")
+show = dl["table"].copy()
+show["Price"] = show["Price"].map(lambda v: f"{v:,.0f}")
+show["Dist pts"] = show["Dist pts"].map(lambda v: f"{v:+,.0f}")
+show["Dist σ"] = show["Dist σ"].map(lambda v: f"{v:+.2f}")
+st.dataframe(show, use_container_width=True, hide_index=True)
+st.caption(f"★ = level within ±{dl['tol']:,.0f} pts of an OI level (wall, max pain, gamma strike): confluence makes a level more meaningful. "
+           "Pivots: P=(H+L+C)/3, R1=2P−L, S1=2P−H, R2=P+(H−L), S2=P−(H−L). After 15:40 IST the basis is today's completed session. "
+           "Ranges are probabilities from IV (assumes normal returns), not guarantees.")
+
+# ---- EXHAUSTION MONITOR ----
+st.markdown("#### 🧭 EXHAUSTION MONITOR (is the trend running out of fuel?)")
+ex = m["exh"]
+if not ex["ready"]:
+    st.info(ex["why"] + " History is saved per day and survives a browser refresh, but only builds while this page is open.")
+else:
+    st.caption(f"Window {ex['age']:.0f} min ({ex['n']} snapshots) | spot {ex['spot_chg_sigma']:+.2f}σ over window | "
+               f"window high {ex['lb_high']:,.0f} / low {ex['lb_low']:,.0f} | 1σ daily ≈ {ex['sd']:,.0f} pts")
+    ecol1, ecol2 = st.columns(2)
+    for col, key, title in ((ecol1, "buyer", "BUYER EXHAUSTION (uptrend fading)"),
+                            (ecol2, "seller", "SELLER EXHAUSTION (downtrend fading)")):
+        side_ = ex[key]
+        scol = "#ff1744" if side_["flag"] == "CONFIRMED" else "#ffab00" if side_["flag"] in ("WATCH", "EARLY") else "#90a4ae"
+        rows = "".join(
+            f'<div class="agent">{"🔴" if v >= 1 else "🟠" if v >= 0.5 else "⚪"} <b>{esc(n)}:</b> {esc(d)}</div>'
+            for n, v, d in side_["signals"])
+        col.markdown(f"""<div class="bbg-panel" style="border:2px solid {scol};">
+          <div class="bbg-title">{title}</div>
+          <div class="bbg-big" style="color:{scol};">{side_['score']}/100</div>
+          <div class="bbg-desc" style="color:{scol};">{esc(side_['status'])}</div>
+          {rows}</div>""", unsafe_allow_html=True)
+    st.caption(f"Exhaustion is a warning, not a reversal call. CONFIRMED needs score >= {EXH_ALERT} AND a price turn of "
+               "at least 0.1σ off the window extreme. A BUY/SELL is blocked when its own side is CONFIRMED.")
+with st.expander("SESSION HISTORY (spot / IV / PCR)"):
+    if len(hist) >= 2:
+        hdf = pd.DataFrame([{"Time": datetime.fromtimestamp(h["ts"], IST).strftime("%H:%M:%S"), "Spot": h["spot"],
+                             "ATM IV": round(h["iv"], 2), "PCR": round(h["pcr"], 3), "Flow edge": round(h["edge"], 2),
+                             "Status": h["status"]} for h in hist])
+        st.line_chart(hdf.set_index("Time")[["Spot"]])
+        st.line_chart(hdf.set_index("Time")[["ATM IV"]])
+        st.dataframe(hdf.iloc[::-1], use_container_width=True, hide_index=True)
+    else:
+        st.write("Waiting for more snapshots.")
+
+# ---- PREMIUM POTENTIAL SCANNER ----
+st.markdown("#### 🎯 PREMIUM POTENTIAL SCANNER")
+scan, smeta = premium_scanner(m, horizon_days, iv_shock)
+lean_now = sum(c["v"] for c in chain_checks(m))
+fav = "CE" if lean_now > 0 else "PE" if lean_now < 0 else None
+if "BULLISH GAMMA" in m["status"]:
+    fav = "CE"
+elif "BEARISH GAMMA" in m["status"]:
+    fav = "PE"
+if scan.empty:
+    st.info("No priced options found (needs last_price from the option chain; market may be closed or premiums < "
+            f"{MIN_PREMIUM:.0f}).")
+else:
+    fav_txt = {"CE": "CALLS (bullish side)", "PE": "PUTS (bearish side)"}.get(fav, "NO CLEAR SIDE - both shown, treat as low edge")
+    st.caption(f"Chain lean {lean_now:+d} | status {m['status']} → favoured: {fav_txt}. "
+               f"1σ daily move ≈ {smeta['sd']:,.0f} pts | horizon {horizon_label} (time left {smeta['T0d']:.1f}d → {smeta['T1d']:.1f}d) | "
+               f"IV shock ±{smeta['crush']:.0f}%.")
+    top = scan[scan["Side"] == fav].head(5) if fav else scan.head(6)
+    other = scan[scan["Side"] != fav].head(3) if fav else None
+    st.dataframe(fmt_scanner(top), use_container_width=True, hide_index=True)
+    if other is not None and not other.empty:
+        with st.expander("Counter-trend side (against the chain lean)"):
+            st.dataframe(fmt_scanner(other), use_container_width=True, hide_index=True)
+
+    b = top.iloc[0]
+    sgn = 1 if b["Side"] == "CE" else -1
+    s1 = m["spot"] + sgn * smeta["sd"]
+    st.markdown(f"""<div class="bbg-panel">
+      <div class="bbg-title">Top pick walk-through: {m['spot']:,.0f} spot, {b['Strike']:,.0f} {b['Side']} ({b['Money']}) at ₹{b['LTP']:,.1f}</div>
+      <div class="agent">If spot moves 1σ in favour to ≈ <b>{s1:,.0f}</b>: premium ≈ <b>{b['x1σ']:.2f}x</b> (₹{b['LTP']*b['x1σ']:,.1f}); delta rises {b['Delta']:.2f} → {b['Delta@1σ']:.2f}, which is the gamma effect (OTM turning into ITM/ATM).</div>
+      <div class="agent">With IV crush −{smeta['crush']:.0f}% on that same move: <b>{b['x1σ crush']:.2f}x</b> (₹{b['LTP']*b['x1σ crush']:,.1f}). With IV spike +{smeta['crush']:.0f}%: <b>{b['x1σ spike']:.2f}x</b> (₹{b['LTP']*b['x1σ spike']:,.1f}).</div>
+      <div class="agent">If it goes the wrong way by 0.5σ: <b>{b['xWrong']:.2f}x</b> (₹{b['LTP']*b['xWrong']:,.1f}). Spot move needed just to double the premium: <b>{('>4' if pd.isna(b['Needs2x(σ)']) else f"{b['Needs2x(σ)']:.2f}")}σ</b>.</div>
+    </div>""", unsafe_allow_html=True)
+    st.caption("Scenario repricing with Black-Scholes anchored to the traded premium, constant per-strike IV shift, "
+               "no slippage. It shows how premiums react IF spot moves; it does not predict that the move happens. "
+               "Score = reward after IV crush ÷ wrong-way loss, weighted by liquidity, delta odds, volume and fresh OI.")
 
 # ---- LIVE NEWS PANEL ----
 st.markdown("#### LIVE MARKET NEWS")
