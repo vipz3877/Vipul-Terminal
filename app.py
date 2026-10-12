@@ -51,7 +51,7 @@ try:
 except ImportError:
     Groq = None
 
-st.set_page_config(page_title="Vipul Bloomberg Terminal v7.3 Data Integrity", layout="wide")
+st.set_page_config(page_title="Vipul Bloomberg Terminal v7.3.1 Previous Close Fix", layout="wide")
 
 # ============================================================
 # CSS
@@ -227,22 +227,53 @@ def fetch_option_chain(scrip, seg, expiry, token, client_id):
     return spot, df.sort_values("Strike").reset_index(drop=True)
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_prev_close(scrip, seg, token, client_id):
-    """Best-effort previous close via Dhan market quote. Returns (value or None, source/message)."""
+    """Fetch the last completed daily candle strictly before today's IST date.
+
+    This is safer than relying on quote.net_change, which may be omitted from Dhan's
+    quote response. The current day's candle is deliberately excluded, even after
+    market close, so the reference remains the previous trading session's close.
+    Returns (value or None, source/message).
+    """
+    today = datetime.now(IST).date()
+    # Primary source: historical daily candles. Do not use today's candle.
+    try:
+        candles = fetch_daily_candles(scrip, seg, token, client_id)
+        completed = []
+        for candle in candles or []:
+            try:
+                candle_day = date.fromisoformat(str(candle.get("date", ""))[:10])
+                close = float(candle.get("c", 0))
+            except (TypeError, ValueError):
+                continue
+            if candle_day < today and math.isfinite(close) and close > 0:
+                completed.append((candle_day, close))
+        if completed:
+            candle_day, close = max(completed, key=lambda item: item[0])
+            return round(close, 2), f"Dhan historical daily candle: {candle_day.isoformat()} close"
+    except Exception as e:
+        candle_error = str(e)
+    else:
+        candle_error = "no valid completed daily candle before today's date"
+
+    # Fallback: use quote LTP - net_change only if Dhan actually supplied the field.
     try:
         r = requests.post(f"{BASE_URL}/marketfeed/quote", headers=auth_headers(token, client_id),
                           json={seg: [scrip]}, timeout=10)
         check(r)
         q = (r.json().get("data") or {}).get(seg, {}).get(str(scrip)) or {}
-        ltp = _n(q.get("last_price"))
-        net = _n(q.get("net_change"))
-        if ltp > 0 and net != 0:
-            return round(ltp - net, 2), "quote: LTP - net_change"
-        # Do not use OHLC close as a previous close: after the session it can be today's close.
-        return None, "Dhan quote did not provide a reliable previous close (net_change unavailable)"
+        raw_ltp, raw_net = q.get("last_price"), q.get("net_change")
+        ltp = float(raw_ltp) if raw_ltp is not None else 0.0
+        net = float(raw_net) if raw_net is not None else None
+        if math.isfinite(ltp) and ltp > 0 and net is not None and math.isfinite(net):
+            candidate = ltp - net
+            if candidate > 0 and math.isfinite(candidate):
+                return round(candidate, 2), "Dhan quote: LTP - explicitly supplied net_change (fallback)"
+        quote_error = "quote did not include a usable last_price/net_change pair"
     except Exception as e:
-        return None, f"auto fetch failed: {e}"
+        quote_error = str(e)
+    return None, f"Previous close unavailable; daily-candle attempt: {candle_error}; quote fallback: {quote_error}"
 
 
 # ---------------- LIVE NEWS ----------------
@@ -1497,7 +1528,8 @@ else:
 # ============================================================
 # DASHBOARD
 # ============================================================
-st.markdown(f"## {idx_name} // SPOT {spot:,.2f}  ({spot - prev_close:+,.2f})")
+prev_move_label = f"({spot - prev_close:+,.2f} vs previous close)" if prev_close > 0 else "(previous close unavailable)"
+st.markdown(f"## {idx_name} // SPOT {spot:,.2f}  {prev_move_label}")
 
 status = m["status"]
 if "BULLISH GAMMA BLAST" in status:
