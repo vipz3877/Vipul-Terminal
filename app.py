@@ -1,12 +1,26 @@
 """
-VIPUL BLOOMBERG PROFESSIONAL TERMINAL v7.9
-Engine: Dual-Force (net-capitulation aware) + Jobber microstructure + chain cross-check + exhaustion monitor
-        + live news + day levels + premium scanner + LIVE OPTION DESK.
+Unified: v5.0/v6.0 engine (Gamma Blast / IV Spike, walls, traps, expected move, AI Council)
+       
 
-Live Option Desk (v7.9): a paper-trading terminal synced to the option chain. A Streamlit fragment re-pulls the chain every
-few seconds, re-marks positions at the bid, matches pending limit orders at the ask and checks stops/targets, independent of
-the 3-minute engine refresh. Chain ladder with B buttons, order ticket (MARKET / LIMIT), positions with Exit, order book,
-trade book, funds strip. Long calls/puts only. Simulation only: this app never places real orders.
+Fixes in v7.1
+ - Client ID is now an editable sidebar input and is passed to every API call
+   (it used to be a hardcoded fallback that st.secrets could silently override).
+ - Token is sanitised (whitespace / quotes / "Bearer " prefix removed).
+ - API errors now show Dhan's real response body instead of a bare "401".
+ - Diagnostics panel with a /v2/profile token test.
+ - OI velocity bug fixed (PE delta used CE current OI).
+ - build_signal now enforces a minimum R:R instead of a near-useless ordering check.
+ - AI text is HTML-escaped before rendering.
+ - Minimum gap between option-chain calls (Dhan limit: ~1 request / 3 sec).
+ - Signal validation now cross-checks the option chain (7 independent reads, must net-agree) and
+   derives target/SL from the nearest OI walls instead of the far global walls.
+ - Live news: Google News RSS headlines feed the Sentiment agent; news changes can re-trigger the AI.
+ - ATM IV for expected move = average of CE and PE IV.
+ - Day Movement Levels: sigma bands, classic pivots, ATR(14), today-open bands, with OI-level confluence.
+ - Exhaustion Monitor: session history (spot, IV, PCR, OI flow) -> buyer/seller exhaustion scores, wired into signal validation.
+ - Premium Potential Scanner: reprices near-spot CE/PE under spot-move, IV crush and IV spike scenarios.
+ - Dual-Force engine v2: near-spot strikes only, thresholds relative to OI (%), dominance test,
+   CONFLICTED state, and full flow breakdown passed to the AI Council.
 """
 
 import os
@@ -16,7 +30,6 @@ import math
 import html
 import time
 import hashlib
-import io
 import tempfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, date, timezone, timedelta
@@ -38,7 +51,7 @@ try:
 except ImportError:
     Groq = None
 
-st.set_page_config(page_title="Vipul Bloomberg Terminal v7.9", layout="wide")
+st.set_page_config(page_title="Vipul Bloomberg Terminal v7.3 Data Integrity", layout="wide")
 
 # ============================================================
 # CSS
@@ -62,25 +75,6 @@ h1,h2,h3,h4 { color:#ff9800 !important; font-family:'Courier New',monospace; let
 .flash-green { animation: flashGreen 1s infinite; }
 .flash-red   { animation: flashRed 1s infinite; }
 .flash-amber { animation: flashAmber 1.4s infinite; }
-.fund-strip { display:flex; flex-wrap:wrap; gap:8px; margin:6px 0 10px 0; }
-.fund-box { background:#0f0f0f; border:1px solid #2a2a2a; border-radius:4px; padding:6px 12px; min-width:120px; }
-.fund-box span { display:block; font-size:10px; color:#888; letter-spacing:1px; text-transform:uppercase; }
-.fund-box b { font-size:16px; color:#fff; }
-.up { color:#00e676 !important; }
-.down { color:#ff1744 !important; }
-.live-dot { color:#666; }
-.live-dot.on { color:#00e676; animation: blinkDot 1.2s infinite; }
-@keyframes blinkDot { 0%,100% {opacity:1;} 50% {opacity:.25;} }
-.lad-h { font-size:10px; color:#888; letter-spacing:1px; text-transform:uppercase; }
-.lad-c { font-size:13px; color:#ddd; padding:4px 2px; border-bottom:1px solid #1a1a1a; }
-.lad-c.itm { background:#16241b; }
-.lad-s { font-size:11px; color:#999; padding:6px 2px; }
-.lad-k { font-size:14px; font-weight:800; color:#ff9800; text-align:center; padding:4px 2px; border-bottom:1px solid #1a1a1a; }
-.lad-k.atm { background:#3a2a00; color:#fff; }
-.tk-name { font-size:15px; font-weight:800; color:#ff9800; margin-bottom:2px; }
-.tk-depth { font-size:12px; color:#bbb; margin-bottom:6px; }
-.pos-n { font-size:13px; font-weight:700; color:#fff; }
-.sub { font-size:10px; color:#777; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -140,25 +134,6 @@ EXH_ALERT = 60            # exhaustion score for "watch / confirmed"
 RISK_FREE = 0.065         # annual rate used in the Black-Scholes repricer
 MIN_PREMIUM = 5.0         # ignore options trading below this premium (points)
 
-# ---- option paper desk (lot sizes per NSE circular, effective Jan 2026: Nifty 65, BankNifty 30, FinNifty 60, Midcap Select 120) ----
-INITIAL_CAPITAL = 100000.0
-OPT_RISK_PCT = 4.0            # max loss at the premium stop, % of equity (incl. charges)
-OPT_OUTLAY_PCT = 30.0         # max premium paid per trade, % of equity
-OPT_SL_PCT = 30.0             # premium stop, % below entry
-OPT_TP_PCT = 60.0             # premium target, % above entry
-OPT_BE_PCT = 40.0             # after the premium is up this %, the stop moves to breakeven (0 = off)
-SLIPPAGE_PCT = 1.0            # used only when the chain has no bid/ask (buy at LTP+x%, sell at LTP-x%)
-CHARGES_PER_ORDER = 20.0      # flat brokerage per executed order; STT / exchange fees / GST are not modelled
-AUTO_MIN_PREMIUM = 20.0       # auto-entry ignores lottery tickets below this premium
-AUTO_MIN_DELTA = 0.25         # ... and options with less than this delta
-AUTO_MAX_SPREAD_PCT = 10.0    # ... and wide bid-ask spreads
-DAILY_LOSS_LIMIT_PCT = 8.0    # auto-entries stop after this realized loss today, % of initial capital
-MAX_TRADES_PER_DAY = 3
-COOLDOWN_MIN = 15             # wait after an exit before the next auto-entry
-AI_MAX_AGE_MIN = 45           # auto-entry needs an AI verdict at least this fresh
-AI_RETRY_SEC = 60             # minimum gap between AI calls after a failure
-ENTRY_START, ENTRY_CUTOFF, SQUARE_OFF = 9 * 60 + 20, 14 * 60 + 45, 15 * 60 + 15   # IST minutes of the day
-
 # ---- live news ----
 NEWS_MAX_AGE_H = 24       # headlines older than this are ignored
 NEWS_TOP_N = 10           # headlines sent to the AI / shown on screen
@@ -167,10 +142,10 @@ NEWS_MIN_GAP_SEC = 600    # a news change can re-trigger the AI at most this oft
 NEWS_EXTRA_FEEDS = tuple(u.strip() for u in get_secret("NEWS_EXTRA_FEEDS", "").split(",") if u.strip())
 
 INDEX_MAP = {
-    "NIFTY 50": {"scrip": 13, "seg": "IDX_I", "step": 50, "lot": 65, "default_prev": 24500.0},
-    "NIFTY BANK": {"scrip": 25, "seg": "IDX_I", "step": 100, "lot": 30, "default_prev": 55000.0},
-    "FINNIFTY": {"scrip": 27, "seg": "IDX_I", "step": 50, "lot": 60, "default_prev": 26000.0},
-    "MIDCPNIFTY": {"scrip": 118, "seg": "IDX_I", "step": 25, "lot": 120, "default_prev": 12500.0},
+    "NIFTY 50": {"scrip": 13, "seg": "IDX_I", "step": 50, "default_prev": 0.0},
+    "NIFTY BANK": {"scrip": 25, "seg": "IDX_I", "step": 100, "default_prev": 0.0},
+    "FINNIFTY": {"scrip": 27, "seg": "IDX_I", "step": 50, "default_prev": 0.0},
+    "MIDCPNIFTY": {"scrip": 118, "seg": "IDX_I", "step": 25, "default_prev": 0.0},
 }
 
 
@@ -210,7 +185,8 @@ def _n(x):
         return 0.0
 
 
-def _fetch_chain_raw(scrip, seg, expiry, token, client_id):
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_option_chain(scrip, seg, expiry, token, client_id):
     # Simple throttle to respect the 1 req / 3 sec limit
     last = st.session_state.get("_last_chain_call", 0.0)
     wait = MIN_CHAIN_GAP_SEC - (time.time() - last)
@@ -243,8 +219,6 @@ def _fetch_chain_raw(scrip, seg, expiry, token, client_id):
             "CE_Bid": _n(ce.get("top_bid_price")), "CE_Ask": _n(ce.get("top_ask_price")),
             "PE_Bid": _n(pe.get("top_bid_price")), "PE_Ask": _n(pe.get("top_ask_price")),
             "CE_Vol": _n(ce.get("volume")), "PE_Vol": _n(pe.get("volume")),
-            "CE_BidQty": _n(ce.get("top_bid_quantity")), "CE_AskQty": _n(ce.get("top_ask_quantity")),
-            "PE_BidQty": _n(pe.get("top_bid_quantity")), "PE_AskQty": _n(pe.get("top_ask_quantity")),
             "CE_Delta": _n(ce_g.get("delta")), "PE_Delta": _n(pe_g.get("delta")),
         })
     df = pd.DataFrame(rows)
@@ -253,42 +227,22 @@ def _fetch_chain_raw(scrip, seg, expiry, token, client_id):
     return spot, df.sort_values("Strike").reset_index(drop=True)
 
 
-@st.cache_data(ttl=30, show_spinner=False)
-def fetch_option_chain(scrip, seg, expiry, token, client_id):
-    return _fetch_chain_raw(scrip, seg, expiry, token, client_id)
-
-
-@st.cache_data(ttl=3, show_spinner=False)
-def fetch_option_chain_live(scrip, seg, expiry, token, client_id):
-    """Short-lived cache used by the live desk fragment (Dhan allows about 1 option-chain request per 3 s)."""
-    return _fetch_chain_raw(scrip, seg, expiry, token, client_id)
-
-
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_prev_close(scrip, seg, token, client_id):
-    """Previous close = close of the last COMPLETED daily candle before today (IST). Falls back to LTP - net_change.
-    ohlc.close is deliberately NOT used: during/after the session it equals today's last price."""
-    err = ""
-    try:
-        candles = fetch_daily_candles(scrip, seg, token, client_id)
-        today = datetime.now(IST).date().isoformat()
-        prior = [c for c in candles if c["date"] < today]
-        if prior:
-            return round(prior[-1]["c"], 2), f"daily candle close {prior[-1]['date']}"
-        err = "no completed candle before today"
-    except Exception as e:
-        err = str(e)[:100]
+    """Best-effort previous close via Dhan market quote. Returns (value or None, source/message)."""
     try:
         r = requests.post(f"{BASE_URL}/marketfeed/quote", headers=auth_headers(token, client_id),
                           json={seg: [scrip]}, timeout=10)
         check(r)
         q = (r.json().get("data") or {}).get(seg, {}).get(str(scrip)) or {}
-        ltp, net = _n(q.get("last_price")), _n(q.get("net_change"))
+        ltp = _n(q.get("last_price"))
+        net = _n(q.get("net_change"))
         if ltp > 0 and net != 0:
             return round(ltp - net, 2), "quote: LTP - net_change"
-        return None, f"candles: {err}; quote had no net_change"
+        # Do not use OHLC close as a previous close: after the session it can be today's close.
+        return None, "Dhan quote did not provide a reliable previous close (net_change unavailable)"
     except Exception as e:
-        return None, f"candles: {err}; quote: {str(e)[:80]}"
+        return None, f"auto fetch failed: {e}"
 
 
 # ---------------- LIVE NEWS ----------------
@@ -396,15 +350,28 @@ def news_hash(items):
 
 
 def parse_dte(expiry_str):
+    """Calendar-day distance for display only. Pricing uses a separate intraday-aware T."""
     try:
         exp_date = datetime.strptime(str(expiry_str)[:10], "%Y-%m-%d").date()
-        return max(1, (exp_date - datetime.now(IST).date()).days)
-    except ValueError:
-        return 1
+        return max(0, (exp_date - datetime.now(IST).date()).days)
+    except (ValueError, TypeError):
+        return 0
+
+
+def time_to_expiry_years(expiry_str, now=None):
+    """Approximate year fraction to 15:30 IST on expiry day; never pretend expiry day is one full day."""
+    try:
+        now = now or datetime.now(IST)
+        exp_date = datetime.strptime(str(expiry_str)[:10], "%Y-%m-%d").date()
+        expiry_dt = datetime.combine(exp_date, datetime.strptime("15:30", "%H:%M").time(), tzinfo=IST)
+        seconds = max(60.0, (expiry_dt - now).total_seconds())
+        return seconds / (365.0 * 24.0 * 60.0 * 60.0)
+    except (ValueError, TypeError):
+        return 1.0 / (365.0 * 24.0)
 
 
 # ============================================================
-# ANALYSIS & JOBBER MICROSTRUCTURE ENGINE
+# ANALYSIS ENGINE
 # ============================================================
 def interpret_oi_battle(ce_chg, pe_chg):
     if ce_chg > 5000 and pe_chg <= 0:
@@ -498,46 +465,27 @@ def engine_sums(near):
 
 
 def detect_gamma_blast(near):
-    """
-    A 'blast' needs the exiting side to be NET unwinding (capitulating), not merely to show some gross exits while
-    still adding more OI than it removes. One-sided heavy writing without capitulation is labelled a BUILD instead.
-    """
     e = engine_sums(near)
     if near is None or near.empty:
         return "BALANCED ACCUMULATION", "WAIT", "No near-spot strikes available."
 
     base_bull = e["ce_exit_pct"] >= MIN_FLOW_PCT and e["pe_build_pct"] >= MIN_FLOW_PCT
     base_bear = e["pe_exit_pct"] >= MIN_FLOW_PCT and e["ce_build_pct"] >= MIN_FLOW_PCT
-    bull_cap = e["ce_net_flow"] < 0          # call writers net unwinding
-    bear_cap = e["pe_net_flow"] < 0          # put writers net unwinding
-    bull_dom = e["bull_force"] >= DOMINANCE * e["bear_force"]
-    bear_dom = e["bear_force"] >= DOMINANCE * e["bull_force"]
-    pe_net_pct = e["pe_net_flow"] / e["pe_oi_near"] * 100 if e["pe_oi_near"] > 0 else 0.0
-    ce_net_pct = e["ce_net_flow"] / e["ce_oi_near"] * 100 if e["ce_oi_near"] > 0 else 0.0
+    bull_ok = base_bull and e["bull_force"] >= DOMINANCE * e["bear_force"]
+    bear_ok = base_bear and e["bear_force"] >= DOMINANCE * e["bull_force"]
 
-    if base_bull and bull_cap and bull_dom:
+    if bull_ok:
         return ("BULLISH GAMMA BLAST", "BUY",
-                f"Call writers net unwinding ({ce_net_pct:+.1f}%) + put writers building ({e['pe_build_pct']:.1f}%); "
+                f"Call writers exiting ({e['ce_exit_pct']:.1f}%) + put writers building ({e['pe_build_pct']:.1f}%); "
                 f"bull force {e['bull_force']:.1f} vs bear {e['bear_force']:.1f}.")
-    if base_bear and bear_cap and bear_dom:
+    if bear_ok:
         return ("BEARISH GAMMA BLAST", "SELL",
-                f"Put writers net unwinding ({pe_net_pct:+.1f}%) + call writers building ({e['ce_build_pct']:.1f}%); "
+                f"Put writers exiting ({e['pe_exit_pct']:.1f}%) + call writers building ({e['ce_build_pct']:.1f}%); "
                 f"bear force {e['bear_force']:.1f} vs bull {e['bull_force']:.1f}.")
-    if base_bull and base_bear:
+    if base_bull or base_bear:
         return ("CONFLICTED", "WAIT",
-                f"Opposing flows both active (bull force {e['bull_force']:.1f} vs bear {e['bear_force']:.1f}). Stand aside.")
-    if base_bear:
-        if bear_dom:
-            return ("RESISTANCE BUILD (bearish lean)", "WAIT",
-                    f"Heavy call writing ({e['ce_build_pct']:.1f}% of near OI) but put writers are still NET adding "
-                    f"({pe_net_pct:+.1f}%), so there is no capitulation yet. Not a blast.")
-        return ("CONFLICTED", "WAIT", "Put exits and call builds present, but no clear winner. Stand aside.")
-    if base_bull:
-        if bull_dom:
-            return ("SUPPORT BUILD (bullish lean)", "WAIT",
-                    f"Heavy put writing ({e['pe_build_pct']:.1f}% of near OI) but call writers are still NET adding "
-                    f"({ce_net_pct:+.1f}%), so there is no capitulation yet. Not a blast.")
-        return ("CONFLICTED", "WAIT", "Call exits and put builds present, but no clear winner. Stand aside.")
+                f"Opposing flows both active with no clear winner (bull force {e['bull_force']:.1f} vs "
+                f"bear force {e['bear_force']:.1f}, ratio {e['force_ratio']:.2f} < {DOMINANCE}). Stand aside.")
 
     weak = MIN_FLOW_PCT / 2.0
     if e["ce_exit_pct"] >= MIN_FLOW_PCT and e["pe_build_pct"] < weak:
@@ -546,37 +494,6 @@ def detect_gamma_blast(near):
         return "IV SPIKE BEAR TRAP", "WAIT", "Isolated put short covering without call support. Trap risk."
     return "BALANCED ACCUMULATION", "WAIT", "Market in range compression. Awaiting trigger."
 
-
-def calculate_jobber_microstructure(df, spot):
-    df = df.copy()
-    df["dist"] = (df["Strike"] - spot).abs()
-    ladder = df.sort_values("dist").head(10).sort_values("Strike").copy()
-
-    if ladder.empty:
-        return {"ladder_imbalance": 0.0, "pocket_support": spot, "micro_turn": "NEUTRAL AUCTION"}
-
-    total_ce = ladder["CE_OI"].sum()
-    total_pe = ladder["PE_OI"].sum()
-    ladder_imbalance = (total_pe - total_ce) / (total_ce + total_pe) if (total_ce + total_pe) > 0 else 0.0
-
-    ladder["Net_OI_Flow"] = ladder["PE_OI_Chg"] - ladder["CE_OI_Chg"]
-    pocket_support = float(ladder.loc[ladder["Net_OI_Flow"].idxmax(), "Strike"])
-
-    ce_unwind_sum = ladder[ladder["CE_OI_Chg"] < 0]["CE_OI_Chg"].sum()
-    pe_unwind_sum = ladder[ladder["PE_OI_Chg"] < 0]["PE_OI_Chg"].sum()
-
-    if ce_unwind_sum < -5000 and pe_unwind_sum > -2000:
-        micro_turn_signal = "ABSORPTION BULLISH (Shorts Trapped)"
-    elif pe_unwind_sum < -5000 and ce_unwind_sum > -2000:
-        micro_turn_signal = "ABSORPTION BEARISH (Longs Trapped)"
-    else:
-        micro_turn_signal = "NEUTRAL AUCTION (Balanced)"
-
-    return {
-        "ladder_imbalance": round(float(ladder_imbalance), 3),
-        "pocket_support": pocket_support,
-        "micro_turn": micro_turn_signal,
-    }
 
 
 def find_structure(df, spot, step, exp_move, call_wall, put_wall):
@@ -618,7 +535,9 @@ def compute_metrics(df, spot, prev_close, expiry_str, step):
     atm_iv = sum(ivs) / len(ivs) if ivs else 12.0          # average CE/PE IV (they should match by put-call parity)
     iv_gap = abs(ce_iv - pe_iv) if (ce_iv > 0 and pe_iv > 0) else 0.0
     dte = parse_dte(expiry_str)
-    exp_move = spot * (atm_iv / 100) * math.sqrt(dte / YEAR_DAYS)
+    # Expected move to expiry uses remaining time (including intraday time on expiry day), not max(1, DTE).
+    t_expiry = max(time_to_expiry_years(expiry_str), 1.0 / (365.0 * 24.0 * 60.0))
+    exp_move = spot * (atm_iv / 100) * math.sqrt(t_expiry)
 
     df["total_gamma"] = df["CE_Gamma"].abs() * df["CE_OI"] + df["PE_Gamma"].abs() * df["PE_OI"]
     gamma_strike = float(df.loc[df["total_gamma"].idxmax(), "Strike"]) if df["total_gamma"].sum() > 0 else spot
@@ -642,7 +561,6 @@ def compute_metrics(df, spot, prev_close, expiry_str, step):
     status, signal, desc = detect_gamma_blast(near)
     engine = engine_sums(near)
     struct = find_structure(df, spot, step, exp_move, call_wall, put_wall)
-    jobber = calculate_jobber_microstructure(df, spot)
 
     return {
         "df": df, "near": near, "spot": spot, "step": step, "pcr": pcr,
@@ -652,7 +570,7 @@ def compute_metrics(df, spot, prev_close, expiry_str, step):
         "gamma_strike": gamma_strike, "call_wall": call_wall, "put_wall": put_wall, "max_pain": max_pain,
         "ce_trap": ce_trap, "pe_trap": pe_trap,
         "score": score, "bias": bias, "status": status, "engine_signal": signal, "desc": desc,
-        "jobber": jobber, "engine": engine, "struct": struct,
+        "engine": engine, "struct": struct,
         "iv_gap": iv_gap, "atm_iv_ce": ce_iv, "atm_iv_pe": pe_iv,
     }
 
@@ -664,7 +582,7 @@ ZERO_VEL = {"ce_builds": 0.0, "ce_unwinds": 0.0, "pe_builds": 0.0, "pe_unwinds":
 
 
 def update_oi_velocity(m, key):
-    now = datetime.now(IST)
+    now = datetime.now()
     snap = st.session_state.get("oi_snap")
     current = {r["Strike"]: (r["CE_OI"], r["PE_OI"]) for _, r in m["near"].iterrows()}
 
@@ -726,7 +644,7 @@ def evaluate_market_state_change(m, vel, nhash=""):
     if m.get("exh_flag", "") != last.get("exh_flag", "") and "CONFIRMED" in m.get("exh_flag", ""):
         return True, "EXHAUSTION_CONFIRMED"
     t = st.session_state.get("last_ai_time")
-    gap_ok = t is None or (datetime.now(IST) - t).total_seconds() >= NEWS_MIN_GAP_SEC
+    gap_ok = t is None or (datetime.now() - t).total_seconds() >= NEWS_MIN_GAP_SEC
     if nhash and nhash != last.get("news_hash", "") and gap_ok:
         return True, "NEWS_CHANGED"
     return False, "STATE_UNCHANGED"
@@ -766,7 +684,6 @@ def run_council(m, vel, news, api_key, model):
 
 MARKET DATA:
 - Spot: {m['spot']:.2f} | PCR: {m['pcr']:.3f} | Bias: {m['bias']} (score {m['score']}/100)
-- Jobber Microstructure: Ladder Imbalance={m['jobber']['ladder_imbalance']}, Pocket Support={m['jobber']['pocket_support']}, Micro-Turn={m['jobber']['micro_turn']}
 - Engine status: {m['status']} | OI battle: {m['battle']}
 - Dual-Force flow (near-spot strikes only, % = share of that side's near-spot OI):
   CE exits {eg['ce_exits']:,.0f} ({eg['ce_exit_pct']:.1f}%) | CE builds {eg['ce_build']:,.0f} ({eg['ce_build_pct']:.1f}%) | CE net flow {eg['ce_net_flow']:+,.0f}
@@ -828,7 +745,7 @@ Return ONLY this JSON:
 # ============================================================
 def chain_checks(m):
     """Independent option-chain reads. v = +1 bullish, -1 bearish, 0 neutral."""
-    e, j = m["engine"], m["jobber"]
+    e = m["engine"]
     checks = []
 
     def add(name, v, detail):
@@ -843,19 +760,12 @@ def chain_checks(m):
     add("Near-spot net OI flow", 1 if gap >= FLOW_EDGE_PCT else -1 if gap <= -FLOW_EDGE_PCT else 0,
         f"PE {pe_pct:+.1f}% vs CE {ce_pct:+.1f}% of near-spot OI")
 
-    li = j["ladder_imbalance"]
-    add("Ladder OI imbalance", 1 if li >= 0.10 else -1 if li <= -0.10 else 0, f"{li:+.3f} (PE-heavy is +)")
-
-    mt = j["micro_turn"]
-    add("Micro-turn", 1 if "BULLISH" in mt else -1 if "BEARISH" in mt else 0, mt)
 
     add("PCR (whole chain)", 1 if m["pcr"] > 1.2 else -1 if m["pcr"] < 0.8 else 0, f"{m['pcr']:.2f}")
 
     add("Bias score", 1 if m["score"] > 55 else -1 if m["score"] < 45 else 0, f"{m['score']}/100 {m['bias']}")
 
-    mp_gap = m["spot"] - m["max_pain"]
-    add("Spot vs max pain", -1 if mp_gap > m["step"] else 1 if mp_gap < -m["step"] else 0,
-        f"spot {m['spot']:,.0f} vs max pain {m['max_pain']:,.0f} ({mp_gap:+,.0f})")
+    # Max Pain is descriptive context, not a reliable directional predictor; do not count it as a confirmation.
     return checks
 
 
@@ -864,18 +774,24 @@ def build_signal(m, ai):
     if ai_sig not in ("BUY", "SELL", "WAIT"):
         ai_sig = "WAIT"
     try:
-        conf = int(float(ai.get("confidence", 0)))
-    except (TypeError, ValueError):
+        conf = max(0, min(100, int(float(ai.get("confidence", 0)))))
+    except (TypeError, ValueError, OverflowError):
         conf = 0
 
     direction = {"BUY": 1, "SELL": -1}.get(ai_sig, 0)
     checks = chain_checks(m)
+    quality = m.get("quality", {})
+    if not quality.get("trade_ready", False):
+        ai_sig = "WAIT"
+        direction = 0
     lean = sum(c["v"] for c in checks)                      # + bullish / - bearish
     net = lean * direction                                   # agreement with the AI's call
     entry = m["spot"]
     res, sup = m["struct"]["res"], m["struct"]["sup"]
     notes = []
     sig, target, sl, rr = ai_sig, None, None, None
+    if not quality.get("trade_ready", False):
+        notes.append("Signal blocked by data-quality gate: " + "; ".join(quality.get("issues", ["data not validated"])) + ".")
 
     if sig != "WAIT":
         # 1) Does the option chain back the call?
@@ -903,6 +819,13 @@ def build_signal(m, ai):
             target, sl = res["level"], sup["level"] - SL_BUFFER
         else:
             target, sl = sup["level"], res["level"] + SL_BUFFER
+        # Reject structurally inverted levels; absolute distances can otherwise hide an invalid setup.
+        if sig == "BUY" and not (sl < entry < target):
+            notes.append("BUY rejected: OI-wall target/stop are not on the correct sides of spot.")
+            sig, target, sl = "WAIT", None, None
+        elif sig == "SELL" and not (target < entry < sl):
+            notes.append("SELL rejected: OI-wall target/stop are not on the correct sides of spot.")
+            sig, target, sl = "WAIT", None, None
 
     if sig != "WAIT":
         risk = abs(entry - sl)
@@ -955,15 +878,11 @@ def fetch_daily_candles(scrip, seg, token, client_id):
     raise RuntimeError(f"daily candles failed: {last_err}")
 
 
-def compute_day_levels(candles, spot, sd, m, prev_close_fallback, today_ohlc=None):
+def compute_day_levels(candles, spot, sd, m, prev_close_fallback):
     """Sigma bands around the reference close, classic pivots, ATR(14), today's open bands, plus OI confluence."""
     now_ist = datetime.now(IST)
     today = now_ist.date().isoformat()
     after_close = now_ist.hour * 60 + now_ist.minute >= 15 * 60 + 40
-    synthetic = False
-    if after_close and now_ist.weekday() < 5 and today_ohlc and not any(c["date"] == today for c in candles):
-        candles = list(candles) + [{"date": today, **today_ohlc}]      # daily candle for today is usually not published yet
-        synthetic = True
     done = [c for c in candles if c["date"] < today or (c["date"] == today and after_close)]
     live = next((c for c in candles if c["date"] == today and not after_close), None)
 
@@ -975,7 +894,7 @@ def compute_day_levels(candles, spot, sd, m, prev_close_fallback, today_ohlc=Non
 
     if ref:
         c, h, l = ref["c"], ref["h"], ref["l"]
-        basis = f"session {ref['date']} (H {h:,.0f} / L {l:,.0f} / C {c:,.0f})" + (" [OHLC from quote]" if synthetic and ref["date"] == today else "")
+        basis = f"session {ref['date']} (H {h:,.0f} / L {l:,.0f} / C {c:,.0f})"
     else:
         c, h, l = prev_close_fallback, None, None
         basis = f"previous close {c:,.0f} (no candle data, pivots unavailable)"
@@ -1038,7 +957,7 @@ def daily_sigma(m):
 
 def hist_path(key):
     safe = re.sub(r"[^A-Za-z0-9]+", "_", key)
-    return os.path.join(tempfile.gettempdir(), f"bbg_hist_{datetime.now(IST).date().isoformat()}_{safe}.json")
+    return os.path.join(tempfile.gettempdir(), f"bbg_hist_{date.today().isoformat()}_{safe}.json")
 
 
 def load_hist(key):
@@ -1300,8 +1219,10 @@ def premium_scanner(m, horizon_days=0.25, iv_shock=15.0):
     df, S0, step = m["df"], m["spot"], m["step"]
     atm_iv = m["atm_iv"]
     sd = S0 * atm_iv / 100.0 * math.sqrt(1.0 / 365.0)              # daily 1-sigma in index points
-    T0 = max(m["dte"], 0.25) / 365.0
-    T1 = max(T0 - horizon_days / 365.0, 0.05 / 365.0)
+    min_year_fraction = 1.0 / (365.0 * 24.0 * 60.0)  # one minute; expiry-day time value must not become a full day
+    T0 = max(time_to_expiry_years(m.get("expiry", "")), min_year_fraction)
+    horizon_years = max(0.0, horizon_days) / 365.0
+    T1 = max(T0 - horizon_years, min_year_fraction)
     span = max(2.5 * sd, 8 * step)
     cand = df[(df["Strike"] >= S0 - span) & (df["Strike"] <= S0 + span)]
     res, sup = m["struct"]["res"], m["struct"]["sup"]
@@ -1342,7 +1263,8 @@ def premium_scanner(m, horizon_days=0.25, iv_shock=15.0):
                 need2 = hi
 
             bid, ask = float(r.get(f"{side}_Bid", 0) or 0), float(r.get(f"{side}_Ask", 0) or 0)
-            spread = (ask - bid) / ((ask + bid) / 2) * 100 if bid > 0 and ask > 0 else float("nan")
+            spread = ((ask - bid) / ((ask + bid) / 2) * 100
+                      if bid > 0 and ask >= bid and (ask + bid) > 0 else float("nan"))
             d_now = abs(float(r.get(f"{side}_Delta", 0) or 0)) or abs(bs_delta(S0, K, T0, iv0, is_call))
             d_1s = abs(bs_delta(Sfav(1.0), K, T1, iv0, is_call))
             money = (K - S0) if is_call else (S0 - K)               # >0 means OTM by that many points
@@ -1367,10 +1289,13 @@ def premium_scanner(m, horizon_days=0.25, iv_shock=15.0):
     out["fuel_pct"] = fuel / fuel.max() if fuel.max() > 0 else 0.0     # fresh writing = trapped writers if price runs through
     reward = 0.5 * (out["x1σ"] - 1) + 0.5 * (out["x1σ crush"] - 1)     # reward that survives an IV crush
     loss = (1 - out["xWrong"]).clip(lower=0, upper=1)
-    liq = out["Spread%"].apply(lambda v: 0.5 if pd.isna(v) else 1.0 if v <= 3 else 0.7 if v <= 6 else 0.4 if v <= 12 else 0.15)
-    prob = (2 * out["Delta"]).clip(upper=1.0) ** 0.5                    # rough odds of finishing in the money
+    # Missing/invalid bid-ask is unknown liquidity, not average liquidity: exclude it from ranking.
+    liq = out["Spread%"].apply(lambda v: 0.0 if pd.isna(v) or v < 0 else 1.0 if v <= 3 else 0.7 if v <= 6 else 0.4 if v <= 12 else 0.15)
+    # Absolute delta is sensitivity, NOT probability of profit. This is only a mild ranking weight.
+    prob = (2 * out["Delta"].clip(lower=0, upper=0.5)).clip(upper=1.0) ** 0.5
     activity = 0.5 + 0.25 * out["vol_pct"] + 0.25 * out["fuel_pct"]
     out["Score"] = (reward.clip(lower=0) / (0.25 + loss)) * liq * prob * activity
+    out.loc[out["Spread%"].isna(), "Score"] = 0.0
     out = out.sort_values("Score", ascending=False).reset_index(drop=True)
     return out, meta
 
@@ -1390,460 +1315,6 @@ def fmt_scanner(df):
     cols = ["Side", "Strike", "Money", "LTP", "Δ", "Spread%", "Vol", "OIchg", "x0.5σ", "x1σ", "x1.5σ",
             "xWall", "x1σ crush", "x1σ spike", "xWrong", "Needs2x(σ)", "Score"]
     return d[cols]
-
-
-# ============================================================
-# OPTION PAPER DESK v7.9: order book + positions synced to the live option chain (long CE/PE only, simulation)
-# ============================================================
-OPT_LEDGER_FILE = os.path.join(tempfile.gettempdir(), "bbg_paper_options_v3.json")
-IDX_SHORT = {"NIFTY 50": "NIFTY", "NIFTY BANK": "BANKNIFTY", "FINNIFTY": "FINNIFTY", "MIDCPNIFTY": "MIDCPNIFTY"}
-LADDER_N = 7                  # strikes shown above and below ATM in the ladder
-
-
-def new_ledger():
-    return {"initial_capital": INITIAL_CAPITAL, "trades": [], "orders": []}
-
-
-def load_ledger():
-    try:
-        with open(OPT_LEDGER_FILE) as f:
-            led = json.load(f)
-        if isinstance(led, dict) and isinstance(led.get("trades"), list):
-            led.setdefault("initial_capital", INITIAL_CAPITAL)
-            led.setdefault("orders", [])
-            return led
-    except Exception:
-        pass
-    return new_ledger()
-
-
-def save_ledger(led):
-    try:
-        with open(OPT_LEDGER_FILE, "w") as f:
-            json.dump(led, f)
-    except Exception:
-        pass
-
-
-def _mins(now):
-    return now.hour * 60 + now.minute
-
-
-def is_trading_day(now):
-    return now.weekday() < 5
-
-
-def market_open_now(now):
-    return is_trading_day(now) and 9 * 60 + 15 <= _mins(now) < 15 * 60 + 30
-
-
-def entry_window_open(now):
-    return is_trading_day(now) and ENTRY_START <= _mins(now) <= ENTRY_CUTOFF
-
-
-def hhmm(mins):
-    return f"{mins // 60:02d}:{mins % 60:02d}"
-
-
-def contract_name(t):
-    try:
-        exp = datetime.strptime(t["expiry"][:10], "%Y-%m-%d").strftime("%d %b").upper()
-    except Exception:
-        exp = str(t.get("expiry", ""))
-    return f"{IDX_SHORT.get(t['index'], t['index'])} {exp} {t['strike']:.0f} {'CALL' if t['opt'] == 'CE' else 'PUT'}"
-
-
-def fmt_lakh(x):
-    return f"{x / 1e5:,.1f}L"
-
-
-def rerun_desk():
-    """Re-render only the live desk when called from the fragment; fall back to a full rerun otherwise."""
-    try:
-        st.rerun(scope="fragment")
-    except Exception:
-        st.rerun()
-
-
-# ---- pricing: you BUY at the ask and can only SELL at the bid ----
-def opt_row(m, strike, opt):
-    r = m["df"][m["df"]["Strike"] == float(strike)]
-    if r.empty:
-        return None
-    r = r.iloc[0]
-    return {"ltp": float(r[f"{opt}_LTP"] or 0), "bid": float(r.get(f"{opt}_Bid", 0) or 0),
-            "ask": float(r.get(f"{opt}_Ask", 0) or 0), "bq": float(r.get(f"{opt}_BidQty", 0) or 0),
-            "aq": float(r.get(f"{opt}_AskQty", 0) or 0)}
-
-
-def buy_fill(row, slip):
-    if not row:
-        return None
-    if row["ask"] > 0:
-        return round(row["ask"], 2)
-    if row["ltp"] > 0:
-        return round(row["ltp"] * (1 + slip / 100.0), 2)
-    return None
-
-
-def mark_price(row, slip):
-    if not row:
-        return None
-    if row["bid"] > 0:
-        return round(row["bid"], 2)
-    if row["ltp"] > 0:
-        return round(row["ltp"] * (1 - slip / 100.0), 2)
-    return None
-
-
-# ---- ledger maths ----
-def realized_pnl(led):
-    return sum(t["pnl"] for t in led["trades"] if t["status"] == "CLOSED")
-
-
-def equity_now(led):
-    return led["initial_capital"] + realized_pnl(led)
-
-
-def open_cost(led):
-    return sum(t["entry_premium"] * t["lots"] * t["lot_size"] for t in led["trades"] if t["status"] == "OPEN")
-
-
-def cash_free(led):
-    return equity_now(led) - open_cost(led)
-
-
-def unrealized_pnl(led):
-    return sum(((t.get("last_premium") or t["entry_premium"]) - t["entry_premium"]) * t["lots"] * t["lot_size"]
-               for t in led["trades"] if t["status"] == "OPEN")
-
-
-def today_stats(led, today):
-    """(trades entered today, realized net P&L booked today)"""
-    n = sum(1 for t in led["trades"] if t.get("date") == today)
-    pnl = sum(t["pnl"] for t in led["trades"] if t["status"] == "CLOSED" and t.get("exit_date") == today)
-    return n, pnl
-
-
-def size_option(equity, cash, premium, lot_size, sl_pct, risk_pct, outlay_pct):
-    """Lots allowed by (a) max loss at the premium stop, (b) max premium per trade, (c) free cash."""
-    cost = premium * lot_size
-    risk_per_lot = cost * sl_pct / 100.0 + 2 * CHARGES_PER_ORDER
-    by_risk = int((equity * risk_pct / 100.0) // risk_per_lot) if risk_per_lot > 0 else 0
-    by_outlay = int((equity * outlay_pct / 100.0) // cost) if cost > 0 else 0
-    by_cash = int(cash // cost) if cost > 0 else 0
-    return {"lots": max(0, min(by_risk, by_outlay, by_cash)), "cost": cost, "risk_per_lot": risk_per_lot,
-            "by_risk": by_risk, "by_outlay": by_outlay, "by_cash": by_cash}
-
-
-def default_levels(m, side):
-    """Index invalidation / target from the nearest OI walls. side: BUY (bullish) or SELL (bearish)."""
-    res, sup = m["struct"]["res"], m["struct"]["sup"]
-    if side == "BUY":
-        return (res["level"] if res else None), (sup["level"] - SL_BUFFER if sup else None)
-    return (sup["level"] if sup else None), (res["level"] + SL_BUFFER if res else None)
-
-
-# ---- orders ----
-def new_order(spec, now):
-    return {
-        "id": hashlib.md5(f"{now.timestamp()}{spec['index']}{spec['strike']}{spec['opt']}{spec['source']}{spec.get('limit')}".encode()).hexdigest()[:6],
-        "ts": now.timestamp(), "date": now.date().isoformat(), "time": now.strftime("%H:%M:%S"),
-        "index": spec["index"], "expiry": str(spec["expiry"])[:10], "strike": float(spec["strike"]), "opt": spec["opt"],
-        "lots": int(spec["lots"]), "lot_size": int(spec["lot_size"]), "type": spec.get("type", "MARKET"),
-        "limit": float(spec["limit"]) if spec.get("limit") else None, "status": "PENDING", "fill": None, "note": "",
-        "trade_id": None, "exec_time": None, "source": spec["source"], "practice": bool(spec.get("practice")),
-        "sl_pct": float(spec["sl_pct"]), "tp_pct": float(spec["tp_pct"]), "be_pct": float(spec["be_pct"]),
-        "spot_sl": float(spec["spot_sl"]) if spec.get("spot_sl") else None,
-        "spot_tp": float(spec["spot_tp"]) if spec.get("spot_tp") else None, "product": "INTRADAY",
-    }
-
-
-def make_trade(o, fill, ltp, spot, now):
-    return {
-        "id": hashlib.md5(f"T{o['id']}{now.timestamp()}".encode()).hexdigest()[:6], "order_id": o["id"],
-        "date": now.date().isoformat(), "time": now.strftime("%H:%M:%S"), "ts": now.timestamp(),
-        "index": o["index"], "expiry": o["expiry"], "strike": o["strike"], "opt": o["opt"],
-        "lots": o["lots"], "lot_size": o["lot_size"], "entry_premium": round(float(fill), 2), "entry_ltp": float(ltp),
-        "entry_spot": round(float(spot), 2),
-        "sl_price": round(fill * (1 - o["sl_pct"] / 100.0), 2), "tp_price": round(fill * (1 + o["tp_pct"] / 100.0), 2),
-        "be_pct": o["be_pct"], "be_armed": False, "spot_sl": o["spot_sl"], "spot_tp": o["spot_tp"],
-        "status": "OPEN", "last_premium": round(float(fill), 2), "max_premium": round(float(fill), 2),
-        "min_premium": round(float(fill), 2), "exit_premium": None, "exit_spot": None, "exit_date": None,
-        "exit_time": None, "exit_ts": None, "exit_reason": "", "gross": 0.0, "charges": 0.0, "pnl": 0.0,
-        "source": o["source"], "practice": o["practice"], "product": o["product"],
-    }
-
-
-def try_execute(led, o, lm, spot, now, cfg):
-    """Fill order o at the current ask if possible. Returns True when the order reached a final state."""
-    row = opt_row(lm, o["strike"], o["opt"])
-    ask = buy_fill(row, cfg["slip"])
-    if not ask:
-        return False
-    if o["type"] == "LIMIT" and ask > o["limit"] + 1e-9:
-        return False
-    cost = ask * o["lots"] * o["lot_size"]
-    if cost > cash_free(led):
-        o["status"], o["note"] = "REJECTED", f"Insufficient funds (needs ₹{cost:,.0f}, free ₹{cash_free(led):,.0f})"
-        return True
-    t = make_trade(o, ask, row["ltp"], spot, now)
-    led["trades"].append(t)
-    o.update({"status": "EXECUTED", "fill": ask, "trade_id": t["id"], "exec_time": now.strftime("%H:%M:%S"), "note": ""})
-    return True
-
-
-def place_order(led, spec, lm, spot, now, cfg):
-    """Create an order; MARKET fills at the ask immediately, LIMIT fills when ask <= limit (else stays PENDING)."""
-    led.setdefault("orders", [])
-    o = new_order(spec, now)
-    led["orders"].append(o)
-    if o["lots"] < 1:
-        o["status"], o["note"] = "REJECTED", "Quantity must be at least 1 lot"
-    elif not o["practice"] and not market_open_now(now):
-        o["status"], o["note"] = "REJECTED", "Market is closed"
-    elif o["type"] == "LIMIT" and not (o["limit"] and o["limit"] > 0):
-        o["status"], o["note"] = "REJECTED", "Limit price required"
-    elif not buy_fill(opt_row(lm, o["strike"], o["opt"]), cfg["slip"]):
-        o["status"], o["note"] = "REJECTED", "No quote for this contract"
-    elif not try_execute(led, o, lm, spot, now, cfg):
-        o["note"] = "Waiting for ask <= limit"
-    return o
-
-
-def process_pending_orders(led, idx_name, expiry, lm, spot, now, cfg):
-    msgs = []
-    today = now.date().isoformat()
-    for o in led.setdefault("orders", []):
-        if o["status"] != "PENDING":
-            continue
-        if not o["practice"] and (o["date"] < today or not is_trading_day(now) or _mins(now) >= SQUARE_OFF):
-            o["status"], o["note"] = "CANCELLED", "Expired at end of day"
-            continue
-        if o["index"] != idx_name or o["expiry"] != str(expiry)[:10]:
-            continue
-        if try_execute(led, o, lm, spot, now, cfg):
-            msgs.append(f"Order {o['id']} {o['status']}: BUY {contract_name(o)} "
-                        + (f"filled @ {o['fill']:.2f}" if o["status"] == "EXECUTED" else o["note"]))
-    return msgs
-
-
-def cancel_order(led, oid):
-    for o in led.get("orders", []):
-        if o["id"] == oid and o["status"] == "PENDING":
-            o["status"], o["note"] = "CANCELLED", "Cancelled by user"
-
-
-def close_trade(t, price, reason, now, spot=None):
-    qty = t["lots"] * t["lot_size"]
-    t.update({"status": "CLOSED", "exit_premium": round(float(price), 2), "exit_spot": spot,
-              "exit_date": now.date().isoformat(), "exit_time": now.strftime("%H:%M:%S"), "exit_ts": now.timestamp(),
-              "exit_reason": reason})
-    t["gross"] = round((price - t["entry_premium"]) * qty, 2)
-    t["charges"] = round(2 * CHARGES_PER_ORDER, 2)
-    t["pnl"] = round(t["gross"] - t["charges"], 2)
-
-
-def manage_open_trades(led, idx_name, expiry, lm, spot, now, cfg):
-    """
-    Marks each open option at the BID and applies, in priority order:
-    square-off > premium stop (or breakeven stop once armed) > index invalidation > premium target > index target.
-    Fills happen at the observed bid, so a gap through the stop fills worse than the stop level.
-    """
-    msgs = []
-    today = now.date().isoformat()
-    for t in led["trades"]:
-        if t["status"] != "OPEN":
-            continue
-        priced = t["index"] == idx_name and t["expiry"] == str(expiry)[:10]
-        mark = mark_price(opt_row(lm, t["strike"], t["opt"]), cfg["slip"]) if priced else None
-        if mark:
-            t["last_premium"] = mark
-            t["max_premium"] = max(t.get("max_premium", mark), mark)
-            t["min_premium"] = min(t.get("min_premium", mark), mark)
-        reason, px = None, mark
-        squared = (not t.get("practice")) and (t["date"] < today or not is_trading_day(now) or _mins(now) >= SQUARE_OFF)
-        if squared:
-            reason = "SQUARE-OFF (end of day / market closed)"
-            px = mark or t.get("last_premium") or t["entry_premium"]
-        elif mark:
-            if t["be_pct"] > 0 and not t["be_armed"] and mark >= t["entry_premium"] * (1 + t["be_pct"] / 100.0):
-                t["be_armed"] = True
-                msgs.append(f"{contract_name(t)} is up {t['be_pct']:.0f}%: stop moved to breakeven ({t['entry_premium']:.2f}).")
-            eff_sl = max(t["sl_price"], t["entry_premium"]) if t["be_armed"] else t["sl_price"]
-            spot_stop = t.get("spot_sl") and priced and ((spot <= t["spot_sl"]) if t["opt"] == "CE" else (spot >= t["spot_sl"]))
-            spot_goal = t.get("spot_tp") and priced and ((spot >= t["spot_tp"]) if t["opt"] == "CE" else (spot <= t["spot_tp"]))
-            if mark <= eff_sl:
-                reason = "BREAKEVEN STOP" if (t["be_armed"] and eff_sl >= t["entry_premium"]) else "PREMIUM STOP"
-            elif spot_stop:
-                reason = "INDEX INVALIDATION (spot stop)"
-            elif mark >= t["tp_price"]:
-                reason = "PREMIUM TARGET"
-            elif spot_goal:
-                reason = "INDEX TARGET (spot)"
-        if reason and px:
-            close_trade(t, px, reason, now, spot if priced else None)
-            msgs.append(f"Closed {t['id']} {contract_name(t)} at {px:.2f}: {reason}, net P&L ₹{t['pnl']:+,.0f}")
-    return msgs
-
-
-def sync_desk(led, idx_name, expiry, lm, spot, now, cfg):
-    """One tick of the paper exchange: match pending orders, then manage open positions."""
-    msgs = process_pending_orders(led, idx_name, expiry, lm, spot, now, cfg)
-    msgs += manage_open_trades(led, idx_name, expiry, lm, spot, now, cfg)
-    return msgs
-
-
-def choose_option(scan, opt_side):
-    """Best scanner row for the wanted side that is liquid enough to trade automatically."""
-    if scan is None or scan.empty:
-        return None
-    s = scan[(scan["Side"] == opt_side) & (scan["LTP"] >= AUTO_MIN_PREMIUM) & (scan["Delta"] >= AUTO_MIN_DELTA)]
-    s = s[s["Spread%"].isna() | (s["Spread%"] <= AUTO_MAX_SPREAD_PCT)]
-    return s.iloc[0] if not s.empty else None      # scan is already sorted by Score
-
-
-def try_auto_entry(led, sig, ai_time, idx_name, expiry, m, scan, spot, now, cfg):
-    """Returns (opened, message). BUY signal -> buy a call; SELL signal -> buy a put. Never sells/writes options."""
-    if not sig or sig["signal"] == "WAIT":
-        return False, ""
-    if not entry_window_open(now):
-        return False, f"Auto-entry skipped: outside the entry window ({hhmm(ENTRY_START)}-{hhmm(ENTRY_CUTOFF)} IST, Mon-Fri)."
-    if any(t["status"] == "OPEN" for t in led["trades"]) or any(o["status"] == "PENDING" for o in led.get("orders", [])):
-        return False, "Auto-entry skipped: a position or pending order already exists."
-    today = now.date().isoformat()
-    n_today, pnl_today = today_stats(led, today)
-    if n_today >= MAX_TRADES_PER_DAY:
-        return False, f"Auto-entry skipped: daily limit of {MAX_TRADES_PER_DAY} trades reached."
-    if pnl_today <= -led["initial_capital"] * DAILY_LOSS_LIMIT_PCT / 100.0:
-        return False, f"Auto-entry skipped: daily loss limit (-{DAILY_LOSS_LIMIT_PCT}%) reached."
-    last_exit = max((t.get("exit_ts") or 0 for t in led["trades"] if t["status"] == "CLOSED"), default=0)
-    if last_exit and now.timestamp() - last_exit < COOLDOWN_MIN * 60:
-        return False, f"Auto-entry skipped: {COOLDOWN_MIN}-min cooldown after the last exit."
-    if ai_time is None or (now - ai_time).total_seconds() > AI_MAX_AGE_MIN * 60:
-        return False, f"Auto-entry skipped: AI verdict older than {AI_MAX_AGE_MIN} min. Use FORCE AI RUN."
-    opt = "CE" if sig["signal"] == "BUY" else "PE"
-    pick = choose_option(scan, opt)
-    if pick is None:
-        return False, (f"Auto-entry skipped: no liquid {opt} (premium >= {AUTO_MIN_PREMIUM:.0f}, delta >= {AUTO_MIN_DELTA}, "
-                       f"spread <= {AUTO_MAX_SPREAD_PCT:.0f}%).")
-    row = opt_row(m, pick["Strike"], opt)
-    fill = buy_fill(row, cfg["slip"])
-    if not fill:
-        return False, "Auto-entry skipped: no tradable price for the chosen contract."
-    lot = INDEX_MAP[idx_name]["lot"]
-    sz = size_option(equity_now(led), cash_free(led), fill, lot, cfg["sl_pct"], cfg["risk_pct"], cfg["outlay_pct"])
-    if sz["lots"] < 1:
-        return False, (f"Auto-entry skipped: 1 lot of {pick['Strike']:.0f} {opt} costs ₹{sz['cost']:,.0f} and risks "
-                       f"₹{sz['risk_per_lot']:,.0f} at a {cfg['sl_pct']:.0f}% stop (limits: risk {cfg['risk_pct']}%, "
-                       f"outlay {cfg['outlay_pct']:.0f}% of equity).")
-    spec = {"index": idx_name, "expiry": expiry, "strike": pick["Strike"], "opt": opt, "lots": sz["lots"], "lot_size": lot,
-            "type": "MARKET", "limit": None, "sl_pct": cfg["sl_pct"], "tp_pct": cfg["tp_pct"], "be_pct": cfg["be_pct"],
-            "spot_sl": sig["sl"], "spot_tp": sig["target"], "source": "AUTO", "practice": False}
-    o = place_order(led, spec, m, spot, now, cfg)
-    if o["status"] != "EXECUTED":
-        return False, f"Auto order {o['status']}: {o['note']}"
-    return True, (f"AUTO BUY {sz['lots']} lot(s) {contract_name(o)} @ {o['fill']:.2f} (cost ₹{o['fill'] * sz['lots'] * lot:,.0f}) | "
-                  f"stop {o['fill'] * (1 - cfg['sl_pct'] / 100):.2f} | target {o['fill'] * (1 + cfg['tp_pct'] / 100):.2f} | "
-                  f"index stop {sig['sl']:,.0f} / target {sig['target']:,.0f}")
-
-
-# ---- journal / export ----
-def trades_to_dhan_rows(trades):
-    rows = []
-    for t in trades:
-        qty = t["lots"] * t["lot_size"]
-        name = contract_name(t)
-        rows.append({"Date": t["date"], "Time": t["time"], "Name": name, "Buy/Sell": "BUY", "Order": "INTRADAY",
-                     "Exchange": "NSE", "Segment": "Derivative", "Quantity/Lot": f"{qty}/{t['lots']}",
-                     "Trade Price": t["entry_premium"], "Trade Value": round(t["entry_premium"] * qty, 2),
-                     "Status": "Traded", "Realized PnL": "", "Exit Reason": "", "Charges (est)": ""})
-        if t["status"] == "CLOSED" and t.get("exit_premium") is not None:
-            rows.append({"Date": t["exit_date"], "Time": t["exit_time"], "Name": name, "Buy/Sell": "SELL",
-                         "Order": "INTRADAY", "Exchange": "NSE", "Segment": "Derivative", "Quantity/Lot": f"{qty}/{t['lots']}",
-                         "Trade Price": t["exit_premium"], "Trade Value": round(t["exit_premium"] * qty, 2),
-                         "Status": "Traded", "Realized PnL": round(t["pnl"], 2), "Exit Reason": t.get("exit_reason", ""),
-                         "Charges (est)": t.get("charges", 0.0)})
-    return pd.DataFrame(rows)
-
-
-def perf_summary(led):
-    closed = sorted([t for t in led["trades"] if t["status"] == "CLOSED"], key=lambda x: x.get("exit_ts") or 0)
-    wins = [t["pnl"] for t in closed if t["pnl"] > 0]
-    losses = [t["pnl"] for t in closed if t["pnl"] <= 0]
-    gw, gl = sum(wins), -sum(losses)
-    peak = run = max_dd = 0.0
-    for t in closed:
-        run += t["pnl"]
-        peak = max(peak, run)
-        max_dd = max(max_dd, peak - run)
-    n = len(closed)
-    return {
-        "Initial capital (₹)": led["initial_capital"],
-        "Equity (₹)": round(equity_now(led), 2),
-        "Net realized P&L (₹)": round(realized_pnl(led), 2),
-        "Trades (total / closed)": f"{len(led['trades'])} / {n}",
-        "Win rate (%)": round(len(wins) / n * 100, 1) if n else 0.0,
-        "Average win (₹)": round(sum(wins) / len(wins), 2) if wins else 0.0,
-        "Average loss (₹)": round(sum(losses) / len(losses), 2) if losses else 0.0,
-        "Expectancy per trade (₹)": round(sum(t["pnl"] for t in closed) / n, 2) if n else 0.0,
-        "Profit factor": round(gw / gl, 2) if gl > 0 else ("n/a" if not gw else "inf"),
-        "Max drawdown (₹)": round(max_dd, 2),
-        "Charges paid (₹)": round(sum(t.get("charges", 0.0) for t in closed), 2),
-    }
-
-
-def generate_excel_report(led):
-    if not led["trades"]:
-        return None
-    try:
-        import openpyxl  # noqa: F401
-    except ImportError:
-        return None
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as w:
-        trades_to_dhan_rows(led["trades"]).to_excel(w, index=False, sheet_name="Trade_History")
-        s = perf_summary(led)
-        pd.DataFrame({"Metric": list(s.keys()), "Value": [str(v) for v in s.values()]}).to_excel(
-            w, index=False, sheet_name="Performance_Summary")
-        closed = [t for t in led["trades"] if t["status"] == "CLOSED"]
-        if closed:
-            pd.DataFrame([{"Contract": contract_name(t), "Entry": t["entry_premium"], "Exit": t["exit_premium"],
-                           "Max premium seen": t.get("max_premium"), "Min premium seen": t.get("min_premium"),
-                           "Gross ₹": t["gross"], "Charges ₹": t["charges"], "Net ₹": t["pnl"],
-                           "Exit reason": t["exit_reason"], "Source": t["source"]} for t in closed]).to_excel(
-                w, index=False, sheet_name="Closed_Detail")
-        if led.get("orders"):
-            pd.DataFrame([{"Order ID": o["id"], "Date": o["date"], "Time": o["time"], "Contract": contract_name(o),
-                           "Type": o["type"], "Lots": o["lots"], "Limit": o["limit"], "Fill": o["fill"],
-                           "Status": o["status"], "Note": o["note"], "Source": o["source"]} for o in led["orders"]]).to_excel(
-                w, index=False, sheet_name="Order_Book")
-    return out.getvalue()
-
-
-def show_df(df, **kw):
-    """st.dataframe that works on both old and new Streamlit width APIs."""
-    try:
-        st.dataframe(df, width="stretch", **kw)
-    except Exception:
-        st.dataframe(df, use_container_width=True, **kw)
-
-
-@st.cache_data(ttl=120, show_spinner=False)
-def fetch_today_ohlc(scrip, seg, token, client_id):
-    """Today's O/H/L/C from the market quote. Best effort; only used after the close when the daily candle is missing."""
-    try:
-        r = requests.post(f"{BASE_URL}/marketfeed/ohlc", headers=auth_headers(token, client_id),
-                          json={seg: [scrip]}, timeout=10)
-        check(r)
-        q = (r.json().get("data") or {}).get(seg, {}).get(str(scrip)) or {}
-        o = q.get("ohlc") or {}
-        vals = {k: _n(o.get(k2)) for k, k2 in (("o", "open"), ("h", "high"), ("l", "low"), ("c", "close"))}
-        if all(v > 0 for v in vals.values()):
-            return vals
-    except Exception:
-        pass
-    return None
 
 
 def esc(x):
@@ -1909,9 +1380,9 @@ with st.sidebar:
     else:
         if auto_prev:
             st.warning(f"Auto prev close unavailable: {auto_src}. Enter it manually.")
-        prev_close = st.number_input("PREV CLOSE", value=info["default_prev"], step=float(info["step"]),
-                                     key=f"prev_{idx_name}",
-                                     help="Yesterday's close. Used by the bias score.")
+        prev_close = st.number_input("PREV CLOSE (enter verified previous-session close)", min_value=0.0,
+                                     value=0.0, step=float(info["step"]), key=f"prev_{idx_name}",
+                                     help="No stale index default is prefilled. Enter the verified previous-session close.")
     live_news = st.toggle("LIVE NEWS FEED", value=True,
                           help="Fetch fresh market headlines (Google News RSS) for the Sentiment agent.")
     news = st.text_area("EXTRA NEWS / MACRO NOTES", placeholder="Optional: add your own notes on top of the live feed",
@@ -1923,21 +1394,6 @@ with st.sidebar:
                          help="Relative change applied to IV in the crush / spike scenarios.")
     exh_lookback = st.slider("EXHAUSTION LOOKBACK (min)", 6, 45, 15, step=3,
                              help="History window used by the exhaustion monitor. With a 3-min refresh, 15 min = 5 snapshots.")
-    st.markdown("---")
-    st.markdown("### 🤖 OPTION PAPER TRADING")
-    st.caption("Simulation only (long calls / puts). This app never places real orders.")
-    auto_execute = st.toggle("AUTO ENTRIES & EXITS (paper)", value=False, key="auto_execute",
-                             help="BUY signal buys a call, SELL signal buys a put (market hours only). Exits automatically at "
-                                  "premium stop/target, breakeven stop, index invalidation or square-off.")
-    risk_pct = st.number_input("MAX LOSS AT STOP (% of equity)", min_value=0.5, max_value=25.0, value=OPT_RISK_PCT, step=0.5, key="risk_pct")
-    outlay_pct = st.number_input("MAX PREMIUM PER TRADE (% of equity)", min_value=5.0, max_value=100.0, value=OPT_OUTLAY_PCT, step=5.0, key="outlay_pct")
-    opt_sl_pct = st.number_input("PREMIUM STOP (%)", min_value=5.0, max_value=90.0, value=OPT_SL_PCT, step=5.0, key="opt_sl_pct")
-    opt_tp_pct = st.number_input("PREMIUM TARGET (%)", min_value=10.0, max_value=1000.0, value=OPT_TP_PCT, step=10.0, key="opt_tp_pct")
-    opt_be_pct = st.number_input("STOP TO BREAKEVEN AFTER +% (0 = off)", min_value=0.0, max_value=300.0, value=OPT_BE_PCT, step=10.0, key="opt_be_pct")
-    live_on = st.toggle("LIVE DESK SYNC (auto-refresh order book)", value=True, key="live_on",
-                        help="The Live Option Desk re-pulls the option chain every few seconds and re-marks positions, "
-                             "matches limit orders and checks stops, independent of the 3-minute engine refresh.")
-    live_sec = st.slider("LIVE REFRESH (seconds)", 4, 30, 5, key="live_sec")
     force_run = st.button("FORCE AI RUN")
 
     auto_refresh = st.toggle("AUTO REFRESH (3 MIN)", value=True)
@@ -1958,10 +1414,34 @@ if df.empty or spot == 0:
     st.stop()
 
 m = compute_metrics(df, spot, prev_close, expiry, info["step"])
+m["expiry"] = expiry
 vel = update_oi_velocity(m, key=f"{idx_name}|{expiry}")
 hist = record_snapshot(m, f"{idx_name}|{expiry}")
 m["exh"] = exhaustion(hist, m, prev_close, exh_lookback)
 m["exh_flag"] = exh_flag(m["exh"])
+
+# Data-integrity gate: fail closed when core inputs are absent or unreliable.
+quality_issues = []
+if not np.isfinite(spot) or spot <= 0:
+    quality_issues.append("spot is missing or invalid")
+if not np.isfinite(prev_close) or prev_close <= 0:
+    quality_issues.append("verified previous close is missing")
+if df["Strike"].isna().any() or not (df["Strike"] > 0).all():
+    quality_issues.append("one or more strikes are invalid")
+if float(df["CE_OI"].sum()) <= 0 or float(df["PE_OI"].sum()) <= 0:
+    quality_issues.append("call/put OI totals are missing or zero")
+prev_oi_ok = ((df["CE_PrevOI"] > 0) & (df["PE_PrevOI"] > 0)).sum()
+if prev_oi_ok < max(3, int(0.25 * len(df))):
+    quality_issues.append("previous OI baseline is missing on too many strikes; OI-change analysis is unreliable")
+if not np.isfinite(m["atm_iv"]) or m["atm_iv"] <= 0 or m["atm_iv"] > 300:
+    quality_issues.append("ATM IV is missing or outside sanity bounds")
+m["quality"] = {"trade_ready": not quality_issues, "issues": quality_issues,
+                 "prev_oi_coverage_pct": round(100 * prev_oi_ok / max(1, len(df)), 1),
+                 "state": "READY" if not quality_issues else "DATA INVALID / MANUAL REVIEW"}
+if quality_issues:
+    st.error("DATA QUALITY GATE — directional signals are disabled: " + "; ".join(quality_issues))
+else:
+    st.success(f"DATA QUALITY: READY | previous OI coverage {m['quality']['prev_oi_coverage_pct']:.1f}% | option-chain cache TTL ≤30 sec")
 
 # ---- live news ----
 news_items, news_status = ([], ["LIVE NEWS: off"])
@@ -1976,14 +1456,16 @@ nhash = news_hash(news_items)
 
 # ---- AI gating + cache ----
 changed, reason = evaluate_market_state_change(m, vel, nhash)
-_last_try = st.session_state.get("last_ai_attempt")
-_retry_ok = _last_try is None or (datetime.now(IST) - _last_try).total_seconds() >= AI_RETRY_SEC
-if force_run or (changed and _retry_ok):
-    st.session_state["last_ai_attempt"] = datetime.now(IST)
+last_ai_time = st.session_state.get("last_ai_time")
+ai_age_sec = (datetime.now() - last_ai_time).total_seconds() if last_ai_time else None
+if not m["quality"]["trade_ready"]:
+    ai = {"signal": "WAIT", "confidence": 0, "final_approval": "BLOCKED: data-quality gate", "_model": "DATA GATE"}
+    gate_label = "BLOCKED — DATA QUALITY"
+elif force_run or changed:
     ai = run_council(m, vel, news_text, groq_key, groq_model)
     if "error" not in ai:
         st.session_state.last_ai_verdict = ai
-        st.session_state.last_ai_time = datetime.now(IST)
+        st.session_state.last_ai_time = datetime.now()
         st.session_state.last_ai_state = {
             "spot": m["spot"], "pcr": m["pcr"], "call_wall": m["call_wall"],
             "put_wall": m["put_wall"], "gamma_strike": m["gamma_strike"], "status": m["status"],
@@ -1995,589 +1477,279 @@ if force_run or (changed and _retry_ok):
     else:
         err = ai["error"]
         cached = st.session_state.get("last_ai_verdict")
-        ai = cached if cached else ai
-        gate_label = f"AI ERROR: {err}" + (" (showing cached)" if cached else "")
+        cached_time = st.session_state.get("last_ai_time")
+        cached_age = (datetime.now() - cached_time).total_seconds() if cached_time else float("inf")
+        if cached and cached_age <= 600:
+            ai = cached
+            gate_label = f"AI ERROR: {err} (showing cached verdict, age {cached_age / 60:.1f}m)"
+        else:
+            ai = {"error": f"{err}. No sufficiently recent cached verdict is available."}
+            gate_label = "AI ERROR — NO CURRENT VERDICT"
 else:
-    ai = st.session_state.get("last_ai_verdict", {"error": "No verdict yet."})
-    t = st.session_state.get("last_ai_time")
-    gate_label = f"CACHED {t.strftime('%H:%M:%S') if t else ''}"
-
-# ---- risk-validated signal + option paper trading engine ----
-if "paper_ledger" not in st.session_state:
-    st.session_state["paper_ledger"] = load_ledger()
-now_ist = datetime.now(IST)
-ai_ok = not ("error" in ai and "signal" not in ai)
-sig = build_signal(m, ai) if ai_ok else None
-ledger = st.session_state["paper_ledger"]
-ledger.setdefault("orders", [])
-scan, smeta = premium_scanner(m, horizon_days, iv_shock)
-opt_cfg = {"sl_pct": opt_sl_pct, "tp_pct": opt_tp_pct, "be_pct": opt_be_pct, "risk_pct": risk_pct,
-           "outlay_pct": outlay_pct, "slip": SLIPPAGE_PCT}
-trade_msgs = sync_desk(ledger, idx_name, expiry, m, spot, now_ist, opt_cfg)
-auto_msg, auto_opened = "", False
-if auto_execute:
-    auto_opened, auto_msg = try_auto_entry(ledger, sig, st.session_state.get("last_ai_time"), idx_name, expiry,
-                                           m, scan, spot, now_ist, opt_cfg)
-if trade_msgs or auto_opened:
-    save_ledger(ledger)
+    if ai_age_sec is not None and ai_age_sec > 600:
+        ai = {"error": f"Cached AI verdict expired ({ai_age_sec / 60:.0f} minutes old). Press FORCE AI RUN or wait for a market-state change."}
+        gate_label = "EXPIRED — NO CURRENT AI VERDICT"
+    else:
+        ai = st.session_state.get("last_ai_verdict", {"error": "No verdict yet."})
+        t = st.session_state.get("last_ai_time")
+        gate_label = f"CACHED {t.strftime('%H:%M:%S') if t else ''} | age {ai_age_sec / 60:.1f}m" if ai_age_sec is not None else "NO CACHED VERDICT"
 
 # ============================================================
 # DASHBOARD
 # ============================================================
 st.markdown(f"## {idx_name} // SPOT {spot:,.2f}  ({spot - prev_close:+,.2f})")
-_mkt = "OPEN" if market_open_now(now_ist) else "CLOSED (spot, OI and premiums shown are the last close, not live)"
-st.caption(f"{now_ist.strftime('%a %d %b %Y %H:%M:%S')} IST | market {_mkt}")
-for _msg in trade_msgs:
-    st.info(_msg)
-if auto_opened:
-    st.success(auto_msg)
-elif auto_msg:
-    st.caption(auto_msg)
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-    "📊 Dashboard & Engine", "📐 Day Levels", "🧭 Exhaustion", "🎯 Premium Scanner",
-    "🤖 AI Council & News", "📋 Option Chain", "📈 Live Option Desk"])
+status = m["status"]
+if "BULLISH GAMMA BLAST" in status:
+    color, flash = "#00e676", "flash-green"
+elif "BEARISH GAMMA BLAST" in status:
+    color, flash = "#ff1744", "flash-red"
+elif "TRAP" in status or "CONFLICTED" in status:
+    color, flash = "#ffab00", "flash-amber"
+else:
+    color, flash = "#90a4ae", ""
 
-with tab1:
-    status = m["status"]
-    if "BULLISH GAMMA BLAST" in status:
-        color, flash = "#00e676", "flash-green"
-    elif "BEARISH GAMMA BLAST" in status:
-        color, flash = "#ff1744", "flash-red"
-    elif "TRAP" in status or "CONFLICTED" in status or "BUILD" in status:
-        color, flash = "#ffab00", "flash-amber"
+st.markdown(f"""
+<div class="bbg-panel {flash}" style="border:2px solid {color};">
+  <div class="bbg-title">Dual-Force Engine</div>
+  <div class="bbg-big" style="color:{color};">{esc(status)} &nbsp;|&nbsp; {esc(m['engine_signal'])}</div>
+  <div class="bbg-desc">{esc(m['desc'])}</div>
+</div>""", unsafe_allow_html=True)
+
+if abs(prev_close - spot) / spot > 0.05:
+    st.warning(f"PREV CLOSE ({prev_close:,.0f}) is more than 5% away from spot ({spot:,.0f}). "
+               "It is probably stale or wrong, and it skews the BIAS SCORE.")
+
+# ---- ENGINE DEBUG ROW ----
+es = m["engine"]
+st.caption(f"DUAL-FORCE ENGINE INPUTS (near-spot strikes, % of that side's OI | each leg needs >= {MIN_FLOW_PCT:.1f}%)")
+d1, d2, d3, d4 = st.columns(4)
+d1.metric("CE EXITS", f"{es['ce_exit_pct']:.1f}%", f"{es['ce_exits']:+,.0f} qty", delta_color="off")
+d2.metric("PE BUILDS", f"{es['pe_build_pct']:.1f}%", f"{es['pe_build']:+,.0f} qty", delta_color="off")
+d3.metric("PE EXITS", f"{es['pe_exit_pct']:.1f}%", f"{es['pe_exits']:+,.0f} qty", delta_color="off")
+d4.metric("CE BUILDS", f"{es['ce_build_pct']:.1f}%", f"{es['ce_build']:+,.0f} qty", delta_color="off")
+f1, f2, f3 = st.columns(3)
+f1.metric("BULL FORCE (PE build + CE exit)", f"{es['bull_force']:.1f}")
+f2.metric("BEAR FORCE (CE build + PE exit)", f"{es['bear_force']:.1f}")
+f3.metric("FORCE RATIO", f"{min(es['force_ratio'], 99):.2f}x", f"winner needs >= {DOMINANCE}x", delta_color="off")
+_zero = [n for n, k in (("CE EXITS", "ce_exit_pct"), ("PE BUILDS", "pe_build_pct"),
+                        ("PE EXITS", "pe_exit_pct"), ("CE BUILDS", "ce_build_pct")) if es[k] == 0]
+if _zero:
+    st.caption(f"{', '.join(_zero)} = 0.0% means no near-spot strike moved that way by more than {NOISE_PCT}% of that side's OI. "
+               "These legs compare today's OI with the PREVIOUS DAY's close, not with the last refresh.")
+_dq = data_quality(m)
+if _dq:
+    st.warning("Data quality: " + _dq + ".")
+st.caption("Bullish blast = CE exits + PE builds both >= threshold AND bull force >= 1.5x bear force. "
+           "Bearish blast = mirror image. Both sides active with no clear winner = CONFLICTED | WAIT.")
+
+if m["iv_gap"] > 3:
+    st.caption(f"⚠ ATM IV mismatch: CE {m['atm_iv_ce']:.1f}% vs PE {m['atm_iv_pe']:.1f}% (often stale quotes after hours). "
+               f"Expected move uses the average ({m['atm_iv']:.1f}%).")
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("BIAS SCORE", f"{m['score']}/100", m["bias"])
+c2.metric("PCR", f"{m['pcr']:.2f}")
+c3.metric("EXPECTED MOVE (±)", f"{m['exp_move']:,.0f}", f"IV {m['atm_iv']:.1f}% | {m['dte']}d")
+c4.metric("OI BATTLE", m["battle"])
+
+c5, c6, c7, c8 = st.columns(4)
+c5.metric("CALL WALL", f"{m['call_wall']:,.0f}")
+c6.metric("PUT WALL", f"{m['put_wall']:,.0f}")
+c7.metric("MAX PAIN", f"{m['max_pain']:,.0f}")
+c8.metric("GAMMA STRIKE", f"{m['gamma_strike']:,.0f}", f"{m['gamma_strike'] - spot:+,.0f} vs spot")
+
+c9, c10, c11, c12 = st.columns(4)
+c9.metric("CE TRAP (RES)", f"{m['ce_trap']:,.0f}" if m["ce_trap"] else "—")
+c10.metric("PE TRAP (SUPP)", f"{m['pe_trap']:,.0f}" if m["pe_trap"] else "—")
+c11.metric("NET CE OI Δ", f"{m['dce']:+,.0f}")
+c12.metric("NET PE OI Δ", f"{m['dpe']:+,.0f}")
+
+j1, j2, j3 = st.columns(3)
+
+st.markdown("#### 3-MIN OI VELOCITY (near spot)")
+v1, v2, v3, v4 = st.columns(4)
+v1.metric("CE BUILDS", f"{vel['ce_builds']:,.0f}")
+v2.metric("CE UNWINDS", f"{vel['ce_unwinds']:,.0f}")
+v3.metric("PE BUILDS", f"{vel['pe_builds']:,.0f}")
+v4.metric("PE UNWINDS", f"{vel['pe_unwinds']:,.0f}")
+if sum(vel.values()) == 0:
+    st.caption("Velocity needs two snapshots ~3 min apart. It will populate after the next refresh.")
+
+# ---- DAY MOVEMENT LEVELS ----
+st.markdown("#### 📐 DAY MOVEMENT LEVELS")
+try:
+    candles = fetch_daily_candles(info["scrip"], info["seg"], dhan_token, client_id)
+    candle_err = ""
+except Exception as e:
+    candles, candle_err = [], str(e)
+dl = compute_day_levels(candles, m["spot"], daily_sigma(m), m, prev_close)
+if candle_err:
+    st.warning(f"Daily candles unavailable ({candle_err[:160]}). Showing sigma bands around the sidebar PREV CLOSE only.")
+st.caption(f"Basis: {dl['basis']} | 1σ daily = Spot × ATM IV × √(1/365) ≈ {dl['sd']:,.0f} pts"
+           + (f" | ATR(14) ≈ {dl['atr']:,.0f} pts" if dl["atr"] else ""))
+lc1, lc2, lc3 = st.columns(3)
+lc1.metric("1σ RANGE (68%)", f"{dl['band1'][0]:,.0f} – {dl['band1'][1]:,.0f}")
+lc2.metric("2σ RANGE (95%)", f"{dl['band2'][0]:,.0f} – {dl['band2'][1]:,.0f}")
+lc3.metric("MOVE SO FAR", f"{dl['moved_sigma']:+.2f}σ", f"{m['spot'] - dl['ref_close']:+,.0f} pts vs ref close", delta_color="off")
+show = dl["table"].copy()
+show["Price"] = show["Price"].map(lambda v: f"{v:,.0f}")
+show["Dist pts"] = show["Dist pts"].map(lambda v: f"{v:+,.0f}")
+show["Dist σ"] = show["Dist σ"].map(lambda v: f"{v:+.2f}")
+st.dataframe(show, use_container_width=True, hide_index=True)
+st.caption(f"★ = level within ±{dl['tol']:,.0f} pts of an OI level (wall, max pain, gamma strike): confluence is descriptive, not a probability. "
+           "Pivots: P=(H+L+C)/3, R1=2P−L, S1=2P−H, R2=P+(H−L), S2=P−(H−L). After 15:40 IST the basis is today's completed session. "
+           "Ranges are probabilities from IV (assumes normal returns), not guarantees.")
+
+# ---- EXHAUSTION MONITOR ----
+st.markdown("#### 🧭 EXHAUSTION MONITOR (is the trend running out of fuel?)")
+ex = m["exh"]
+if not ex["ready"]:
+    st.info(ex["why"] + " History is saved per day and survives a browser refresh, but only builds while this page is open.")
+else:
+    st.caption(f"Window {ex['age']:.0f} min ({ex['n']} snapshots) | spot {ex['spot_chg_sigma']:+.2f}σ over window | "
+               f"window high {ex['lb_high']:,.0f} / low {ex['lb_low']:,.0f} | 1σ daily ≈ {ex['sd']:,.0f} pts")
+    ecol1, ecol2 = st.columns(2)
+    for col, key, title in ((ecol1, "buyer", "BUYER EXHAUSTION (uptrend fading)"),
+                            (ecol2, "seller", "SELLER EXHAUSTION (downtrend fading)")):
+        side_ = ex[key]
+        scol = "#ff1744" if side_["flag"] == "CONFIRMED" else "#ffab00" if side_["flag"] in ("WATCH", "EARLY") else "#90a4ae"
+        rows = "".join(
+            f'<div class="agent">{"🔴" if v >= 1 else "🟠" if v >= 0.5 else "⚪"} <b>{esc(n)}:</b> {esc(d)}</div>'
+            for n, v, d in side_["signals"])
+        col.markdown(f"""<div class="bbg-panel" style="border:2px solid {scol};">
+          <div class="bbg-title">{title}</div>
+          <div class="bbg-big" style="color:{scol};">{side_['score']}/100</div>
+          <div class="bbg-desc" style="color:{scol};">{esc(side_['status'])}</div>
+          {rows}</div>""", unsafe_allow_html=True)
+    st.caption(f"Exhaustion is a warning, not a reversal call. CONFIRMED needs score >= {EXH_ALERT} AND a price turn of "
+               "at least 0.1σ off the window extreme. A BUY/SELL is blocked when its own side is CONFIRMED.")
+with st.expander("SESSION HISTORY (spot / IV / PCR)"):
+    if len(hist) >= 2:
+        hdf = pd.DataFrame([{"Time": datetime.fromtimestamp(h["ts"], IST).strftime("%H:%M:%S"), "Spot": h["spot"],
+                             "ATM IV": round(h["iv"], 2), "PCR": round(h["pcr"], 3), "Flow edge": round(h["edge"], 2),
+                             "Status": h["status"]} for h in hist])
+        st.line_chart(hdf.set_index("Time")[["Spot"]])
+        st.line_chart(hdf.set_index("Time")[["ATM IV"]])
+        st.dataframe(hdf.iloc[::-1], use_container_width=True, hide_index=True)
     else:
-        color, flash = "#90a4ae", ""
+        st.write("Waiting for more snapshots.")
 
+# ---- PREMIUM POTENTIAL SCANNER ----
+st.markdown("#### 🎯 PREMIUM POTENTIAL SCANNER")
+scan, smeta = premium_scanner(m, horizon_days, iv_shock)
+lean_now = sum(c["v"] for c in chain_checks(m))
+fav = "CE" if lean_now > 0 else "PE" if lean_now < 0 else None
+if "BULLISH GAMMA" in m["status"]:
+    fav = "CE"
+elif "BEARISH GAMMA" in m["status"]:
+    fav = "PE"
+if scan.empty:
+    st.info("No priced options found (needs last_price from the option chain; market may be closed or premiums < "
+            f"{MIN_PREMIUM:.0f}).")
+else:
+    fav_txt = {"CE": "CALLS (bullish side)", "PE": "PUTS (bearish side)"}.get(fav, "NO CLEAR SIDE - both shown, treat as low edge")
+    st.caption(f"Chain lean {lean_now:+d} | status {m['status']} → favoured: {fav_txt}. "
+               f"1σ daily move ≈ {smeta['sd']:,.0f} pts | horizon {horizon_label} (time left {smeta['T0d']:.1f}d → {smeta['T1d']:.1f}d) | "
+               f"IV shock ±{smeta['crush']:.0f}%.")
+    top = scan[scan["Side"] == fav].head(5) if fav else scan.head(6)
+    other = scan[scan["Side"] != fav].head(3) if fav else None
+    st.dataframe(fmt_scanner(top), use_container_width=True, hide_index=True)
+    if other is not None and not other.empty:
+        with st.expander("Counter-trend side (against the chain lean)"):
+            st.dataframe(fmt_scanner(other), use_container_width=True, hide_index=True)
+
+    b = top.iloc[0]
+    sgn = 1 if b["Side"] == "CE" else -1
+    s1 = m["spot"] + sgn * smeta["sd"]
+    st.markdown(f"""<div class="bbg-panel">
+      <div class="bbg-title">Top pick walk-through: {m['spot']:,.0f} spot, {b['Strike']:,.0f} {b['Side']} ({b['Money']}) at ₹{b['LTP']:,.1f}</div>
+      <div class="agent">If spot moves 1σ in favour to ≈ <b>{s1:,.0f}</b>: premium ≈ <b>{b['x1σ']:.2f}x</b> (₹{b['LTP']*b['x1σ']:,.1f}); delta rises {b['Delta']:.2f} → {b['Delta@1σ']:.2f}, which is the gamma effect (OTM turning into ITM/ATM).</div>
+      <div class="agent">With IV crush −{smeta['crush']:.0f}% on that same move: <b>{b['x1σ crush']:.2f}x</b> (₹{b['LTP']*b['x1σ crush']:,.1f}). With IV spike +{smeta['crush']:.0f}%: <b>{b['x1σ spike']:.2f}x</b> (₹{b['LTP']*b['x1σ spike']:,.1f}).</div>
+      <div class="agent">If it goes the wrong way by 0.5σ: <b>{b['xWrong']:.2f}x</b> (₹{b['LTP']*b['xWrong']:,.1f}). Spot move needed just to double the premium: <b>{('>4' if pd.isna(b['Needs2x(σ)']) else f"{b['Needs2x(σ)']:.2f}")}σ</b>.</div>
+    </div>""", unsafe_allow_html=True)
+    st.caption("Scenario repricing with Black-Scholes anchored to the traded premium, constant per-strike IV shift, "
+               "no slippage. It shows how premiums react IF spot moves; it does not predict that the move happens. "
+               "Score = a heuristic scenario-ranking metric, not a calibrated probability or trade recommendation. Delta is sensitivity, not probability of profit; OI change does not identify buyer vs seller initiation.")
+
+# ---- LIVE NEWS PANEL ----
+st.markdown("#### LIVE MARKET NEWS")
+if news_items:
+    tone = headline_tone(news_items)
+    tcol = "#00e676" if tone > 15 else "#ff1744" if tone < -15 else "#90a4ae"
+    rows = []
+    for i in news_items:
+        link = i["link"] if i["link"].startswith(("http://", "https://")) else ""
+        t = esc(i["title"])
+        t = f'<a href="{html.escape(link, quote=True)}" target="_blank" style="color:#ddd;">{t}</a>' if link else t
+        rows.append(f'<div class="agent"><b>{esc(age_label(i["age_min"]))}</b> · {esc(i["source"])} — {t}</div>')
+    st.markdown(f"""<div class="bbg-panel">
+      <div class="bbg-title">Headline tone (keyword backstop): <span style="color:{tcol};">{tone:+d}</span></div>
+      {''.join(rows)}</div>""", unsafe_allow_html=True)
+else:
+    st.warning("No headlines available. " + " | ".join(news_status))
+with st.expander("NEWS FEED STATUS"):
+    for line in news_status:
+        st.write(line)
+
+st.markdown("#### AI COUNCIL")
+st.caption(f"Gate: {gate_label}")
+if "error" in ai and "signal" not in ai:
+    st.warning(ai["error"])
+else:
+    sig = build_signal(m, ai)
+    scolor = {"BUY": "#00e676", "SELL": "#ff1744"}.get(sig["signal"], "#90a4ae")
+    lv = ""
+    if sig["target"] is not None:
+        rr_txt = f"1:{sig['rr']:.1f}" if sig["rr"] else "n/a"
+        lv = (f"Entry {sig['entry']:,.0f} &nbsp;|&nbsp; Target {sig['target']:,.0f} &nbsp;|&nbsp; "
+              f"SL {sig['sl']:,.0f} &nbsp;|&nbsp; R:R {rr_txt}")
+    ai_note = f" (AI said {sig['ai_signal']})" if sig["ai_signal"] != sig["signal"] else ""
     st.markdown(f"""
-    <div class="bbg-panel {flash}" style="border:2px solid {color};">
-      <div class="bbg-title">Dual-Force Engine</div>
-      <div class="bbg-big" style="color:{color};">{status} &nbsp;|&nbsp; {m['engine_signal']}</div>
-      <div class="bbg-desc">{m['desc']}</div>
+    <div class="bbg-panel" style="border:2px solid {scolor};">
+      <div class="bbg-title">Risk-Validated Signal</div>
+      <div class="bbg-big" style="color:{scolor};">{sig['signal']}{esc(ai_note)} &nbsp;|&nbsp; Confidence {sig['confidence']}%</div>
+      <div class="bbg-desc">{lv}</div>
+      <div class="bbg-desc" style="color:#ffab00;">{esc(sig['note']) if sig['note'] else ''}</div>
     </div>""", unsafe_allow_html=True)
 
-    if abs(prev_close - spot) / spot > 0.05:
-        st.warning(f"PREV CLOSE ({prev_close:,.0f}) is more than 5% away from spot ({spot:,.0f}). "
-                   "It is probably stale or wrong, and it skews the BIAS SCORE.")
+    # option-chain cross-check
+    d = sig["direction"]
+    def icon(v):
+        if d == 0:
+            return "🟢" if v > 0 else "🔴" if v < 0 else "⚪"
+        return "✅" if v * d > 0 else "❌" if v * d < 0 else "➖"
+    crow = "".join(f'<div class="agent">{icon(c["v"])} <b>{esc(c["name"])}:</b> {esc(c["detail"])}</div>'
+                   for c in sig["checks"])
+    lean_txt = "BULLISH" if sig["lean"] > 0 else "BEARISH" if sig["lean"] < 0 else "NEUTRAL"
+    sres, ssup = m["struct"]["res"], m["struct"]["sup"]
+    lvl_txt = (f"Nearest OI resistance {sres['level']:,.0f} ({sres['oi']/1e5:,.1f}L, chg {sres['chg']/1e5:+,.1f}L)" if sres else "No nearby resistance") \
+        + " &nbsp;|&nbsp; " + \
+        (f"Nearest OI support {ssup['level']:,.0f} ({ssup['oi']/1e5:,.1f}L, chg {ssup['chg']/1e5:+,.1f}L)" if ssup else "No nearby support") \
+        + f" &nbsp;|&nbsp; Global walls {m['call_wall']:,.0f} / {m['put_wall']:,.0f}"
+    need = f"AI call agreement {sig['net']:+d} (needs +{MIN_CONFIRM})" if d else "no directional call to confirm"
+    st.markdown(f"""
+    <div class="bbg-panel">
+      <div class="bbg-title">Option-chain cross-check &nbsp;|&nbsp; chain lean {lean_txt} ({sig['lean']:+d}) &nbsp;|&nbsp; {need}</div>
+      {crow}
+      <div class="agent" style="color:#888;">{lvl_txt}</div>
+    </div>""", unsafe_allow_html=True)
 
-    # ---- ENGINE DEBUG ROW ----
-    es = m["engine"]
-    st.caption(f"DUAL-FORCE ENGINE INPUTS (near-spot strikes, % of that side's OI | each leg needs >= {MIN_FLOW_PCT:.1f}%)")
-    d1, d2, d3, d4 = st.columns(4)
-    d1.metric("CE EXITS", f"{es['ce_exit_pct']:.1f}%", f"{es['ce_exits']:+,.0f} qty", delta_color="off")
-    d2.metric("PE BUILDS", f"{es['pe_build_pct']:.1f}%", f"{es['pe_build']:+,.0f} qty", delta_color="off")
-    d3.metric("PE EXITS", f"{es['pe_exit_pct']:.1f}%", f"{es['pe_exits']:+,.0f} qty", delta_color="off")
-    d4.metric("CE BUILDS", f"{es['ce_build_pct']:.1f}%", f"{es['ce_build']:+,.0f} qty", delta_color="off")
-    f1, f2, f3 = st.columns(3)
-    f1.metric("BULL FORCE (PE build + CE exit)", f"{es['bull_force']:.1f}")
-    f2.metric("BEAR FORCE (CE build + PE exit)", f"{es['bear_force']:.1f}")
-    f3.metric("FORCE RATIO", f"{min(es['force_ratio'], 99):.2f}x", f"winner needs >= {DOMINANCE}x", delta_color="off")
-    _zero = [n for n, k in (("CE EXITS", "ce_exit_pct"), ("PE BUILDS", "pe_build_pct"),
-                            ("PE EXITS", "pe_exit_pct"), ("CE BUILDS", "ce_build_pct")) if es[k] == 0]
-    if _zero:
-        st.caption(f"{', '.join(_zero)} = 0.0% means no near-spot strike moved that way by more than {NOISE_PCT}% of that side's OI. "
-                   "These legs compare today's OI with the PREVIOUS DAY's close, not with the last refresh.")
-    _dq = data_quality(m)
-    if _dq:
-        st.warning("Data quality: " + _dq + ".")
-    st.caption("Bullish blast = CE exits + PE builds both >= threshold AND bull force >= 1.5x bear force. "
-               "Bearish blast = mirror image. Both sides active with no clear winner = CONFLICTED | WAIT.")
-
-    if m["iv_gap"] > 3:
-        st.caption(f"⚠ ATM IV mismatch: CE {m['atm_iv_ce']:.1f}% vs PE {m['atm_iv_pe']:.1f}% (often stale quotes after hours). "
-                   f"Expected move uses the average ({m['atm_iv']:.1f}%).")
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("BIAS SCORE", f"{m['score']}/100", m["bias"])
-    c2.metric("PCR", f"{m['pcr']:.2f}")
-    c3.metric("EXPECTED MOVE (±)", f"{m['exp_move']:,.0f}", f"IV {m['atm_iv']:.1f}% | {m['dte']}d")
-    c4.metric("OI BATTLE", m["battle"])
-
-    c5, c6, c7, c8 = st.columns(4)
-    c5.metric("CALL WALL", f"{m['call_wall']:,.0f}")
-    c6.metric("PUT WALL", f"{m['put_wall']:,.0f}")
-    c7.metric("MAX PAIN", f"{m['max_pain']:,.0f}")
-    c8.metric("GAMMA STRIKE", f"{m['gamma_strike']:,.0f}", f"{m['gamma_strike'] - spot:+,.0f} vs spot")
-
-    c9, c10, c11, c12 = st.columns(4)
-    c9.metric("CE TRAP (RES)", f"{m['ce_trap']:,.0f}" if m["ce_trap"] else "—")
-    c10.metric("PE TRAP (SUPP)", f"{m['pe_trap']:,.0f}" if m["pe_trap"] else "—")
-    c11.metric("NET CE OI Δ", f"{m['dce']:+,.0f}")
-    c12.metric("NET PE OI Δ", f"{m['dpe']:+,.0f}")
-
-    # ---- JOBBER MICRO-LADDER PANEL ----
-    st.markdown("#### ⚡ JOBBER MICRO-LADDER & ABSORPTION FEED")
-    j1, j2, j3 = st.columns(3)
-    j1.metric("LADDER IMBALANCE", f"{m['jobber']['ladder_imbalance']:+.3f}", "Range: -1.0 to +1.0")
-    j2.metric("MAX PRESSURE POCKET", f"{m['jobber']['pocket_support']:,.0f}", "Closest High-Liquidity Node")
-    j3.metric("MICRO-TURN STATUS", m["jobber"]["micro_turn"])
-
-    st.markdown("#### 3-MIN OI VELOCITY (near spot)")
-    v1, v2, v3, v4 = st.columns(4)
-    v1.metric("CE BUILDS", f"{vel['ce_builds']:,.0f}")
-    v2.metric("CE UNWINDS", f"{vel['ce_unwinds']:,.0f}")
-    v3.metric("PE BUILDS", f"{vel['pe_builds']:,.0f}")
-    v4.metric("PE UNWINDS", f"{vel['pe_unwinds']:,.0f}")
-    if sum(vel.values()) == 0:
-        st.caption("Velocity needs two snapshots ~3 min apart. It will populate after the next refresh.")
-
-
-with tab2:
-    # ---- DAY MOVEMENT LEVELS ----
-    st.markdown("#### 📐 DAY MOVEMENT LEVELS")
     try:
-        candles = fetch_daily_candles(info["scrip"], info["seg"], dhan_token, client_id)
-        candle_err = ""
-    except Exception as e:
-        candles, candle_err = [], str(e)
-    _after_close = now_ist.hour * 60 + now_ist.minute >= 15 * 60 + 40
-    _today_ohlc = fetch_today_ohlc(info["scrip"], info["seg"], dhan_token, client_id) if _after_close else None
-    dl = compute_day_levels(candles, m["spot"], daily_sigma(m), m, prev_close, _today_ohlc)
-    if candle_err:
-        st.warning(f"Daily candles unavailable ({candle_err[:160]}). Showing sigma bands around the sidebar PREV CLOSE only.")
-    st.caption(f"Basis: {dl['basis']} | 1σ daily = Spot × ATM IV × √(1/365) ≈ {dl['sd']:,.0f} pts"
-               + (f" | ATR(14) ≈ {dl['atr']:,.0f} pts" if dl["atr"] else ""))
-    lc1, lc2, lc3 = st.columns(3)
-    lc1.metric("1σ RANGE (68%)", f"{dl['band1'][0]:,.0f} – {dl['band1'][1]:,.0f}")
-    lc2.metric("2σ RANGE (95%)", f"{dl['band2'][0]:,.0f} – {dl['band2'][1]:,.0f}")
-    lc3.metric("MOVE SO FAR", f"{dl['moved_sigma']:+.2f}σ", f"{m['spot'] - dl['ref_close']:+,.0f} pts vs ref close", delta_color="off")
-    show = dl["table"].copy()
-    show["Price"] = show["Price"].map(lambda v: f"{v:,.0f}")
-    show["Dist pts"] = show["Dist pts"].map(lambda v: f"{v:+,.0f}")
-    show["Dist σ"] = show["Dist σ"].map(lambda v: f"{v:+.2f}")
-    show_df(show, hide_index=True)
-    st.caption(f"★ = level within ±{dl['tol']:,.0f} pts of an OI level (wall, max pain, gamma strike): confluence makes a level more meaningful. "
-               "Pivots: P=(H+L+C)/3, R1=2P−L, S1=2P−H, R2=P+(H−L), S2=P−(H−L). After 15:40 IST the basis is today's completed session. "
-               "Ranges are probabilities from IV (assumes normal returns), not guarantees.")
+        ns = int(float(ai.get("news_score", 0)))
+    except (TypeError, ValueError):
+        ns = None
+    ns_txt = f" (score {ns:+d})" if ns is not None else ""
+    st.markdown(f"""
+    <div class="bbg-panel">
+      <div class="agent"><b>Price Action:</b> {esc(ai.get('price_action_agent'))}</div>
+      <div class="agent"><b>Order Flow:</b> {esc(ai.get('order_flow_agent'))}</div>
+      <div class="agent"><b>Volatility:</b> {esc(ai.get('volatility_agent'))}</div>
+      <div class="agent"><b>Sentiment{ns_txt}:</b> {esc(ai.get('news_agent'))}</div>
+      <div class="agent"><b>Risk Officer:</b> {esc(ai.get('final_approval'))}</div>
+    </div>""", unsafe_allow_html=True)
 
+st.caption(f"1σ range: {m['lower_1sigma']:,.0f} to {m['upper_1sigma']:,.0f}  |  Updated {datetime.now().strftime('%H:%M:%S')}")
 
-with tab3:
-    # ---- EXHAUSTION MONITOR ----
-    st.markdown("#### 🧭 EXHAUSTION MONITOR (is the trend running out of fuel?)")
-    ex = m["exh"]
-    if not ex["ready"]:
-        st.info(ex["why"] + " History is saved per day and survives a browser refresh, but only builds while this page is open.")
-    else:
-        st.caption(f"Window {ex['age']:.0f} min ({ex['n']} snapshots stored today) | spot {ex['spot_chg_sigma']:+.2f}σ over window | "
-                   f"window high {ex['lb_high']:,.0f} / low {ex['lb_low']:,.0f} | 1σ daily ≈ {ex['sd']:,.0f} pts")
-        ecol1, ecol2 = st.columns(2)
-        for col, key, title in ((ecol1, "buyer", "BUYER EXHAUSTION (uptrend fading)"),
-                                (ecol2, "seller", "SELLER EXHAUSTION (downtrend fading)")):
-            side_ = ex[key]
-            scol = "#ff1744" if side_["flag"] == "CONFIRMED" else "#ffab00" if side_["flag"] in ("WATCH", "EARLY") else "#90a4ae"
-            rows = "".join(
-                f'<div class="agent">{"🔴" if v >= 1 else "🟠" if v >= 0.5 else "⚪"} <b>{esc(n)}:</b> {esc(d)}</div>'
-                for n, v, d in side_["signals"])
-            col.markdown(f"""<div class="bbg-panel" style="border:2px solid {scol};">
-              <div class="bbg-title">{title}</div>
-              <div class="bbg-big" style="color:{scol};">{side_['score']}/100</div>
-              <div class="bbg-desc" style="color:{scol};">{esc(side_['status'])}</div>
-              {rows}</div>""", unsafe_allow_html=True)
-        st.caption(f"Exhaustion is a warning, not a reversal call. CONFIRMED needs score >= {EXH_ALERT} AND a price turn of "
-                   "at least 0.1σ off the window extreme. A BUY/SELL is blocked when its own side is CONFIRMED.")
-    with st.expander("SESSION HISTORY (spot / IV / PCR)"):
-        if len(hist) >= 2:
-            hdf = pd.DataFrame([{"Time": datetime.fromtimestamp(h["ts"], IST).strftime("%H:%M:%S"), "Spot": h["spot"],
-                                 "ATM IV": round(h["iv"], 2), "PCR": round(h["pcr"], 3), "Flow edge": round(h["edge"], 2),
-                                 "Status": h["status"]} for h in hist])
-            st.line_chart(hdf.set_index("Time")[["Spot"]])
-            st.line_chart(hdf.set_index("Time")[["ATM IV"]])
-            show_df(hdf.iloc[::-1], hide_index=True)
-        else:
-            st.write("Waiting for more snapshots.")
-
-
-with tab4:
-    # ---- PREMIUM POTENTIAL SCANNER ----
-    st.markdown("#### 🎯 PREMIUM POTENTIAL SCANNER")
-    lean_now = sum(c["v"] for c in chain_checks(m))
-    fav = "CE" if lean_now > 0 else "PE" if lean_now < 0 else None
-    if "BULLISH GAMMA" in m["status"]:
-        fav = "CE"
-    elif "BEARISH GAMMA" in m["status"]:
-        fav = "PE"
-    if scan.empty:
-        st.info("No priced options found (needs last_price from the option chain; market may be closed or premiums < "
-                f"{MIN_PREMIUM:.0f}).")
-    else:
-        fav_txt = {"CE": "CALLS (bullish side)", "PE": "PUTS (bearish side)"}.get(fav, "NO CLEAR SIDE - both shown, treat as low edge")
-        st.caption(f"Chain lean {lean_now:+d} | status {m['status']} → favoured: {fav_txt}. "
-                   f"1σ daily move ≈ {smeta['sd']:,.0f} pts | horizon {horizon_label} (time left {smeta['T0d']:.1f}d → {smeta['T1d']:.1f}d) | "
-                   f"IV shock ±{smeta['crush']:.0f}%.")
-        top = scan[scan["Side"] == fav].head(5) if fav else scan.head(6)
-        other = scan[scan["Side"] != fav].head(3) if fav else None
-        show_df(fmt_scanner(top), hide_index=True)
-        if other is not None and not other.empty:
-            with st.expander("Counter-trend side (against the chain lean)"):
-                show_df(fmt_scanner(other), hide_index=True)
-
-        b = top.iloc[0]
-        sgn = 1 if b["Side"] == "CE" else -1
-        s1 = m["spot"] + sgn * smeta["sd"]
-        st.markdown(f"""<div class="bbg-panel">
-          <div class="bbg-title">Top pick walk-through: {m['spot']:,.0f} spot, {b['Strike']:,.0f} {b['Side']} ({b['Money']}) at ₹{b['LTP']:,.1f}</div>
-          <div class="agent">If spot moves 1σ in favour to ≈ <b>{s1:,.0f}</b>: premium ≈ <b>{b['x1σ']:.2f}x</b> (₹{b['LTP']*b['x1σ']:,.1f}); delta rises {b['Delta']:.2f} → {b['Delta@1σ']:.2f}, which is the gamma effect (OTM turning into ITM/ATM).</div>
-          <div class="agent">With IV crush −{smeta['crush']:.0f}% on that same move: <b>{b['x1σ crush']:.2f}x</b> (₹{b['LTP']*b['x1σ crush']:,.1f}). With IV spike +{smeta['crush']:.0f}%: <b>{b['x1σ spike']:.2f}x</b> (₹{b['LTP']*b['x1σ spike']:,.1f}).</div>
-          <div class="agent">If it goes the wrong way by 0.5σ: <b>{b['xWrong']:.2f}x</b> (₹{b['LTP']*b['xWrong']:,.1f}). Spot move needed just to double the premium: <b>{('>4' if pd.isna(b['Needs2x(σ)']) else f"{b['Needs2x(σ)']:.2f}")}σ</b>.</div>
-        </div>""", unsafe_allow_html=True)
-        st.caption("Scenario repricing with Black-Scholes anchored to the traded premium, constant per-strike IV shift, "
-                   "no slippage. It shows how premiums react IF spot moves; it does not predict that the move happens. "
-                   "Score = reward after IV crush ÷ wrong-way loss, weighted by liquidity, delta odds, volume and fresh OI.")
-
-
-with tab5:
-    # ---- LIVE NEWS PANEL ----
-    st.markdown("#### LIVE MARKET NEWS")
-    if news_items:
-        tone = headline_tone(news_items)
-        tcol = "#00e676" if tone > 15 else "#ff1744" if tone < -15 else "#90a4ae"
-        rows = []
-        for i in news_items:
-            link = i["link"] if i["link"].startswith(("http://", "https://")) else ""
-            t = esc(i["title"])
-            t = f'<a href="{html.escape(link, quote=True)}" target="_blank" style="color:#ddd;">{t}</a>' if link else t
-            rows.append(f'<div class="agent"><b>{esc(age_label(i["age_min"]))}</b> · {esc(i["source"])} — {t}</div>')
-        st.markdown(f"""<div class="bbg-panel">
-          <div class="bbg-title">Headline tone (keyword backstop): <span style="color:{tcol};">{tone:+d}</span></div>
-          {''.join(rows)}</div>""", unsafe_allow_html=True)
-    else:
-        st.warning("No headlines available. " + " | ".join(news_status))
-    with st.expander("NEWS FEED STATUS"):
-        for line in news_status:
-            st.write(line)
-
-    st.markdown("#### AI COUNCIL")
-    st.caption(f"Gate: {gate_label}")
-    if "error" in ai and "signal" not in ai:
-        st.warning(ai["error"])
-    else:
-        scolor = {"BUY": "#00e676", "SELL": "#ff1744"}.get(sig["signal"], "#90a4ae")
-        lv = ""
-        if sig["target"] is not None:
-            rr_txt = f"1:{sig['rr']:.1f}" if sig["rr"] else "n/a"
-            lv = (f"Entry {sig['entry']:,.0f} &nbsp;|&nbsp; Target {sig['target']:,.0f} &nbsp;|&nbsp; "
-                  f"SL {sig['sl']:,.0f} &nbsp;|&nbsp; R:R {rr_txt}")
-        ai_note = f" (AI said {sig['ai_signal']})" if sig["ai_signal"] != sig["signal"] else ""
-        st.markdown(f"""
-        <div class="bbg-panel" style="border:2px solid {scolor};">
-          <div class="bbg-title">Risk-Validated Signal</div>
-          <div class="bbg-big" style="color:{scolor};">{sig['signal']}{esc(ai_note)} &nbsp;|&nbsp; Confidence {sig['confidence']}%</div>
-          <div class="bbg-desc">{lv}</div>
-          <div class="bbg-desc" style="color:#ffab00;">{esc(sig['note']) if sig['note'] else ''}</div>
-        </div>""", unsafe_allow_html=True)
-
-        # option-chain cross-check
-        d = sig["direction"]
-        def icon(v):
-            if d == 0:
-                return "🟢" if v > 0 else "🔴" if v < 0 else "⚪"
-            return "✅" if v * d > 0 else "❌" if v * d < 0 else "➖"
-        crow = "".join(f'<div class="agent">{icon(c["v"])} <b>{esc(c["name"])}:</b> {esc(c["detail"])}</div>'
-                       for c in sig["checks"])
-        lean_txt = "BULLISH" if sig["lean"] > 0 else "BEARISH" if sig["lean"] < 0 else "NEUTRAL"
-        sres, ssup = m["struct"]["res"], m["struct"]["sup"]
-        lvl_txt = (f"Nearest OI resistance {sres['level']:,.0f} ({sres['oi']/1e5:,.1f}L, chg {sres['chg']/1e5:+,.1f}L)" if sres else "No nearby resistance") \
-            + " &nbsp;|&nbsp; " + \
-            (f"Nearest OI support {ssup['level']:,.0f} ({ssup['oi']/1e5:,.1f}L, chg {ssup['chg']/1e5:+,.1f}L)" if ssup else "No nearby support") \
-            + f" &nbsp;|&nbsp; Global walls {m['call_wall']:,.0f} / {m['put_wall']:,.0f}"
-        need = f"AI call agreement {sig['net']:+d} (needs +{MIN_CONFIRM})" if d else "no directional call to confirm"
-        st.markdown(f"""
-        <div class="bbg-panel">
-          <div class="bbg-title">Option-chain cross-check &nbsp;|&nbsp; chain lean {lean_txt} ({sig['lean']:+d}) &nbsp;|&nbsp; {need}</div>
-          {crow}
-          <div class="agent" style="color:#888;">{lvl_txt}</div>
-        </div>""", unsafe_allow_html=True)
-
-        try:
-            ns = int(float(ai.get("news_score", 0)))
-        except (TypeError, ValueError):
-            ns = None
-        ns_txt = f" (score {ns:+d})" if ns is not None else ""
-        st.markdown(f"""
-        <div class="bbg-panel">
-          <div class="agent"><b>Price Action:</b> {esc(ai.get('price_action_agent'))}</div>
-          <div class="agent"><b>Order Flow:</b> {esc(ai.get('order_flow_agent'))}</div>
-          <div class="agent"><b>Volatility:</b> {esc(ai.get('volatility_agent'))}</div>
-          <div class="agent"><b>Sentiment{ns_txt}:</b> {esc(ai.get('news_agent'))}</div>
-          <div class="agent"><b>Risk Officer:</b> {esc(ai.get('final_approval'))}</div>
-        </div>""", unsafe_allow_html=True)
-
-
-with tab6:
-    st.caption(f"1σ range to expiry: {m['lower_1sigma']:,.0f} to {m['upper_1sigma']:,.0f}  |  Updated {datetime.now(IST).strftime('%H:%M:%S')} IST")
-    show_df(m["df"], hide_index=True)
-
-with tab7:
-    def render_desk():
-        """Live paper-trading terminal. Runs as a fragment: re-pulls the option chain every few seconds and re-marks everything."""
-        led = st.session_state["paper_ledger"]
-        led.setdefault("orders", [])
-        now = datetime.now(IST)
-
-        # ---------- live data (falls back to the last full-run chain if the live pull fails) ----------
-        live_err = ""
-        try:
-            l_spot, l_df = fetch_option_chain_live(info["scrip"], info["seg"], expiry, dhan_token, client_id)
-            if l_df.empty or not l_spot:
-                raise RuntimeError("empty chain")
-        except Exception as e:
-            l_spot, l_df, live_err = spot, m["df"], str(e)[:140]
-        lm = {"df": l_df}
-
-        # ---------- one tick of the paper exchange ----------
-        msgs = sync_desk(led, idx_name, expiry, lm, l_spot, now, opt_cfg)
-        if msgs:
-            save_ledger(led)
-            for _t in msgs:
-                st.toast(_t)
-
-        eq, cash, used = equity_now(led), cash_free(led), open_cost(led)
-        unreal, real = unrealized_pnl(led), realized_pnl(led)
-        n_today, pnl_today = today_stats(led, now.date().isoformat())
-        day_pnl = pnl_today + unreal
-        live = market_open_now(now) and not live_err
-        dot = '<span class="live-dot on">●</span> LIVE' if live else '<span class="live-dot">●</span> ' + ("FEED ERROR" if live_err else "MARKET CLOSED (last close)")
-        pc = lambda v: "up" if v > 0 else "down" if v < 0 else ""
-        strikes_all = sorted(l_df["Strike"].unique())
-        atm = min(strikes_all, key=lambda k: abs(k - l_spot))
-        ar = l_df[l_df["Strike"] == atm].iloc[0]
-        st.markdown(
-            f'<div class="fund-strip">'
-            f'<div class="fund-box"><span>{dot}</span><b>{now.strftime("%H:%M:%S")} IST</b></div>'
-            f'<div class="fund-box"><span>{IDX_SHORT.get(idx_name, idx_name)}</span><b class="{pc(l_spot - prev_close)}">{l_spot:,.2f} ({l_spot - prev_close:+,.2f})</b></div>'
-            f'<div class="fund-box"><span>ATM {atm:,.0f} straddle</span><b>₹{ar["CE_LTP"] + ar["PE_LTP"]:,.1f}</b></div>'
-            f'<div class="fund-box"><span>Equity</span><b>₹{eq:,.0f}</b></div>'
-            f'<div class="fund-box"><span>Available</span><b>₹{cash:,.0f}</b></div>'
-            f'<div class="fund-box"><span>Used (premium)</span><b>₹{used:,.0f}</b></div>'
-            f'<div class="fund-box"><span>Unrealized</span><b class="{pc(unreal)}">₹{unreal:+,.0f}</b></div>'
-            f'<div class="fund-box"><span>Day P&L</span><b class="{pc(day_pnl)}">₹{day_pnl:+,.0f}</b></div>'
-            f'<div class="fund-box"><span>Total P&L</span><b class="{pc(real + unreal)}">₹{real + unreal:+,.0f}</b></div>'
-            f'</div>', unsafe_allow_html=True)
-        if live_err:
-            st.warning(f"Live pull failed, showing the last full-refresh chain. ({live_err})")
-        st.caption("Simulation only. Buys fill at the ask; positions are marked and sold at the bid (LTP ± slippage when there is no quote). "
-                   f"₹{CHARGES_PER_ORDER:.0f} per order is deducted; STT, exchange fees and GST are not modelled. "
-                   "The desk re-pulls the chain every few seconds; the engine and AI above refresh every 3 minutes.")
-
-        left, right = st.columns([3, 2])
-
-        # ---------- option chain ladder ----------
-        with left:
-            st.markdown("##### OPTION CHAIN (press **B** to open a buy ticket)")
-            i0 = strikes_all.index(atm)
-            window = strikes_all[max(0, i0 - LADDER_N): i0 + LADDER_N + 1]
-            byk = l_df.set_index("Strike")
-            widths = [1.1, 1.3, 0.55, 1.2, 0.55, 1.3, 1.1]
-            for c, h in zip(st.columns(widths), ["CE OI Δ", "CE LTP", "", "STRIKE", "", "PE LTP", "PE OI Δ"]):
-                c.markdown(f"<div class='lad-h'>{h}</div>", unsafe_allow_html=True)
-            prev = st.session_state.get("_ltp_prev", {})
-            cur = {}
-
-            def ltp_cell(K, opt, ltp, itm):
-                key = f"{int(K)}{opt}"
-                pv = prev.get(key)
-                arrow = "" if pv is None or abs(ltp - pv) < 1e-9 else ("▲" if ltp > pv else "▼")
-                cls = "up" if arrow == "▲" else "down" if arrow == "▼" else ""
-                cur[key] = ltp
-                return f"<div class='lad-c {'itm' if itm else ''} {cls}'>{ltp:,.2f} {arrow}</div>"
-
-            for K in window:
-                r = byk.loc[K]
-                cc = st.columns(widths)
-                ce_d, pe_d = r["CE_OI"] - r["CE_PrevOI"], r["PE_OI"] - r["PE_PrevOI"]
-                cc[0].markdown(f"<div class='lad-s {pc(ce_d)}'>{fmt_lakh(ce_d)}</div>", unsafe_allow_html=True)
-                cc[1].markdown(ltp_cell(K, "CE", r["CE_LTP"], K < l_spot), unsafe_allow_html=True)
-                if cc[2].button("B", key=f"b_CE_{int(K)}"):
-                    st.session_state["ticket"] = {"strike": float(K), "opt": "CE"}
-                cc[3].markdown(f"<div class='lad-k {'atm' if K == atm else ''}'>{K:,.0f}</div>", unsafe_allow_html=True)
-                if cc[4].button("B", key=f"b_PE_{int(K)}"):
-                    st.session_state["ticket"] = {"strike": float(K), "opt": "PE"}
-                cc[5].markdown(ltp_cell(K, "PE", r["PE_LTP"], K > l_spot), unsafe_allow_html=True)
-                cc[6].markdown(f"<div class='lad-s {pc(pe_d)}'>{fmt_lakh(pe_d)}</div>", unsafe_allow_html=True)
-            st.session_state["_ltp_prev"] = cur
-            st.caption("Shaded = in the money. ▲▼ = tick since the last refresh. OI Δ is versus the previous close.")
-
-        # ---------- order ticket ----------
-        with right:
-            st.markdown("##### ORDER TICKET")
-            if sig and sig["signal"] != "WAIT":
-                _want = "CE" if sig["signal"] == "BUY" else "PE"
-                _pk = choose_option(scan, _want)
-                if _pk is not None and st.button(f"⚡ Use signal pick: {_pk['Strike']:,.0f} {_want}", key="use_signal_pick"):
-                    st.session_state["ticket"] = {"strike": float(_pk["Strike"]), "opt": _want}
-            tk = st.session_state.get("ticket")
-            if not tk:
-                st.caption("Press B beside a price in the chain to buy that option.")
-            else:
-                opt, K = tk["opt"], tk["strike"]
-                row = opt_row(lm, K, opt)
-                if row is None:
-                    st.warning("That contract is not in the current chain.")
-                else:
-                    ask, bid = buy_fill(row, SLIPPAGE_PCT), mark_price(row, SLIPPAGE_PCT)
-                    cname = contract_name({"index": idx_name, "expiry": expiry, "strike": K, "opt": opt})
-                    st.markdown(f"<div class='tk-name'>BUY · {cname}</div>", unsafe_allow_html=True)
-                    st.markdown(f"<div class='tk-depth'>LTP <b>{row['ltp']:,.2f}</b> &nbsp;|&nbsp; Bid <b class='down'>{(bid or 0):,.2f}</b>"
-                                f"{' × ' + format(int(row['bq']), ',') if row['bq'] else ''} &nbsp;|&nbsp; Ask <b class='up'>{(ask or 0):,.2f}</b>"
-                                f"{' × ' + format(int(row['aq']), ',') if row['aq'] else ''}</div>", unsafe_allow_html=True)
-                    otype = st.radio("Order type", ["MARKET", "LIMIT"], horizontal=True, key="tk_type")
-                    lot = INDEX_MAP[idx_name]["lot"]
-                    lots = st.number_input("Lots", min_value=1, max_value=200, value=1, step=1, key="tk_lots")
-                    limit = None
-                    if otype == "LIMIT":
-                        limit = st.number_input("Limit price", min_value=0.05, value=float(ask or row["ltp"] or 1.0), step=0.05,
-                                                key=f"tk_lim_{int(K)}{opt}")
-                    t1, t2 = st.columns(2)
-                    slp = t1.number_input("Stop %", min_value=5.0, max_value=90.0, value=float(opt_sl_pct), step=5.0, key="tk_sl")
-                    tpp = t2.number_input("Target %", min_value=10.0, max_value=1000.0, value=float(opt_tp_pct), step=10.0, key="tk_tp")
-                    idx_exit = st.checkbox("Also exit on index invalidation / target (OI walls)", value=True, key="tk_idx")
-                    practice = st.checkbox("Simulate outside market hours", key="practice")
-                    ref_px = (limit if otype == "LIMIT" else ask) or 0.0
-                    cost = ref_px * lot * lots
-                    maxloss = cost * slp / 100.0 + 2 * CHARGES_PER_ORDER
-                    st.caption(f"Qty {lot * lots} | Required ₹{cost:,.0f} | Available ₹{cash:,.0f} | "
-                               f"Max loss at stop ≈ ₹{maxloss:,.0f} ({maxloss / eq * 100:.1f}% of equity)")
-                    _sz = size_option(eq, cash, ref_px or 1.0, lot, slp, risk_pct, outlay_pct)
-                    if lots > _sz["lots"]:
-                        st.warning(f"Above your own limits (risk, outlay or cash allow {_sz['lots']} lot(s)). You can still place it.")
-                    b1, b2 = st.columns(2)
-                    if b1.button("BUY", type="primary", key="tk_buy"):
-                        _side = "BUY" if opt == "CE" else "SELL"
-                        _tp_idx, _sl_idx = default_levels(m, _side)
-                        spec = {"index": idx_name, "expiry": expiry, "strike": K, "opt": opt, "lots": lots, "lot_size": lot,
-                                "type": otype, "limit": limit, "sl_pct": slp, "tp_pct": tpp, "be_pct": opt_be_pct,
-                                "spot_sl": _sl_idx if idx_exit else None, "spot_tp": _tp_idx if idx_exit else None,
-                                "source": "MANUAL", "practice": practice}
-                        o = place_order(led, spec, lm, l_spot, now, opt_cfg)
-                        save_ledger(led)
-                        st.session_state["last_order"] = (f"Order {o['id']} {o['status']}"
-                                                          + (f" @ {o['fill']:.2f}" if o["fill"] else "") + (f" - {o['note']}" if o["note"] else ""))
-                        rerun_desk()
-                    if b2.button("Close ticket", key="tk_close"):
-                        st.session_state["ticket"] = None
-                        rerun_desk()
-            if st.session_state.get("last_order"):
-                st.caption("Last order: " + st.session_state["last_order"])
-
-        # ---------- platform sections ----------
-        nav = st.radio("Section", ["Positions", "Orders", "Trades", "Summary"], horizontal=True, key="desk_nav",
-                       label_visibility="collapsed")
-        open_t = [t for t in led["trades"] if t["status"] == "OPEN"]
-
-        if nav == "Positions":
-            if not open_t:
-                st.caption("No open positions.")
-            else:
-                w = [2.4, 0.8, 0.9, 0.9, 1.1, 0.9, 0.9, 0.9, 0.8]
-                for c, h in zip(st.columns(w), ["Instrument", "Qty", "Avg", "LTP", "P&L ₹", "P&L %", "Stop", "Target", ""]):
-                    c.markdown(f"<div class='lad-h'>{h}</div>", unsafe_allow_html=True)
-                for t in open_t:
-                    lp = t.get("last_premium") or t["entry_premium"]
-                    qty = t["lots"] * t["lot_size"]
-                    pnl = (lp - t["entry_premium"]) * qty
-                    pct = (lp / t["entry_premium"] - 1) * 100
-                    stop = max(t["sl_price"], t["entry_premium"]) if t["be_armed"] else t["sl_price"]
-                    priced = t["index"] == idx_name and t["expiry"] == str(expiry)[:10]
-                    pc_ = st.columns(w)
-                    pc_[0].markdown(f"<div class='pos-n'>{contract_name(t)}</div><div class='sub'>{t['source']} · {t['product']}"
-                                    f"{' · BE armed' if t['be_armed'] else ''}{'' if priced else ' · switch expiry to reprice'}</div>",
-                                    unsafe_allow_html=True)
-                    pc_[1].markdown(f"<div class='lad-c'>{qty}</div>", unsafe_allow_html=True)
-                    pc_[2].markdown(f"<div class='lad-c'>{t['entry_premium']:,.2f}</div>", unsafe_allow_html=True)
-                    pc_[3].markdown(f"<div class='lad-c'>{lp:,.2f}</div>", unsafe_allow_html=True)
-                    pc_[4].markdown(f"<div class='lad-c {pc(pnl)}'>{pnl:+,.0f}</div>", unsafe_allow_html=True)
-                    pc_[5].markdown(f"<div class='lad-c {pc(pct)}'>{pct:+.1f}%</div>", unsafe_allow_html=True)
-                    pc_[6].markdown(f"<div class='lad-c'>{stop:,.2f}</div>", unsafe_allow_html=True)
-                    pc_[7].markdown(f"<div class='lad-c'>{t['tp_price']:,.2f}</div>", unsafe_allow_html=True)
-                    if pc_[8].button("Exit", key=f"exit_{t['id']}"):
-                        px = (mark_price(opt_row(lm, t["strike"], t["opt"]), SLIPPAGE_PCT) if priced else None) or lp
-                        close_trade(t, px, "MANUAL EXIT", now, l_spot if priced else None)
-                        save_ledger(led)
-                        rerun_desk()
-                with st.expander("Modify stop / target of a position"):
-                    _ids = [t["id"] for t in open_t]
-                    _mid = st.selectbox("Position", _ids, key="mod_id")
-                    _t = next(t for t in open_t if t["id"] == _mid)
-                    _lp = _t.get("last_premium") or _t["entry_premium"]
-                    n_sl = st.number_input("New stop (premium)", min_value=0.05, value=float(_t["sl_price"]), step=0.05, key=f"mod_sl_{_mid}")
-                    n_tp = st.number_input("New target (premium)", min_value=0.05, value=float(_t["tp_price"]), step=0.05, key=f"mod_tp_{_mid}")
-                    if st.button("Update", key="mod_go"):
-                        if not (n_sl < _lp < n_tp):
-                            st.error(f"Need stop < current price ({_lp:,.2f}) < target.")
-                        else:
-                            _t["sl_price"], _t["tp_price"] = round(n_sl, 2), round(n_tp, 2)
-                            save_ledger(led)
-                            rerun_desk()
-
-        elif nav == "Orders":
-            orders = list(reversed(led["orders"]))
-            if not orders:
-                st.caption("No orders yet.")
-            else:
-                show_df(pd.DataFrame([{"Time": o["time"], "ID": o["id"], "Instrument": contract_name(o), "Side": "BUY",
-                                       "Type": o["type"], "Qty": o["lots"] * o["lot_size"], "Limit": o["limit"], "Fill": o["fill"],
-                                       "Status": o["status"], "Note": o["note"], "Source": o["source"]} for o in orders]), hide_index=True)
-                for o in [o for o in orders if o["status"] == "PENDING"]:
-                    oc = st.columns([4, 1])
-                    oc[0].markdown(f"<div class='pos-n'>PENDING · {contract_name(o)} · limit {o['limit']:,.2f} · {o['lots']} lot(s)</div>", unsafe_allow_html=True)
-                    if oc[1].button("Cancel", key=f"cancel_{o['id']}"):
-                        cancel_order(led, o["id"])
-                        save_ledger(led)
-                        rerun_desk()
-
-        elif nav == "Trades":
-            if led["trades"]:
-                show_df(trades_to_dhan_rows(led["trades"]).iloc[::-1], hide_index=True)
-            else:
-                st.caption("No trades yet.")
-
-        else:
-            closed = [t for t in led["trades"] if t["status"] == "CLOSED"]
-            s = perf_summary(led)
-            s1, s2, s3, s4, s5 = st.columns(5)
-            s1.metric("WIN RATE", f"{s['Win rate (%)']:.0f}%")
-            s2.metric("EXPECTANCY / TRADE", f"₹{s['Expectancy per trade (₹)']:+,.0f}")
-            s3.metric("PROFIT FACTOR", str(s["Profit factor"]))
-            s4.metric("MAX DRAWDOWN", f"₹{s['Max drawdown (₹)']:,.0f}")
-            s5.metric("CHARGES PAID", f"₹{s['Charges paid (₹)']:,.0f}")
-            if closed:
-                why = pd.Series([t["exit_reason"] for t in closed]).value_counts()
-                st.caption("Exit reasons: " + " | ".join(f"{k}: {v}" for k, v in why.items()))
-                curve = pd.DataFrame({"Net P&L ₹ (cumulative)": pd.Series(
-                    [t["pnl"] for t in sorted(closed, key=lambda x: x.get("exit_ts") or 0)]).cumsum()})
-                if len(curve) >= 2:
-                    st.line_chart(curve)
-            x = generate_excel_report(led)
-            dx1, dx2 = st.columns(2)
-            if x:
-                dx1.download_button("📊 Excel journal", x, file_name=f"Vipul_Options_Journal_{now.date().isoformat()}.xlsx",
-                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            elif led["trades"]:
-                dx1.download_button("📄 CSV journal (install openpyxl for Excel)", trades_to_dhan_rows(led["trades"]).to_csv(index=False),
-                                    file_name=f"Vipul_Options_Journal_{now.date().isoformat()}.csv", mime="text/csv")
-            dx2.download_button("💾 Ledger backup (JSON)", json.dumps(led), file_name="paper_options_ledger_backup.json",
-                                mime="application/json")
-            up = st.file_uploader("Restore ledger from backup JSON", type="json", key="ledger_upload")
-            if up is not None and st.button("♻ RESTORE LEDGER", key="restore_go"):
-                try:
-                    new = json.load(up)
-                    assert isinstance(new.get("trades"), list)
-                    new.setdefault("initial_capital", INITIAL_CAPITAL)
-                    new.setdefault("orders", [])
-                    st.session_state["paper_ledger"] = new
-                    save_ledger(new)
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Could not restore: {e}")
-            st.caption("The ledger lives in the server's temp folder, so a Streamlit Cloud restart can erase it. Download a backup regularly.")
-            if st.checkbox("I want to reset the ledger and delete all paper trades and orders", key="reset_ok") and st.button("🗑 RESET LEDGER", key="reset_go"):
-                st.session_state["paper_ledger"] = new_ledger()
-                save_ledger(st.session_state["paper_ledger"])
-                st.rerun()
-
-
-    if live_on and hasattr(st, "fragment"):
-        st.fragment(run_every=int(live_sec))(render_desk)()
-    else:
-        render_desk()
-
+with st.expander("OPTION CHAIN DATA"):
+    st.dataframe(m["df"], use_container_width=True)
