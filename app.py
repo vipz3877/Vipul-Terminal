@@ -1,10 +1,12 @@
 """
-VIPUL BLOOMBERG PROFESSIONAL TERMINAL v7.7 (audited)
+VIPUL BLOOMBERG PROFESSIONAL TERMINAL v7.9
 Engine: Dual-Force (net-capitulation aware) + Jobber microstructure + chain cross-check + exhaustion monitor
-        + live news + day levels + premium scanner + paper trading desk with real auto-exits.
+        + live news + day levels + premium scanner + LIVE OPTION DESK.
 
-v7.7 vs the v7.6 you sent: restored everything v7.6 had stubbed out (see the audit notes delivered with this file)
-and fixed the paper desk (lot size, P&L, sizing, auto-exit, market-hours guard, persistent ledger, Excel export).
+Live Option Desk (v7.9): a paper-trading terminal synced to the option chain. A Streamlit fragment re-pulls the chain every
+few seconds, re-marks positions at the bid, matches pending limit orders at the ask and checks stops/targets, independent of
+the 3-minute engine refresh. Chain ladder with B buttons, order ticket (MARKET / LIMIT), positions with Exit, order book,
+trade book, funds strip. Long calls/puts only. Simulation only: this app never places real orders.
 """
 
 import os
@@ -36,7 +38,7 @@ try:
 except ImportError:
     Groq = None
 
-st.set_page_config(page_title="Vipul Bloomberg Terminal v7.7", layout="wide")
+st.set_page_config(page_title="Vipul Bloomberg Terminal v7.9", layout="wide")
 
 # ============================================================
 # CSS
@@ -60,6 +62,25 @@ h1,h2,h3,h4 { color:#ff9800 !important; font-family:'Courier New',monospace; let
 .flash-green { animation: flashGreen 1s infinite; }
 .flash-red   { animation: flashRed 1s infinite; }
 .flash-amber { animation: flashAmber 1.4s infinite; }
+.fund-strip { display:flex; flex-wrap:wrap; gap:8px; margin:6px 0 10px 0; }
+.fund-box { background:#0f0f0f; border:1px solid #2a2a2a; border-radius:4px; padding:6px 12px; min-width:120px; }
+.fund-box span { display:block; font-size:10px; color:#888; letter-spacing:1px; text-transform:uppercase; }
+.fund-box b { font-size:16px; color:#fff; }
+.up { color:#00e676 !important; }
+.down { color:#ff1744 !important; }
+.live-dot { color:#666; }
+.live-dot.on { color:#00e676; animation: blinkDot 1.2s infinite; }
+@keyframes blinkDot { 0%,100% {opacity:1;} 50% {opacity:.25;} }
+.lad-h { font-size:10px; color:#888; letter-spacing:1px; text-transform:uppercase; }
+.lad-c { font-size:13px; color:#ddd; padding:4px 2px; border-bottom:1px solid #1a1a1a; }
+.lad-c.itm { background:#16241b; }
+.lad-s { font-size:11px; color:#999; padding:6px 2px; }
+.lad-k { font-size:14px; font-weight:800; color:#ff9800; text-align:center; padding:4px 2px; border-bottom:1px solid #1a1a1a; }
+.lad-k.atm { background:#3a2a00; color:#fff; }
+.tk-name { font-size:15px; font-weight:800; color:#ff9800; margin-bottom:2px; }
+.tk-depth { font-size:12px; color:#bbb; margin-bottom:6px; }
+.pos-n { font-size:13px; font-weight:700; color:#fff; }
+.sub { font-size:10px; color:#777; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -119,10 +140,19 @@ EXH_ALERT = 60            # exhaustion score for "watch / confirmed"
 RISK_FREE = 0.065         # annual rate used in the Black-Scholes repricer
 MIN_PREMIUM = 5.0         # ignore options trading below this premium (points)
 
-# ---- paper trading desk (lot sizes per NSE circular, effective Jan 2026: Nifty 65, BankNifty 30, FinNifty 60, Midcap Select 120) ----
+# ---- option paper desk (lot sizes per NSE circular, effective Jan 2026: Nifty 65, BankNifty 30, FinNifty 60, Midcap Select 120) ----
 INITIAL_CAPITAL = 100000.0
-RISK_PER_TRADE_PCT = 2.0      # default risk budget per trade, % of equity
-DAILY_LOSS_LIMIT_PCT = 4.0    # auto-entries stop after this realized loss today, % of initial capital
+OPT_RISK_PCT = 4.0            # max loss at the premium stop, % of equity (incl. charges)
+OPT_OUTLAY_PCT = 30.0         # max premium paid per trade, % of equity
+OPT_SL_PCT = 30.0             # premium stop, % below entry
+OPT_TP_PCT = 60.0             # premium target, % above entry
+OPT_BE_PCT = 40.0             # after the premium is up this %, the stop moves to breakeven (0 = off)
+SLIPPAGE_PCT = 1.0            # used only when the chain has no bid/ask (buy at LTP+x%, sell at LTP-x%)
+CHARGES_PER_ORDER = 20.0      # flat brokerage per executed order; STT / exchange fees / GST are not modelled
+AUTO_MIN_PREMIUM = 20.0       # auto-entry ignores lottery tickets below this premium
+AUTO_MIN_DELTA = 0.25         # ... and options with less than this delta
+AUTO_MAX_SPREAD_PCT = 10.0    # ... and wide bid-ask spreads
+DAILY_LOSS_LIMIT_PCT = 8.0    # auto-entries stop after this realized loss today, % of initial capital
 MAX_TRADES_PER_DAY = 3
 COOLDOWN_MIN = 15             # wait after an exit before the next auto-entry
 AI_MAX_AGE_MIN = 45           # auto-entry needs an AI verdict at least this fresh
@@ -180,8 +210,7 @@ def _n(x):
         return 0.0
 
 
-@st.cache_data(ttl=30, show_spinner=False)
-def fetch_option_chain(scrip, seg, expiry, token, client_id):
+def _fetch_chain_raw(scrip, seg, expiry, token, client_id):
     # Simple throttle to respect the 1 req / 3 sec limit
     last = st.session_state.get("_last_chain_call", 0.0)
     wait = MIN_CHAIN_GAP_SEC - (time.time() - last)
@@ -214,12 +243,25 @@ def fetch_option_chain(scrip, seg, expiry, token, client_id):
             "CE_Bid": _n(ce.get("top_bid_price")), "CE_Ask": _n(ce.get("top_ask_price")),
             "PE_Bid": _n(pe.get("top_bid_price")), "PE_Ask": _n(pe.get("top_ask_price")),
             "CE_Vol": _n(ce.get("volume")), "PE_Vol": _n(pe.get("volume")),
+            "CE_BidQty": _n(ce.get("top_bid_quantity")), "CE_AskQty": _n(ce.get("top_ask_quantity")),
+            "PE_BidQty": _n(pe.get("top_bid_quantity")), "PE_AskQty": _n(pe.get("top_ask_quantity")),
             "CE_Delta": _n(ce_g.get("delta")), "PE_Delta": _n(pe_g.get("delta")),
         })
     df = pd.DataFrame(rows)
     if df.empty:
         return spot, df
     return spot, df.sort_values("Strike").reset_index(drop=True)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_option_chain(scrip, seg, expiry, token, client_id):
+    return _fetch_chain_raw(scrip, seg, expiry, token, client_id)
+
+
+@st.cache_data(ttl=3, show_spinner=False)
+def fetch_option_chain_live(scrip, seg, expiry, token, client_id):
+    """Short-lived cache used by the live desk fragment (Dhan allows about 1 option-chain request per 3 s)."""
+    return _fetch_chain_raw(scrip, seg, expiry, token, client_id)
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -1351,21 +1393,24 @@ def fmt_scanner(df):
 
 
 # ============================================================
-# PAPER TRADING DESK (simulation only: index points x lot size, no real orders)
+# OPTION PAPER DESK v7.9: order book + positions synced to the live option chain (long CE/PE only, simulation)
 # ============================================================
-LEDGER_FILE = os.path.join(tempfile.gettempdir(), "bbg_paper_ledger_v2.json")
+OPT_LEDGER_FILE = os.path.join(tempfile.gettempdir(), "bbg_paper_options_v3.json")
+IDX_SHORT = {"NIFTY 50": "NIFTY", "NIFTY BANK": "BANKNIFTY", "FINNIFTY": "FINNIFTY", "MIDCPNIFTY": "MIDCPNIFTY"}
+LADDER_N = 7                  # strikes shown above and below ATM in the ladder
 
 
 def new_ledger():
-    return {"initial_capital": INITIAL_CAPITAL, "trades": []}
+    return {"initial_capital": INITIAL_CAPITAL, "trades": [], "orders": []}
 
 
 def load_ledger():
     try:
-        with open(LEDGER_FILE) as f:
+        with open(OPT_LEDGER_FILE) as f:
             led = json.load(f)
         if isinstance(led, dict) and isinstance(led.get("trades"), list):
             led.setdefault("initial_capital", INITIAL_CAPITAL)
+            led.setdefault("orders", [])
             return led
     except Exception:
         pass
@@ -1374,7 +1419,7 @@ def load_ledger():
 
 def save_ledger(led):
     try:
-        with open(LEDGER_FILE, "w") as f:
+        with open(OPT_LEDGER_FILE, "w") as f:
             json.dump(led, f)
     except Exception:
         pass
@@ -1400,95 +1445,272 @@ def hhmm(mins):
     return f"{mins // 60:02d}:{mins % 60:02d}"
 
 
-def trade_pnl(t, price):
-    diff = (price - t["entry_price"]) if t["side"] == "BUY" else (t["entry_price"] - price)
-    return round(diff * t["lots"] * t["lot_size"], 2)
+def contract_name(t):
+    try:
+        exp = datetime.strptime(t["expiry"][:10], "%Y-%m-%d").strftime("%d %b").upper()
+    except Exception:
+        exp = str(t.get("expiry", ""))
+    return f"{IDX_SHORT.get(t['index'], t['index'])} {exp} {t['strike']:.0f} {'CALL' if t['opt'] == 'CE' else 'PUT'}"
 
 
+def fmt_lakh(x):
+    return f"{x / 1e5:,.1f}L"
+
+
+def rerun_desk():
+    """Re-render only the live desk when called from the fragment; fall back to a full rerun otherwise."""
+    try:
+        st.rerun(scope="fragment")
+    except Exception:
+        st.rerun()
+
+
+# ---- pricing: you BUY at the ask and can only SELL at the bid ----
+def opt_row(m, strike, opt):
+    r = m["df"][m["df"]["Strike"] == float(strike)]
+    if r.empty:
+        return None
+    r = r.iloc[0]
+    return {"ltp": float(r[f"{opt}_LTP"] or 0), "bid": float(r.get(f"{opt}_Bid", 0) or 0),
+            "ask": float(r.get(f"{opt}_Ask", 0) or 0), "bq": float(r.get(f"{opt}_BidQty", 0) or 0),
+            "aq": float(r.get(f"{opt}_AskQty", 0) or 0)}
+
+
+def buy_fill(row, slip):
+    if not row:
+        return None
+    if row["ask"] > 0:
+        return round(row["ask"], 2)
+    if row["ltp"] > 0:
+        return round(row["ltp"] * (1 + slip / 100.0), 2)
+    return None
+
+
+def mark_price(row, slip):
+    if not row:
+        return None
+    if row["bid"] > 0:
+        return round(row["bid"], 2)
+    if row["ltp"] > 0:
+        return round(row["ltp"] * (1 - slip / 100.0), 2)
+    return None
+
+
+# ---- ledger maths ----
 def realized_pnl(led):
     return sum(t["pnl"] for t in led["trades"] if t["status"] == "CLOSED")
-
-
-def unrealized_pnl(led, prices):
-    return sum(trade_pnl(t, prices.get(t["index"], t["entry_price"]))
-               for t in led["trades"] if t["status"] == "OPEN")
 
 
 def equity_now(led):
     return led["initial_capital"] + realized_pnl(led)
 
 
+def open_cost(led):
+    return sum(t["entry_premium"] * t["lots"] * t["lot_size"] for t in led["trades"] if t["status"] == "OPEN")
+
+
+def cash_free(led):
+    return equity_now(led) - open_cost(led)
+
+
+def unrealized_pnl(led):
+    return sum(((t.get("last_premium") or t["entry_premium"]) - t["entry_premium"]) * t["lots"] * t["lot_size"]
+               for t in led["trades"] if t["status"] == "OPEN")
+
+
 def today_stats(led, today):
-    """(trades entered today, realized P&L booked today)"""
+    """(trades entered today, realized net P&L booked today)"""
     n = sum(1 for t in led["trades"] if t.get("date") == today)
     pnl = sum(t["pnl"] for t in led["trades"] if t["status"] == "CLOSED" and t.get("exit_date") == today)
     return n, pnl
 
 
-def position_size(equity, entry, sl, lot_size, risk_pct):
-    """Lots such that (entry-SL distance x lot size x lots) stays within risk_pct of equity. Returns (lots, risk/lot, budget)."""
-    risk_per_lot = abs(entry - sl) * lot_size
-    budget = equity * risk_pct / 100.0
-    lots = int(budget // risk_per_lot) if risk_per_lot > 0 else 0
-    return lots, risk_per_lot, budget
+def size_option(equity, cash, premium, lot_size, sl_pct, risk_pct, outlay_pct):
+    """Lots allowed by (a) max loss at the premium stop, (b) max premium per trade, (c) free cash."""
+    cost = premium * lot_size
+    risk_per_lot = cost * sl_pct / 100.0 + 2 * CHARGES_PER_ORDER
+    by_risk = int((equity * risk_pct / 100.0) // risk_per_lot) if risk_per_lot > 0 else 0
+    by_outlay = int((equity * outlay_pct / 100.0) // cost) if cost > 0 else 0
+    by_cash = int(cash // cost) if cost > 0 else 0
+    return {"lots": max(0, min(by_risk, by_outlay, by_cash)), "cost": cost, "risk_per_lot": risk_per_lot,
+            "by_risk": by_risk, "by_outlay": by_outlay, "by_cash": by_cash}
 
 
 def default_levels(m, side):
+    """Index invalidation / target from the nearest OI walls. side: BUY (bullish) or SELL (bearish)."""
     res, sup = m["struct"]["res"], m["struct"]["sup"]
     if side == "BUY":
         return (res["level"] if res else None), (sup["level"] - SL_BUFFER if sup else None)
     return (sup["level"] if sup else None), (res["level"] + SL_BUFFER if res else None)
 
 
-def make_trade(idx_name, side, entry, lots, lot_size, target, sl, source, now, practice=False):
+# ---- orders ----
+def new_order(spec, now):
     return {
-        "id": hashlib.md5(f"{now.timestamp()}{idx_name}{side}{source}".encode()).hexdigest()[:6],
-        "date": now.date().isoformat(), "time": now.strftime("%H:%M:%S"), "ts": now.timestamp(),
-        "index": idx_name, "side": side, "entry_price": round(float(entry), 2),
-        "lots": int(lots), "lot_size": int(lot_size),
-        "target": float(target) if target is not None else None,
-        "sl": float(sl) if sl is not None else None,
-        "status": "OPEN", "exit_price": None, "exit_date": None, "exit_time": None, "exit_ts": None,
-        "exit_reason": "", "pnl": 0.0, "source": source, "practice": bool(practice),
+        "id": hashlib.md5(f"{now.timestamp()}{spec['index']}{spec['strike']}{spec['opt']}{spec['source']}{spec.get('limit')}".encode()).hexdigest()[:6],
+        "ts": now.timestamp(), "date": now.date().isoformat(), "time": now.strftime("%H:%M:%S"),
+        "index": spec["index"], "expiry": str(spec["expiry"])[:10], "strike": float(spec["strike"]), "opt": spec["opt"],
+        "lots": int(spec["lots"]), "lot_size": int(spec["lot_size"]), "type": spec.get("type", "MARKET"),
+        "limit": float(spec["limit"]) if spec.get("limit") else None, "status": "PENDING", "fill": None, "note": "",
+        "trade_id": None, "exec_time": None, "source": spec["source"], "practice": bool(spec.get("practice")),
+        "sl_pct": float(spec["sl_pct"]), "tp_pct": float(spec["tp_pct"]), "be_pct": float(spec["be_pct"]),
+        "spot_sl": float(spec["spot_sl"]) if spec.get("spot_sl") else None,
+        "spot_tp": float(spec["spot_tp"]) if spec.get("spot_tp") else None, "product": "INTRADAY",
     }
 
 
-def close_trade(t, price, reason, now):
-    t.update({"status": "CLOSED", "exit_price": round(float(price), 2), "exit_date": now.date().isoformat(),
-              "exit_time": now.strftime("%H:%M:%S"), "exit_ts": now.timestamp(), "exit_reason": reason})
-    t["pnl"] = trade_pnl(t, price)
+def make_trade(o, fill, ltp, spot, now):
+    return {
+        "id": hashlib.md5(f"T{o['id']}{now.timestamp()}".encode()).hexdigest()[:6], "order_id": o["id"],
+        "date": now.date().isoformat(), "time": now.strftime("%H:%M:%S"), "ts": now.timestamp(),
+        "index": o["index"], "expiry": o["expiry"], "strike": o["strike"], "opt": o["opt"],
+        "lots": o["lots"], "lot_size": o["lot_size"], "entry_premium": round(float(fill), 2), "entry_ltp": float(ltp),
+        "entry_spot": round(float(spot), 2),
+        "sl_price": round(fill * (1 - o["sl_pct"] / 100.0), 2), "tp_price": round(fill * (1 + o["tp_pct"] / 100.0), 2),
+        "be_pct": o["be_pct"], "be_armed": False, "spot_sl": o["spot_sl"], "spot_tp": o["spot_tp"],
+        "status": "OPEN", "last_premium": round(float(fill), 2), "max_premium": round(float(fill), 2),
+        "min_premium": round(float(fill), 2), "exit_premium": None, "exit_spot": None, "exit_date": None,
+        "exit_time": None, "exit_ts": None, "exit_reason": "", "gross": 0.0, "charges": 0.0, "pnl": 0.0,
+        "source": o["source"], "practice": o["practice"], "product": o["product"],
+    }
 
 
-def manage_open_trades(led, idx_name, spot, now):
-    """Auto exits, evaluated on every refresh at the OBSERVED spot (a 3-min poll can fill beyond the SL/target level)."""
+def try_execute(led, o, lm, spot, now, cfg):
+    """Fill order o at the current ask if possible. Returns True when the order reached a final state."""
+    row = opt_row(lm, o["strike"], o["opt"])
+    ask = buy_fill(row, cfg["slip"])
+    if not ask:
+        return False
+    if o["type"] == "LIMIT" and ask > o["limit"] + 1e-9:
+        return False
+    cost = ask * o["lots"] * o["lot_size"]
+    if cost > cash_free(led):
+        o["status"], o["note"] = "REJECTED", f"Insufficient funds (needs ₹{cost:,.0f}, free ₹{cash_free(led):,.0f})"
+        return True
+    t = make_trade(o, ask, row["ltp"], spot, now)
+    led["trades"].append(t)
+    o.update({"status": "EXECUTED", "fill": ask, "trade_id": t["id"], "exec_time": now.strftime("%H:%M:%S"), "note": ""})
+    return True
+
+
+def place_order(led, spec, lm, spot, now, cfg):
+    """Create an order; MARKET fills at the ask immediately, LIMIT fills when ask <= limit (else stays PENDING)."""
+    led.setdefault("orders", [])
+    o = new_order(spec, now)
+    led["orders"].append(o)
+    if o["lots"] < 1:
+        o["status"], o["note"] = "REJECTED", "Quantity must be at least 1 lot"
+    elif not o["practice"] and not market_open_now(now):
+        o["status"], o["note"] = "REJECTED", "Market is closed"
+    elif o["type"] == "LIMIT" and not (o["limit"] and o["limit"] > 0):
+        o["status"], o["note"] = "REJECTED", "Limit price required"
+    elif not buy_fill(opt_row(lm, o["strike"], o["opt"]), cfg["slip"]):
+        o["status"], o["note"] = "REJECTED", "No quote for this contract"
+    elif not try_execute(led, o, lm, spot, now, cfg):
+        o["note"] = "Waiting for ask <= limit"
+    return o
+
+
+def process_pending_orders(led, idx_name, expiry, lm, spot, now, cfg):
     msgs = []
     today = now.date().isoformat()
-    for t in led["trades"]:
-        if t["status"] != "OPEN" or t["index"] != idx_name:
+    for o in led.setdefault("orders", []):
+        if o["status"] != "PENDING":
             continue
-        reason = None
-        if not t.get("practice"):
-            if t["date"] < today or (is_trading_day(now) and _mins(now) >= SQUARE_OFF) or not is_trading_day(now):
-                reason = "SQUARE-OFF (end of day / market closed)"
-        if reason is None and t.get("sl") is not None and t.get("target") is not None:
-            if t["side"] == "BUY":
-                reason = "STOP LOSS" if spot <= t["sl"] else "TARGET" if spot >= t["target"] else None
-            else:
-                reason = "STOP LOSS" if spot >= t["sl"] else "TARGET" if spot <= t["target"] else None
-        if reason:
-            close_trade(t, spot, reason, now)
-            msgs.append(f"Closed {t['id']} ({t['side']} {t['index']}) at {spot:,.2f}: {reason}, P&L ₹{t['pnl']:+,.0f}")
+        if not o["practice"] and (o["date"] < today or not is_trading_day(now) or _mins(now) >= SQUARE_OFF):
+            o["status"], o["note"] = "CANCELLED", "Expired at end of day"
+            continue
+        if o["index"] != idx_name or o["expiry"] != str(expiry)[:10]:
+            continue
+        if try_execute(led, o, lm, spot, now, cfg):
+            msgs.append(f"Order {o['id']} {o['status']}: BUY {contract_name(o)} "
+                        + (f"filled @ {o['fill']:.2f}" if o["status"] == "EXECUTED" else o["note"]))
     return msgs
 
 
-def try_auto_entry(led, sig, ai_time, idx_name, spot, now, risk_pct):
-    """Returns (opened, message). Every guard is explicit so nothing opens on stale data or outside market hours."""
-    if not sig or sig["signal"] == "WAIT" or sig["target"] is None or sig["sl"] is None:
+def cancel_order(led, oid):
+    for o in led.get("orders", []):
+        if o["id"] == oid and o["status"] == "PENDING":
+            o["status"], o["note"] = "CANCELLED", "Cancelled by user"
+
+
+def close_trade(t, price, reason, now, spot=None):
+    qty = t["lots"] * t["lot_size"]
+    t.update({"status": "CLOSED", "exit_premium": round(float(price), 2), "exit_spot": spot,
+              "exit_date": now.date().isoformat(), "exit_time": now.strftime("%H:%M:%S"), "exit_ts": now.timestamp(),
+              "exit_reason": reason})
+    t["gross"] = round((price - t["entry_premium"]) * qty, 2)
+    t["charges"] = round(2 * CHARGES_PER_ORDER, 2)
+    t["pnl"] = round(t["gross"] - t["charges"], 2)
+
+
+def manage_open_trades(led, idx_name, expiry, lm, spot, now, cfg):
+    """
+    Marks each open option at the BID and applies, in priority order:
+    square-off > premium stop (or breakeven stop once armed) > index invalidation > premium target > index target.
+    Fills happen at the observed bid, so a gap through the stop fills worse than the stop level.
+    """
+    msgs = []
+    today = now.date().isoformat()
+    for t in led["trades"]:
+        if t["status"] != "OPEN":
+            continue
+        priced = t["index"] == idx_name and t["expiry"] == str(expiry)[:10]
+        mark = mark_price(opt_row(lm, t["strike"], t["opt"]), cfg["slip"]) if priced else None
+        if mark:
+            t["last_premium"] = mark
+            t["max_premium"] = max(t.get("max_premium", mark), mark)
+            t["min_premium"] = min(t.get("min_premium", mark), mark)
+        reason, px = None, mark
+        squared = (not t.get("practice")) and (t["date"] < today or not is_trading_day(now) or _mins(now) >= SQUARE_OFF)
+        if squared:
+            reason = "SQUARE-OFF (end of day / market closed)"
+            px = mark or t.get("last_premium") or t["entry_premium"]
+        elif mark:
+            if t["be_pct"] > 0 and not t["be_armed"] and mark >= t["entry_premium"] * (1 + t["be_pct"] / 100.0):
+                t["be_armed"] = True
+                msgs.append(f"{contract_name(t)} is up {t['be_pct']:.0f}%: stop moved to breakeven ({t['entry_premium']:.2f}).")
+            eff_sl = max(t["sl_price"], t["entry_premium"]) if t["be_armed"] else t["sl_price"]
+            spot_stop = t.get("spot_sl") and priced and ((spot <= t["spot_sl"]) if t["opt"] == "CE" else (spot >= t["spot_sl"]))
+            spot_goal = t.get("spot_tp") and priced and ((spot >= t["spot_tp"]) if t["opt"] == "CE" else (spot <= t["spot_tp"]))
+            if mark <= eff_sl:
+                reason = "BREAKEVEN STOP" if (t["be_armed"] and eff_sl >= t["entry_premium"]) else "PREMIUM STOP"
+            elif spot_stop:
+                reason = "INDEX INVALIDATION (spot stop)"
+            elif mark >= t["tp_price"]:
+                reason = "PREMIUM TARGET"
+            elif spot_goal:
+                reason = "INDEX TARGET (spot)"
+        if reason and px:
+            close_trade(t, px, reason, now, spot if priced else None)
+            msgs.append(f"Closed {t['id']} {contract_name(t)} at {px:.2f}: {reason}, net P&L ₹{t['pnl']:+,.0f}")
+    return msgs
+
+
+def sync_desk(led, idx_name, expiry, lm, spot, now, cfg):
+    """One tick of the paper exchange: match pending orders, then manage open positions."""
+    msgs = process_pending_orders(led, idx_name, expiry, lm, spot, now, cfg)
+    msgs += manage_open_trades(led, idx_name, expiry, lm, spot, now, cfg)
+    return msgs
+
+
+def choose_option(scan, opt_side):
+    """Best scanner row for the wanted side that is liquid enough to trade automatically."""
+    if scan is None or scan.empty:
+        return None
+    s = scan[(scan["Side"] == opt_side) & (scan["LTP"] >= AUTO_MIN_PREMIUM) & (scan["Delta"] >= AUTO_MIN_DELTA)]
+    s = s[s["Spread%"].isna() | (s["Spread%"] <= AUTO_MAX_SPREAD_PCT)]
+    return s.iloc[0] if not s.empty else None      # scan is already sorted by Score
+
+
+def try_auto_entry(led, sig, ai_time, idx_name, expiry, m, scan, spot, now, cfg):
+    """Returns (opened, message). BUY signal -> buy a call; SELL signal -> buy a put. Never sells/writes options."""
+    if not sig or sig["signal"] == "WAIT":
         return False, ""
     if not entry_window_open(now):
         return False, f"Auto-entry skipped: outside the entry window ({hhmm(ENTRY_START)}-{hhmm(ENTRY_CUTOFF)} IST, Mon-Fri)."
-    if any(t["status"] == "OPEN" for t in led["trades"]):
-        return False, "Auto-entry skipped: a position is already open."
+    if any(t["status"] == "OPEN" for t in led["trades"]) or any(o["status"] == "PENDING" for o in led.get("orders", [])):
+        return False, "Auto-entry skipped: a position or pending order already exists."
     today = now.date().isoformat()
     n_today, pnl_today = today_stats(led, today)
     if n_today >= MAX_TRADES_PER_DAY:
@@ -1500,61 +1722,78 @@ def try_auto_entry(led, sig, ai_time, idx_name, spot, now, risk_pct):
         return False, f"Auto-entry skipped: {COOLDOWN_MIN}-min cooldown after the last exit."
     if ai_time is None or (now - ai_time).total_seconds() > AI_MAX_AGE_MIN * 60:
         return False, f"Auto-entry skipped: AI verdict older than {AI_MAX_AGE_MIN} min. Use FORCE AI RUN."
+    opt = "CE" if sig["signal"] == "BUY" else "PE"
+    pick = choose_option(scan, opt)
+    if pick is None:
+        return False, (f"Auto-entry skipped: no liquid {opt} (premium >= {AUTO_MIN_PREMIUM:.0f}, delta >= {AUTO_MIN_DELTA}, "
+                       f"spread <= {AUTO_MAX_SPREAD_PCT:.0f}%).")
+    row = opt_row(m, pick["Strike"], opt)
+    fill = buy_fill(row, cfg["slip"])
+    if not fill:
+        return False, "Auto-entry skipped: no tradable price for the chosen contract."
     lot = INDEX_MAP[idx_name]["lot"]
-    lots, rpl, budget = position_size(equity_now(led), sig["entry"], sig["sl"], lot, risk_pct)
-    if lots < 1:
-        return False, (f"Auto-entry skipped: 1 lot risks ₹{rpl:,.0f} (SL {abs(sig['entry'] - sig['sl']):,.0f} pts x {lot}) "
-                       f"but the budget is ₹{budget:,.0f} ({risk_pct}% of equity).")
-    t = make_trade(idx_name, sig["signal"], sig["entry"], lots, lot, sig["target"], sig["sl"], "AUTO", now)
-    led["trades"].append(t)
-    return True, (f"AUTO {sig['signal']} {lots} lot(s) {idx_name} @ {sig['entry']:,.2f} | SL {sig['sl']:,.0f} | "
-                  f"target {sig['target']:,.0f} | risk ₹{lots * rpl:,.0f}")
+    sz = size_option(equity_now(led), cash_free(led), fill, lot, cfg["sl_pct"], cfg["risk_pct"], cfg["outlay_pct"])
+    if sz["lots"] < 1:
+        return False, (f"Auto-entry skipped: 1 lot of {pick['Strike']:.0f} {opt} costs ₹{sz['cost']:,.0f} and risks "
+                       f"₹{sz['risk_per_lot']:,.0f} at a {cfg['sl_pct']:.0f}% stop (limits: risk {cfg['risk_pct']}%, "
+                       f"outlay {cfg['outlay_pct']:.0f}% of equity).")
+    spec = {"index": idx_name, "expiry": expiry, "strike": pick["Strike"], "opt": opt, "lots": sz["lots"], "lot_size": lot,
+            "type": "MARKET", "limit": None, "sl_pct": cfg["sl_pct"], "tp_pct": cfg["tp_pct"], "be_pct": cfg["be_pct"],
+            "spot_sl": sig["sl"], "spot_tp": sig["target"], "source": "AUTO", "practice": False}
+    o = place_order(led, spec, m, spot, now, cfg)
+    if o["status"] != "EXECUTED":
+        return False, f"Auto order {o['status']}: {o['note']}"
+    return True, (f"AUTO BUY {sz['lots']} lot(s) {contract_name(o)} @ {o['fill']:.2f} (cost ₹{o['fill'] * sz['lots'] * lot:,.0f}) | "
+                  f"stop {o['fill'] * (1 - cfg['sl_pct'] / 100):.2f} | target {o['fill'] * (1 + cfg['tp_pct'] / 100):.2f} | "
+                  f"index stop {sig['sl']:,.0f} / target {sig['target']:,.0f}")
 
 
+# ---- journal / export ----
 def trades_to_dhan_rows(trades):
-    """Entry and exit legs in a Dhan-style trade-history layout (+ Realized PnL / Exit Reason)."""
     rows = []
     for t in trades:
         qty = t["lots"] * t["lot_size"]
-        name = f"{t['index']} (paper, index points)"
-        rows.append({"Date": t["date"], "Time": t["time"], "Name": name, "Buy/Sell": t["side"], "Order": "MARGIN",
+        name = contract_name(t)
+        rows.append({"Date": t["date"], "Time": t["time"], "Name": name, "Buy/Sell": "BUY", "Order": "INTRADAY",
                      "Exchange": "NSE", "Segment": "Derivative", "Quantity/Lot": f"{qty}/{t['lots']}",
-                     "Trade Price": t["entry_price"], "Trade Value": round(t["entry_price"] * qty, 2),
-                     "Status": "Traded", "Realized PnL": "", "Exit Reason": ""})
-        if t["status"] == "CLOSED" and t.get("exit_price") is not None:
-            rows.append({"Date": t["exit_date"], "Time": t["exit_time"], "Name": name,
-                         "Buy/Sell": "SELL" if t["side"] == "BUY" else "BUY", "Order": "MARGIN", "Exchange": "NSE",
-                         "Segment": "Derivative", "Quantity/Lot": f"{qty}/{t['lots']}", "Trade Price": t["exit_price"],
-                         "Trade Value": round(t["exit_price"] * qty, 2), "Status": "Traded",
-                         "Realized PnL": round(t["pnl"], 2), "Exit Reason": t.get("exit_reason", "")})
+                     "Trade Price": t["entry_premium"], "Trade Value": round(t["entry_premium"] * qty, 2),
+                     "Status": "Traded", "Realized PnL": "", "Exit Reason": "", "Charges (est)": ""})
+        if t["status"] == "CLOSED" and t.get("exit_premium") is not None:
+            rows.append({"Date": t["exit_date"], "Time": t["exit_time"], "Name": name, "Buy/Sell": "SELL",
+                         "Order": "INTRADAY", "Exchange": "NSE", "Segment": "Derivative", "Quantity/Lot": f"{qty}/{t['lots']}",
+                         "Trade Price": t["exit_premium"], "Trade Value": round(t["exit_premium"] * qty, 2),
+                         "Status": "Traded", "Realized PnL": round(t["pnl"], 2), "Exit Reason": t.get("exit_reason", ""),
+                         "Charges (est)": t.get("charges", 0.0)})
     return pd.DataFrame(rows)
 
 
 def perf_summary(led):
-    closed = [t for t in led["trades"] if t["status"] == "CLOSED"]
+    closed = sorted([t for t in led["trades"] if t["status"] == "CLOSED"], key=lambda x: x.get("exit_ts") or 0)
     wins = [t["pnl"] for t in closed if t["pnl"] > 0]
     losses = [t["pnl"] for t in closed if t["pnl"] <= 0]
-    gross_win, gross_loss = sum(wins), -sum(losses)
-    curve, peak, max_dd, run = [], 0.0, 0.0, 0.0
-    for t in sorted(closed, key=lambda x: x.get("exit_ts") or 0):
+    gw, gl = sum(wins), -sum(losses)
+    peak = run = max_dd = 0.0
+    for t in closed:
         run += t["pnl"]
         peak = max(peak, run)
         max_dd = max(max_dd, peak - run)
+    n = len(closed)
     return {
         "Initial capital (₹)": led["initial_capital"],
         "Equity (₹)": round(equity_now(led), 2),
-        "Realized P&L (₹)": round(realized_pnl(led), 2),
-        "Trades (total / closed)": f"{len(led['trades'])} / {len(closed)}",
-        "Win rate (%)": round(len(wins) / len(closed) * 100, 1) if closed else 0.0,
+        "Net realized P&L (₹)": round(realized_pnl(led), 2),
+        "Trades (total / closed)": f"{len(led['trades'])} / {n}",
+        "Win rate (%)": round(len(wins) / n * 100, 1) if n else 0.0,
         "Average win (₹)": round(sum(wins) / len(wins), 2) if wins else 0.0,
         "Average loss (₹)": round(sum(losses) / len(losses), 2) if losses else 0.0,
-        "Profit factor": round(gross_win / gross_loss, 2) if gross_loss > 0 else ("n/a" if not gross_win else "inf"),
+        "Expectancy per trade (₹)": round(sum(t["pnl"] for t in closed) / n, 2) if n else 0.0,
+        "Profit factor": round(gw / gl, 2) if gl > 0 else ("n/a" if not gw else "inf"),
         "Max drawdown (₹)": round(max_dd, 2),
+        "Charges paid (₹)": round(sum(t.get("charges", 0.0) for t in closed), 2),
     }
 
 
 def generate_excel_report(led):
-    """Returns xlsx bytes, or None if openpyxl is missing / there are no trades."""
     if not led["trades"]:
         return None
     try:
@@ -1567,6 +1806,18 @@ def generate_excel_report(led):
         s = perf_summary(led)
         pd.DataFrame({"Metric": list(s.keys()), "Value": [str(v) for v in s.values()]}).to_excel(
             w, index=False, sheet_name="Performance_Summary")
+        closed = [t for t in led["trades"] if t["status"] == "CLOSED"]
+        if closed:
+            pd.DataFrame([{"Contract": contract_name(t), "Entry": t["entry_premium"], "Exit": t["exit_premium"],
+                           "Max premium seen": t.get("max_premium"), "Min premium seen": t.get("min_premium"),
+                           "Gross ₹": t["gross"], "Charges ₹": t["charges"], "Net ₹": t["pnl"],
+                           "Exit reason": t["exit_reason"], "Source": t["source"]} for t in closed]).to_excel(
+                w, index=False, sheet_name="Closed_Detail")
+        if led.get("orders"):
+            pd.DataFrame([{"Order ID": o["id"], "Date": o["date"], "Time": o["time"], "Contract": contract_name(o),
+                           "Type": o["type"], "Lots": o["lots"], "Limit": o["limit"], "Fill": o["fill"],
+                           "Status": o["status"], "Note": o["note"], "Source": o["source"]} for o in led["orders"]]).to_excel(
+                w, index=False, sheet_name="Order_Book")
     return out.getvalue()
 
 
@@ -1673,13 +1924,20 @@ with st.sidebar:
     exh_lookback = st.slider("EXHAUSTION LOOKBACK (min)", 6, 45, 15, step=3,
                              help="History window used by the exhaustion monitor. With a 3-min refresh, 15 min = 5 snapshots.")
     st.markdown("---")
-    st.markdown("### 🤖 PAPER TRADING")
-    st.caption("Simulation only. This app never places real orders.")
+    st.markdown("### 🤖 OPTION PAPER TRADING")
+    st.caption("Simulation only (long calls / puts). This app never places real orders.")
     auto_execute = st.toggle("AUTO ENTRIES & EXITS (paper)", value=False, key="auto_execute",
-                             help="Opens a paper trade when the risk-validated signal is BUY/SELL (market hours only), "
-                                  "and auto-closes at stop, target or square-off.")
-    risk_pct = st.number_input("RISK PER TRADE (% of equity)", min_value=0.25, max_value=25.0, value=RISK_PER_TRADE_PCT,
-                               step=0.25, key="risk_pct")
+                             help="BUY signal buys a call, SELL signal buys a put (market hours only). Exits automatically at "
+                                  "premium stop/target, breakeven stop, index invalidation or square-off.")
+    risk_pct = st.number_input("MAX LOSS AT STOP (% of equity)", min_value=0.5, max_value=25.0, value=OPT_RISK_PCT, step=0.5, key="risk_pct")
+    outlay_pct = st.number_input("MAX PREMIUM PER TRADE (% of equity)", min_value=5.0, max_value=100.0, value=OPT_OUTLAY_PCT, step=5.0, key="outlay_pct")
+    opt_sl_pct = st.number_input("PREMIUM STOP (%)", min_value=5.0, max_value=90.0, value=OPT_SL_PCT, step=5.0, key="opt_sl_pct")
+    opt_tp_pct = st.number_input("PREMIUM TARGET (%)", min_value=10.0, max_value=1000.0, value=OPT_TP_PCT, step=10.0, key="opt_tp_pct")
+    opt_be_pct = st.number_input("STOP TO BREAKEVEN AFTER +% (0 = off)", min_value=0.0, max_value=300.0, value=OPT_BE_PCT, step=10.0, key="opt_be_pct")
+    live_on = st.toggle("LIVE DESK SYNC (auto-refresh order book)", value=True, key="live_on",
+                        help="The Live Option Desk re-pulls the option chain every few seconds and re-marks positions, "
+                             "matches limit orders and checks stops, independent of the 3-minute engine refresh.")
+    live_sec = st.slider("LIVE REFRESH (seconds)", 4, 30, 5, key="live_sec")
     force_run = st.button("FORCE AI RUN")
 
     auto_refresh = st.toggle("AUTO REFRESH (3 MIN)", value=True)
@@ -1744,18 +2002,22 @@ else:
     t = st.session_state.get("last_ai_time")
     gate_label = f"CACHED {t.strftime('%H:%M:%S') if t else ''}"
 
-# ---- risk-validated signal + paper trading engine ----
+# ---- risk-validated signal + option paper trading engine ----
 if "paper_ledger" not in st.session_state:
     st.session_state["paper_ledger"] = load_ledger()
 now_ist = datetime.now(IST)
 ai_ok = not ("error" in ai and "signal" not in ai)
 sig = build_signal(m, ai) if ai_ok else None
 ledger = st.session_state["paper_ledger"]
-trade_msgs = manage_open_trades(ledger, idx_name, spot, now_ist)
+ledger.setdefault("orders", [])
+scan, smeta = premium_scanner(m, horizon_days, iv_shock)
+opt_cfg = {"sl_pct": opt_sl_pct, "tp_pct": opt_tp_pct, "be_pct": opt_be_pct, "risk_pct": risk_pct,
+           "outlay_pct": outlay_pct, "slip": SLIPPAGE_PCT}
+trade_msgs = sync_desk(ledger, idx_name, expiry, m, spot, now_ist, opt_cfg)
 auto_msg, auto_opened = "", False
 if auto_execute:
-    auto_opened, auto_msg = try_auto_entry(ledger, sig, st.session_state.get("last_ai_time"),
-                                           idx_name, spot, now_ist, risk_pct)
+    auto_opened, auto_msg = try_auto_entry(ledger, sig, st.session_state.get("last_ai_time"), idx_name, expiry,
+                                           m, scan, spot, now_ist, opt_cfg)
 if trade_msgs or auto_opened:
     save_ledger(ledger)
 
@@ -1763,7 +2025,7 @@ if trade_msgs or auto_opened:
 # DASHBOARD
 # ============================================================
 st.markdown(f"## {idx_name} // SPOT {spot:,.2f}  ({spot - prev_close:+,.2f})")
-_mkt = "OPEN" if market_open_now(now_ist) else "CLOSED (spot and OI shown are the last close, not live)"
+_mkt = "OPEN" if market_open_now(now_ist) else "CLOSED (spot, OI and premiums shown are the last close, not live)"
 st.caption(f"{now_ist.strftime('%a %d %b %Y %H:%M:%S')} IST | market {_mkt}")
 for _msg in trade_msgs:
     st.info(_msg)
@@ -1774,7 +2036,7 @@ elif auto_msg:
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "📊 Dashboard & Engine", "📐 Day Levels", "🧭 Exhaustion", "🎯 Premium Scanner",
-    "🤖 AI Council & News", "📋 Option Chain", "📝 Paper Desk"])
+    "🤖 AI Council & News", "📋 Option Chain", "📈 Live Option Desk"])
 
 with tab1:
     status = m["status"]
@@ -1928,7 +2190,6 @@ with tab3:
 with tab4:
     # ---- PREMIUM POTENTIAL SCANNER ----
     st.markdown("#### 🎯 PREMIUM POTENTIAL SCANNER")
-    scan, smeta = premium_scanner(m, horizon_days, iv_shock)
     lean_now = sum(c["v"] for c in chain_checks(m))
     fav = "CE" if lean_now > 0 else "PE" if lean_now < 0 else None
     if "BULLISH GAMMA" in m["status"]:
@@ -2047,106 +2308,276 @@ with tab6:
     show_df(m["df"], hide_index=True)
 
 with tab7:
-    st.markdown("#### 📝 PAPER TRADING DESK")
-    st.caption("Simulation only. P&L = index points × lot size × lots (like futures), not option premium. No real orders are placed.")
-    led = ledger
-    _closed = [t for t in led["trades"] if t["status"] == "CLOSED"]
-    _open = [t for t in led["trades"] if t["status"] == "OPEN"]
-    _real, _unreal = realized_pnl(led), unrealized_pnl(led, {idx_name: spot})
-    _eq = led["initial_capital"] + _real
-    _wr = (len([t for t in _closed if t["pnl"] > 0]) / len(_closed) * 100) if _closed else 0.0
-    p1, p2, p3, p4, p5 = st.columns(5)
-    p1.metric("EQUITY (realized)", f"₹{_eq:,.0f}", f"{_real:+,.0f} realized")
-    p2.metric("UNREALIZED", f"₹{_unreal:+,.0f}")
-    p3.metric("TRADES", len(led["trades"]))
-    p4.metric("WIN RATE", f"{_wr:.0f}%")
-    p5.metric("OPEN", len(_open))
-    _n_today, _pnl_today = today_stats(led, now_ist.date().isoformat())
-    st.caption(f"Today: {_n_today}/{MAX_TRADES_PER_DAY} trades | realized ₹{_pnl_today:+,.0f} | daily loss limit "
-               f"-₹{led['initial_capital'] * DAILY_LOSS_LIMIT_PCT / 100:,.0f} | lot size {INDEX_MAP[idx_name]['lot']} | "
-               f"risk budget ₹{_eq * risk_pct / 100:,.0f} per trade ({risk_pct}%)")
+    def render_desk():
+        """Live paper-trading terminal. Runs as a fragment: re-pulls the option chain every few seconds and re-marks everything."""
+        led = st.session_state["paper_ledger"]
+        led.setdefault("orders", [])
+        now = datetime.now(IST)
 
-    if sig and sig["signal"] != "WAIT" and sig["target"] is not None:
-        _lots, _rpl, _bud = position_size(_eq, sig["entry"], sig["sl"], INDEX_MAP[idx_name]["lot"], risk_pct)
-        st.info(f"Current validated signal: {sig['signal']} entry {sig['entry']:,.0f}, SL {sig['sl']:,.0f}, target {sig['target']:,.0f}. "
-                f"Risk per lot ₹{_rpl:,.0f}; sizing at {risk_pct}% gives {_lots} lot(s)."
-                + ("" if _lots >= 1 else " One lot is above your risk budget, so auto-entry will skip it."))
-
-    st.markdown("##### Manual entry")
-    _side0 = sig["signal"] if sig and sig["signal"] in ("BUY", "SELL") else "BUY"
-    mc1, mc2, mc3, mc4 = st.columns(4)
-    m_side = mc1.selectbox("Side", ["BUY", "SELL"], index=0 if _side0 == "BUY" else 1, key="man_side")
-    _dt, _dsl = default_levels(m, m_side)
-    m_sl = mc2.number_input("Stop-loss", value=float(_dsl if _dsl else spot), step=float(info["step"]) / 2, key=f"man_sl_{idx_name}_{m_side}")
-    m_tp = mc3.number_input("Target", value=float(_dt if _dt else spot), step=float(info["step"]) / 2, key=f"man_tp_{idx_name}_{m_side}")
-    m_lots = mc4.number_input("Lots", min_value=1, max_value=100, value=1, step=1, key="man_lots")
-    _risk = abs(spot - m_sl) * INDEX_MAP[idx_name]["lot"] * m_lots
-    st.caption(f"Risk if stopped: ₹{_risk:,.0f} ({_risk / _eq * 100:.1f}% of equity)")
-    practice = st.checkbox("Practice mode: ignore market hours (exempt from auto square-off; for testing only)", key="practice")
-    if st.button("🚀 ENTER PAPER TRADE"):
-        _ok = (m_sl < spot < m_tp) if m_side == "BUY" else (m_tp < spot < m_sl)
-        if not _ok:
-            st.error("Levels invalid: BUY needs SL < spot < target; SELL needs target < spot < SL.")
-        elif not practice and not market_open_now(now_ist):
-            st.error("Market is closed. Tick practice mode to simulate with the last-close price.")
-        else:
-            led["trades"].append(make_trade(idx_name, m_side, spot, m_lots, INDEX_MAP[idx_name]["lot"], m_tp, m_sl,
-                                            "MANUAL", now_ist, practice))
-            save_ledger(led)
-            st.rerun()
-
-    st.markdown("##### Open positions")
-    if _open:
-        _rows = [{"ID": t["id"], "Index": t["index"], "Side": t["side"], "Lots": t["lots"], "Entry": t["entry_price"],
-                  "SL": t["sl"], "Target": t["target"], "Spot": spot if t["index"] == idx_name else None,
-                  "Unrealized ₹": trade_pnl(t, spot) if t["index"] == idx_name else None, "Source": t["source"]}
-                 for t in _open]
-        show_df(pd.DataFrame(_rows), hide_index=True)
-        _ids = [t["id"] for t in _open if t["index"] == idx_name]
-        if _ids:
-            _cid = st.selectbox("Close position", _ids, key="close_id")
-            if st.button("⏹ CLOSE AT CURRENT SPOT"):
-                for t in led["trades"]:
-                    if t["id"] == _cid and t["status"] == "OPEN":
-                        close_trade(t, spot, "MANUAL CLOSE", now_ist)
-                save_ledger(led)
-                st.rerun()
-    else:
-        st.caption("No open positions.")
-
-    st.markdown("##### Trade history")
-    if _closed:
-        _h = pd.DataFrame(_closed)[["id", "date", "time", "index", "side", "lots", "entry_price", "exit_price",
-                                    "exit_reason", "pnl", "source"]]
-        show_df(_h.iloc[::-1], hide_index=True)
-        _s = perf_summary(led)
-        st.caption(" | ".join(f"{k}: {v}" for k, v in _s.items() if k in ("Profit factor", "Max drawdown (₹)", "Average win (₹)", "Average loss (₹)")))
-    else:
-        st.caption("No closed trades yet.")
-
-    st.markdown("##### Export / backup")
-    _x = generate_excel_report(led)
-    dx1, dx2, dx3 = st.columns(3)
-    if _x:
-        dx1.download_button("📊 Excel journal", _x, file_name=f"Vipul_Journal_{now_ist.date().isoformat()}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    elif led["trades"]:
-        dx1.download_button("📄 CSV journal (install openpyxl for Excel)", trades_to_dhan_rows(led["trades"]).to_csv(index=False),
-                            file_name=f"Vipul_Journal_{now_ist.date().isoformat()}.csv", mime="text/csv")
-    dx2.download_button("💾 Ledger backup (JSON)", json.dumps(led), file_name="paper_ledger_backup.json", mime="application/json")
-    _up = st.file_uploader("Restore ledger from backup JSON", type="json", key="ledger_upload")
-    if _up is not None and st.button("♻ RESTORE LEDGER"):
+        # ---------- live data (falls back to the last full-run chain if the live pull fails) ----------
+        live_err = ""
         try:
-            _new = json.load(_up)
-            assert isinstance(_new.get("trades"), list)
-            _new.setdefault("initial_capital", INITIAL_CAPITAL)
-            st.session_state["paper_ledger"] = _new
-            save_ledger(_new)
-            st.rerun()
+            l_spot, l_df = fetch_option_chain_live(info["scrip"], info["seg"], expiry, dhan_token, client_id)
+            if l_df.empty or not l_spot:
+                raise RuntimeError("empty chain")
         except Exception as e:
-            st.error(f"Could not restore: {e}")
-    st.caption("The ledger is stored in the server's temp folder, so a Streamlit Cloud restart can erase it. Download a backup regularly.")
-    if st.checkbox("I want to reset the ledger and delete all paper trades", key="reset_ok") and st.button("🗑 RESET LEDGER"):
-        st.session_state["paper_ledger"] = new_ledger()
-        save_ledger(st.session_state["paper_ledger"])
-        st.rerun()
+            l_spot, l_df, live_err = spot, m["df"], str(e)[:140]
+        lm = {"df": l_df}
+
+        # ---------- one tick of the paper exchange ----------
+        msgs = sync_desk(led, idx_name, expiry, lm, l_spot, now, opt_cfg)
+        if msgs:
+            save_ledger(led)
+            for _t in msgs:
+                st.toast(_t)
+
+        eq, cash, used = equity_now(led), cash_free(led), open_cost(led)
+        unreal, real = unrealized_pnl(led), realized_pnl(led)
+        n_today, pnl_today = today_stats(led, now.date().isoformat())
+        day_pnl = pnl_today + unreal
+        live = market_open_now(now) and not live_err
+        dot = '<span class="live-dot on">●</span> LIVE' if live else '<span class="live-dot">●</span> ' + ("FEED ERROR" if live_err else "MARKET CLOSED (last close)")
+        pc = lambda v: "up" if v > 0 else "down" if v < 0 else ""
+        strikes_all = sorted(l_df["Strike"].unique())
+        atm = min(strikes_all, key=lambda k: abs(k - l_spot))
+        ar = l_df[l_df["Strike"] == atm].iloc[0]
+        st.markdown(
+            f'<div class="fund-strip">'
+            f'<div class="fund-box"><span>{dot}</span><b>{now.strftime("%H:%M:%S")} IST</b></div>'
+            f'<div class="fund-box"><span>{IDX_SHORT.get(idx_name, idx_name)}</span><b class="{pc(l_spot - prev_close)}">{l_spot:,.2f} ({l_spot - prev_close:+,.2f})</b></div>'
+            f'<div class="fund-box"><span>ATM {atm:,.0f} straddle</span><b>₹{ar["CE_LTP"] + ar["PE_LTP"]:,.1f}</b></div>'
+            f'<div class="fund-box"><span>Equity</span><b>₹{eq:,.0f}</b></div>'
+            f'<div class="fund-box"><span>Available</span><b>₹{cash:,.0f}</b></div>'
+            f'<div class="fund-box"><span>Used (premium)</span><b>₹{used:,.0f}</b></div>'
+            f'<div class="fund-box"><span>Unrealized</span><b class="{pc(unreal)}">₹{unreal:+,.0f}</b></div>'
+            f'<div class="fund-box"><span>Day P&L</span><b class="{pc(day_pnl)}">₹{day_pnl:+,.0f}</b></div>'
+            f'<div class="fund-box"><span>Total P&L</span><b class="{pc(real + unreal)}">₹{real + unreal:+,.0f}</b></div>'
+            f'</div>', unsafe_allow_html=True)
+        if live_err:
+            st.warning(f"Live pull failed, showing the last full-refresh chain. ({live_err})")
+        st.caption("Simulation only. Buys fill at the ask; positions are marked and sold at the bid (LTP ± slippage when there is no quote). "
+                   f"₹{CHARGES_PER_ORDER:.0f} per order is deducted; STT, exchange fees and GST are not modelled. "
+                   "The desk re-pulls the chain every few seconds; the engine and AI above refresh every 3 minutes.")
+
+        left, right = st.columns([3, 2])
+
+        # ---------- option chain ladder ----------
+        with left:
+            st.markdown("##### OPTION CHAIN (press **B** to open a buy ticket)")
+            i0 = strikes_all.index(atm)
+            window = strikes_all[max(0, i0 - LADDER_N): i0 + LADDER_N + 1]
+            byk = l_df.set_index("Strike")
+            widths = [1.1, 1.3, 0.55, 1.2, 0.55, 1.3, 1.1]
+            for c, h in zip(st.columns(widths), ["CE OI Δ", "CE LTP", "", "STRIKE", "", "PE LTP", "PE OI Δ"]):
+                c.markdown(f"<div class='lad-h'>{h}</div>", unsafe_allow_html=True)
+            prev = st.session_state.get("_ltp_prev", {})
+            cur = {}
+
+            def ltp_cell(K, opt, ltp, itm):
+                key = f"{int(K)}{opt}"
+                pv = prev.get(key)
+                arrow = "" if pv is None or abs(ltp - pv) < 1e-9 else ("▲" if ltp > pv else "▼")
+                cls = "up" if arrow == "▲" else "down" if arrow == "▼" else ""
+                cur[key] = ltp
+                return f"<div class='lad-c {'itm' if itm else ''} {cls}'>{ltp:,.2f} {arrow}</div>"
+
+            for K in window:
+                r = byk.loc[K]
+                cc = st.columns(widths)
+                ce_d, pe_d = r["CE_OI"] - r["CE_PrevOI"], r["PE_OI"] - r["PE_PrevOI"]
+                cc[0].markdown(f"<div class='lad-s {pc(ce_d)}'>{fmt_lakh(ce_d)}</div>", unsafe_allow_html=True)
+                cc[1].markdown(ltp_cell(K, "CE", r["CE_LTP"], K < l_spot), unsafe_allow_html=True)
+                if cc[2].button("B", key=f"b_CE_{int(K)}"):
+                    st.session_state["ticket"] = {"strike": float(K), "opt": "CE"}
+                cc[3].markdown(f"<div class='lad-k {'atm' if K == atm else ''}'>{K:,.0f}</div>", unsafe_allow_html=True)
+                if cc[4].button("B", key=f"b_PE_{int(K)}"):
+                    st.session_state["ticket"] = {"strike": float(K), "opt": "PE"}
+                cc[5].markdown(ltp_cell(K, "PE", r["PE_LTP"], K > l_spot), unsafe_allow_html=True)
+                cc[6].markdown(f"<div class='lad-s {pc(pe_d)}'>{fmt_lakh(pe_d)}</div>", unsafe_allow_html=True)
+            st.session_state["_ltp_prev"] = cur
+            st.caption("Shaded = in the money. ▲▼ = tick since the last refresh. OI Δ is versus the previous close.")
+
+        # ---------- order ticket ----------
+        with right:
+            st.markdown("##### ORDER TICKET")
+            if sig and sig["signal"] != "WAIT":
+                _want = "CE" if sig["signal"] == "BUY" else "PE"
+                _pk = choose_option(scan, _want)
+                if _pk is not None and st.button(f"⚡ Use signal pick: {_pk['Strike']:,.0f} {_want}", key="use_signal_pick"):
+                    st.session_state["ticket"] = {"strike": float(_pk["Strike"]), "opt": _want}
+            tk = st.session_state.get("ticket")
+            if not tk:
+                st.caption("Press B beside a price in the chain to buy that option.")
+            else:
+                opt, K = tk["opt"], tk["strike"]
+                row = opt_row(lm, K, opt)
+                if row is None:
+                    st.warning("That contract is not in the current chain.")
+                else:
+                    ask, bid = buy_fill(row, SLIPPAGE_PCT), mark_price(row, SLIPPAGE_PCT)
+                    cname = contract_name({"index": idx_name, "expiry": expiry, "strike": K, "opt": opt})
+                    st.markdown(f"<div class='tk-name'>BUY · {cname}</div>", unsafe_allow_html=True)
+                    st.markdown(f"<div class='tk-depth'>LTP <b>{row['ltp']:,.2f}</b> &nbsp;|&nbsp; Bid <b class='down'>{(bid or 0):,.2f}</b>"
+                                f"{' × ' + format(int(row['bq']), ',') if row['bq'] else ''} &nbsp;|&nbsp; Ask <b class='up'>{(ask or 0):,.2f}</b>"
+                                f"{' × ' + format(int(row['aq']), ',') if row['aq'] else ''}</div>", unsafe_allow_html=True)
+                    otype = st.radio("Order type", ["MARKET", "LIMIT"], horizontal=True, key="tk_type")
+                    lot = INDEX_MAP[idx_name]["lot"]
+                    lots = st.number_input("Lots", min_value=1, max_value=200, value=1, step=1, key="tk_lots")
+                    limit = None
+                    if otype == "LIMIT":
+                        limit = st.number_input("Limit price", min_value=0.05, value=float(ask or row["ltp"] or 1.0), step=0.05,
+                                                key=f"tk_lim_{int(K)}{opt}")
+                    t1, t2 = st.columns(2)
+                    slp = t1.number_input("Stop %", min_value=5.0, max_value=90.0, value=float(opt_sl_pct), step=5.0, key="tk_sl")
+                    tpp = t2.number_input("Target %", min_value=10.0, max_value=1000.0, value=float(opt_tp_pct), step=10.0, key="tk_tp")
+                    idx_exit = st.checkbox("Also exit on index invalidation / target (OI walls)", value=True, key="tk_idx")
+                    practice = st.checkbox("Simulate outside market hours", key="practice")
+                    ref_px = (limit if otype == "LIMIT" else ask) or 0.0
+                    cost = ref_px * lot * lots
+                    maxloss = cost * slp / 100.0 + 2 * CHARGES_PER_ORDER
+                    st.caption(f"Qty {lot * lots} | Required ₹{cost:,.0f} | Available ₹{cash:,.0f} | "
+                               f"Max loss at stop ≈ ₹{maxloss:,.0f} ({maxloss / eq * 100:.1f}% of equity)")
+                    _sz = size_option(eq, cash, ref_px or 1.0, lot, slp, risk_pct, outlay_pct)
+                    if lots > _sz["lots"]:
+                        st.warning(f"Above your own limits (risk, outlay or cash allow {_sz['lots']} lot(s)). You can still place it.")
+                    b1, b2 = st.columns(2)
+                    if b1.button("BUY", type="primary", key="tk_buy"):
+                        _side = "BUY" if opt == "CE" else "SELL"
+                        _tp_idx, _sl_idx = default_levels(m, _side)
+                        spec = {"index": idx_name, "expiry": expiry, "strike": K, "opt": opt, "lots": lots, "lot_size": lot,
+                                "type": otype, "limit": limit, "sl_pct": slp, "tp_pct": tpp, "be_pct": opt_be_pct,
+                                "spot_sl": _sl_idx if idx_exit else None, "spot_tp": _tp_idx if idx_exit else None,
+                                "source": "MANUAL", "practice": practice}
+                        o = place_order(led, spec, lm, l_spot, now, opt_cfg)
+                        save_ledger(led)
+                        st.session_state["last_order"] = (f"Order {o['id']} {o['status']}"
+                                                          + (f" @ {o['fill']:.2f}" if o["fill"] else "") + (f" - {o['note']}" if o["note"] else ""))
+                        rerun_desk()
+                    if b2.button("Close ticket", key="tk_close"):
+                        st.session_state["ticket"] = None
+                        rerun_desk()
+            if st.session_state.get("last_order"):
+                st.caption("Last order: " + st.session_state["last_order"])
+
+        # ---------- platform sections ----------
+        nav = st.radio("Section", ["Positions", "Orders", "Trades", "Summary"], horizontal=True, key="desk_nav",
+                       label_visibility="collapsed")
+        open_t = [t for t in led["trades"] if t["status"] == "OPEN"]
+
+        if nav == "Positions":
+            if not open_t:
+                st.caption("No open positions.")
+            else:
+                w = [2.4, 0.8, 0.9, 0.9, 1.1, 0.9, 0.9, 0.9, 0.8]
+                for c, h in zip(st.columns(w), ["Instrument", "Qty", "Avg", "LTP", "P&L ₹", "P&L %", "Stop", "Target", ""]):
+                    c.markdown(f"<div class='lad-h'>{h}</div>", unsafe_allow_html=True)
+                for t in open_t:
+                    lp = t.get("last_premium") or t["entry_premium"]
+                    qty = t["lots"] * t["lot_size"]
+                    pnl = (lp - t["entry_premium"]) * qty
+                    pct = (lp / t["entry_premium"] - 1) * 100
+                    stop = max(t["sl_price"], t["entry_premium"]) if t["be_armed"] else t["sl_price"]
+                    priced = t["index"] == idx_name and t["expiry"] == str(expiry)[:10]
+                    pc_ = st.columns(w)
+                    pc_[0].markdown(f"<div class='pos-n'>{contract_name(t)}</div><div class='sub'>{t['source']} · {t['product']}"
+                                    f"{' · BE armed' if t['be_armed'] else ''}{'' if priced else ' · switch expiry to reprice'}</div>",
+                                    unsafe_allow_html=True)
+                    pc_[1].markdown(f"<div class='lad-c'>{qty}</div>", unsafe_allow_html=True)
+                    pc_[2].markdown(f"<div class='lad-c'>{t['entry_premium']:,.2f}</div>", unsafe_allow_html=True)
+                    pc_[3].markdown(f"<div class='lad-c'>{lp:,.2f}</div>", unsafe_allow_html=True)
+                    pc_[4].markdown(f"<div class='lad-c {pc(pnl)}'>{pnl:+,.0f}</div>", unsafe_allow_html=True)
+                    pc_[5].markdown(f"<div class='lad-c {pc(pct)}'>{pct:+.1f}%</div>", unsafe_allow_html=True)
+                    pc_[6].markdown(f"<div class='lad-c'>{stop:,.2f}</div>", unsafe_allow_html=True)
+                    pc_[7].markdown(f"<div class='lad-c'>{t['tp_price']:,.2f}</div>", unsafe_allow_html=True)
+                    if pc_[8].button("Exit", key=f"exit_{t['id']}"):
+                        px = (mark_price(opt_row(lm, t["strike"], t["opt"]), SLIPPAGE_PCT) if priced else None) or lp
+                        close_trade(t, px, "MANUAL EXIT", now, l_spot if priced else None)
+                        save_ledger(led)
+                        rerun_desk()
+                with st.expander("Modify stop / target of a position"):
+                    _ids = [t["id"] for t in open_t]
+                    _mid = st.selectbox("Position", _ids, key="mod_id")
+                    _t = next(t for t in open_t if t["id"] == _mid)
+                    _lp = _t.get("last_premium") or _t["entry_premium"]
+                    n_sl = st.number_input("New stop (premium)", min_value=0.05, value=float(_t["sl_price"]), step=0.05, key=f"mod_sl_{_mid}")
+                    n_tp = st.number_input("New target (premium)", min_value=0.05, value=float(_t["tp_price"]), step=0.05, key=f"mod_tp_{_mid}")
+                    if st.button("Update", key="mod_go"):
+                        if not (n_sl < _lp < n_tp):
+                            st.error(f"Need stop < current price ({_lp:,.2f}) < target.")
+                        else:
+                            _t["sl_price"], _t["tp_price"] = round(n_sl, 2), round(n_tp, 2)
+                            save_ledger(led)
+                            rerun_desk()
+
+        elif nav == "Orders":
+            orders = list(reversed(led["orders"]))
+            if not orders:
+                st.caption("No orders yet.")
+            else:
+                show_df(pd.DataFrame([{"Time": o["time"], "ID": o["id"], "Instrument": contract_name(o), "Side": "BUY",
+                                       "Type": o["type"], "Qty": o["lots"] * o["lot_size"], "Limit": o["limit"], "Fill": o["fill"],
+                                       "Status": o["status"], "Note": o["note"], "Source": o["source"]} for o in orders]), hide_index=True)
+                for o in [o for o in orders if o["status"] == "PENDING"]:
+                    oc = st.columns([4, 1])
+                    oc[0].markdown(f"<div class='pos-n'>PENDING · {contract_name(o)} · limit {o['limit']:,.2f} · {o['lots']} lot(s)</div>", unsafe_allow_html=True)
+                    if oc[1].button("Cancel", key=f"cancel_{o['id']}"):
+                        cancel_order(led, o["id"])
+                        save_ledger(led)
+                        rerun_desk()
+
+        elif nav == "Trades":
+            if led["trades"]:
+                show_df(trades_to_dhan_rows(led["trades"]).iloc[::-1], hide_index=True)
+            else:
+                st.caption("No trades yet.")
+
+        else:
+            closed = [t for t in led["trades"] if t["status"] == "CLOSED"]
+            s = perf_summary(led)
+            s1, s2, s3, s4, s5 = st.columns(5)
+            s1.metric("WIN RATE", f"{s['Win rate (%)']:.0f}%")
+            s2.metric("EXPECTANCY / TRADE", f"₹{s['Expectancy per trade (₹)']:+,.0f}")
+            s3.metric("PROFIT FACTOR", str(s["Profit factor"]))
+            s4.metric("MAX DRAWDOWN", f"₹{s['Max drawdown (₹)']:,.0f}")
+            s5.metric("CHARGES PAID", f"₹{s['Charges paid (₹)']:,.0f}")
+            if closed:
+                why = pd.Series([t["exit_reason"] for t in closed]).value_counts()
+                st.caption("Exit reasons: " + " | ".join(f"{k}: {v}" for k, v in why.items()))
+                curve = pd.DataFrame({"Net P&L ₹ (cumulative)": pd.Series(
+                    [t["pnl"] for t in sorted(closed, key=lambda x: x.get("exit_ts") or 0)]).cumsum()})
+                if len(curve) >= 2:
+                    st.line_chart(curve)
+            x = generate_excel_report(led)
+            dx1, dx2 = st.columns(2)
+            if x:
+                dx1.download_button("📊 Excel journal", x, file_name=f"Vipul_Options_Journal_{now.date().isoformat()}.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            elif led["trades"]:
+                dx1.download_button("📄 CSV journal (install openpyxl for Excel)", trades_to_dhan_rows(led["trades"]).to_csv(index=False),
+                                    file_name=f"Vipul_Options_Journal_{now.date().isoformat()}.csv", mime="text/csv")
+            dx2.download_button("💾 Ledger backup (JSON)", json.dumps(led), file_name="paper_options_ledger_backup.json",
+                                mime="application/json")
+            up = st.file_uploader("Restore ledger from backup JSON", type="json", key="ledger_upload")
+            if up is not None and st.button("♻ RESTORE LEDGER", key="restore_go"):
+                try:
+                    new = json.load(up)
+                    assert isinstance(new.get("trades"), list)
+                    new.setdefault("initial_capital", INITIAL_CAPITAL)
+                    new.setdefault("orders", [])
+                    st.session_state["paper_ledger"] = new
+                    save_ledger(new)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Could not restore: {e}")
+            st.caption("The ledger lives in the server's temp folder, so a Streamlit Cloud restart can erase it. Download a backup regularly.")
+            if st.checkbox("I want to reset the ledger and delete all paper trades and orders", key="reset_ok") and st.button("🗑 RESET LEDGER", key="reset_go"):
+                st.session_state["paper_ledger"] = new_ledger()
+                save_ledger(st.session_state["paper_ledger"])
+                st.rerun()
+
+
+    if live_on and hasattr(st, "fragment"):
+        st.fragment(run_every=int(live_sec))(render_desk)()
+    else:
+        render_desk()
+
