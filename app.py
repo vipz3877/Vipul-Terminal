@@ -251,7 +251,7 @@ class DhanLiveStreamWorker:
                 self.connected = True
                 self.last_err = ""
             sub_msg = {
-                "RequestCode": 15,  # 15 = Ticker/Quote stream for index & derivatives
+                "RequestCode": 15,
                 "InstrumentCount": 1,
                 "InstrumentList": [{"ExchangeSegment": seg, "SecurityId": str(scrip)}],
             }
@@ -268,15 +268,12 @@ class DhanLiveStreamWorker:
                 feed_code, _msg_len, _ex_seg, _sec_id = struct.unpack("<BHBI", message[:8])
                 now_ts = time.time()
                 if feed_code == 2 and len(message) >= 16:
-                    # Ticker Packet: float32 LTP (8..12), uint32 LTT (12..16)
                     ltp, _ltt = struct.unpack("<fI", message[8:16])
                     self._record_tick(ltp, 1.0, None, None, now_ts)
                 elif feed_code in (4, 8) and len(message) >= 34:
-                    # Quote / Full Packet: LTP, LTQ, LTT, ATP, Vol, TotBuyQty, TotSellQty
                     ltp, ltq, _ltt, _atp, _vol, tot_buy, tot_sell = struct.unpack("<fHIfIII", message[8:34])
                     bid_p = ask_p = None
                     if feed_code == 8 and len(message) >= 162:
-                        # First 20-byte depth level starts at offset 62
                         _bq, _aq, _bo, _ao, bid_p, ask_p = struct.unpack("<IIHHff", message[62:82])
                     with self.lock:
                         denom = float(tot_buy + tot_sell)
@@ -315,7 +312,6 @@ class DhanLiveStreamWorker:
         if not math.isfinite(ltp) or ltp <= 0:
             return
         with self.lock:
-            # Lee-Ready Tick Classification: Quote rule first, then Tick-Test rule
             if bid and ask and bid > 0 and ask >= bid:
                 mid = 0.5 * (bid + ask)
                 if ltp > mid:
@@ -370,7 +366,6 @@ def compute_chain_microstructure(near, spot, step):
     Chain-native Order Book / Quote-Location Microstructure (works even without WebSocket).
     Computes where traded LTP sits inside the [Bid, Ask] spread across near-ATM Calls and Puts:
       Quote Location = (LTP - Bid) / (Ask - Bid) in [0, 1].
-      > 0.55 means takers are aggressively lifting the Ask; < 0.45 means takers are hitting the Bid.
     """
     atm_band = near[(near["Strike"] >= spot - 3 * step) & (near["Strike"] <= spot + 3 * step)].copy()
     if atm_band.empty:
@@ -393,7 +388,6 @@ def compute_chain_microstructure(near, spot, step):
 
     ce_agg, ce_sp = side_aggression("CE")
     pe_agg, pe_sp = side_aggression("PE")
-    # Net Option-Taker Flow: Calls lifted at Ask (+) vs Puts lifted at Ask (-)
     net_taker = round((ce_agg - pe_agg) * 100.0, 1)
     if net_taker >= 8.0:
         label = "CALL TAKERS LIFTING ASK (Bullish Aggression)"
@@ -471,7 +465,6 @@ def log_and_reconcile_signals(idx_name, expiry, m, sig, now_ist):
     conn = sqlite3.connect(_db_path(), timeout=10)
     conn.row_factory = sqlite3.Row
     try:
-        # 1. Reconcile open signals for this index
         open_rows = conn.execute(
             "SELECT * FROM signal_audit WHERE idx_name = ? AND outcome = 'OPEN'", (idx_name,)
         ).fetchall()
@@ -514,7 +507,6 @@ def log_and_reconcile_signals(idx_name, expiry, m, sig, now_ist):
                 WHERE id=?
             """, (hi, lo, spot, round(mfe, 2), round(mae, 2), mfe_r, mae_r, realized_r, outcome, closed_ts, r["id"]))
 
-        # Helper to insert a new signal if not recently logged
         def _maybe_insert(source, direction, target, sl, conf):
             if direction not in ("BUY", "SELL") or target is None or sl is None:
                 return
@@ -538,11 +530,9 @@ def log_and_reconcile_signals(idx_name, expiry, m, sig, now_ist):
                 spot, float(target), float(sl), round(risk_pts, 2), spot, spot, spot
             ))
 
-        # 2. Log Risk-Validated AI Council signal if active
         if sig and sig.get("signal") in ("BUY", "SELL"):
             _maybe_insert("AI_VALIDATED", sig["signal"], sig["target"], sig["sl"], sig.get("confidence", 0))
 
-        # 3. Log Dual-Force Engine Gamma Blast if active and structural walls exist
         if m.get("engine_signal") in ("BUY", "SELL"):
             res, sup = m["struct"]["res"], m["struct"]["sup"]
             buf = m["buf"]
@@ -1893,10 +1883,12 @@ def chain_health(df, spot):
     if len(df) < 5:
         messages.append(f"Only {len(df)} strikes returned.")
     for side in ("CE", "PE"):
-        if coverage.get(f"{side}_OI_Present", 0) < 0.8:
-            messages.append(f"{side} OI field coverage is only {coverage.get(f'{side}_OI_Present', 0):.0%} near spot.")
-        if coverage.get(f"{side}_PrevOI_Present", 0) < 0.8:
-            messages.append(f"{side} previous-OI coverage is only {coverage.get(f'{side}_PrevOI_Present', 0):.0%}; OI-change interpretations are limited.")
+        oi_cov = coverage.get(f"{side}_OI_Present", 0)
+        prev_cov = coverage.get(f"{side}_PrevOI_Present", 0)
+        if oi_cov < 0.8:
+            messages.append(f"{side} OI field coverage is only {oi_cov:.0%} near spot.")
+        if prev_cov < 0.8:
+            messages.append(f"{side} previous-OI coverage is only {prev_cov:.0%}; OI-change interpretations are limited.")
         live = near[near[f"{side}_OI"] > 0]
         if len(live) >= 3:
             uninit_frac = ((live[f"{side}_PrevOI"] == 0) & (live[f"{side}_Vol"] < live[f"{side}_OI"])).mean()
@@ -2200,7 +2192,6 @@ if df.empty or spot == 0:
     st.warning("Option chain returned no data (market closed or invalid expiry).")
     st.stop()
 
-# If WebSocket has a fresh tick (<15s old) within 1% of chain spot, display the live tick alongside chain spot
 if ws_snap["connected"] and ws_snap["latest_ltp"] > 0 and (ws_snap["last_age_sec"] or 999) < 15:
     if abs(ws_snap["latest_ltp"] - spot) / spot < 0.01:
         spot = float(ws_snap["latest_ltp"])
@@ -2274,7 +2265,7 @@ scan, smeta = premium_scanner(m, horizon_days, iv_shock, skew=use_skew)
 
 try:
     log_and_reconcile_signals(idx_name, expiry, m, sig, now_ist)
-except Exception as _db_err:
+except Exception:
     pass
 
 # ============================================================
@@ -2358,7 +2349,7 @@ with tab1:
     d1, d2, d3, d4 = st.columns(4)
     d1.metric("CE EXITS", f"{es['ce_exit_pct']:.1f}%", f"{es['ce_exits']:+,.0f} qty", delta_color="off")
     d2.metric("PE BUILDS", f"{es['pe_build_pct']:.1f}%", f"{es['pe_build']:+,.0f} qty", delta_color="off")
-    d3.metric("PE EXITS", f"{es['pe_exit_pct']:.1f}%", f"{es['pe_exit_pct']:.1f}% ({es['pe_exits']:+,.0f})", delta_color="off")
+    d3.metric("PE EXITS", f"{es['pe_exit_pct']:.1f}%", f"{es['pe_exits']:+,.0f} qty", delta_color="off")
     d4.metric("CE BUILDS", f"{es['ce_build_pct']:.1f}%", f"{es['ce_build']:+,.0f} qty", delta_color="off")
     f1, f2, f3 = st.columns(3)
     f1.metric("BULL FORCE (PE build + CE exit)", f"{es['bull_force']:.1f}")
@@ -2419,7 +2410,7 @@ with tab2:
     if cdf.empty:
         st.info("No strikes in selected window.")
     else:
-        cdf["Strike_Label"] = cdf["Strike"].map(lambda k: f"{int(k)}")
+        _gflip_lbl = f"{m['gamma_flip']:,.1f}" if m["gamma_flip"] else "None in window"
         gcol1, gcol2 = st.columns(2)
         with gcol1:
             st.markdown("##### 1. Signed Net Dealer GEX per Strike")
@@ -2427,7 +2418,7 @@ with tab2:
             st.bar_chart(cdf.set_index("Strike")[["Net_GEX"]])
         with gcol2:
             st.markdown("##### 2. Call GEX vs Put GEX Split")
-            st.caption(f"Gamma Flip Level: {f'{m[\"gamma_flip\"]:,.1f}' if m['gamma_flip'] else 'None in window'} | Peak Gamma Strike: {m['gamma_strike']:,.0f}")
+            st.caption(f"Gamma Flip Level: {_gflip_lbl} | Peak Gamma Strike: {m['gamma_strike']:,.0f}")
             st.bar_chart(cdf.set_index("Strike")[["CE_GEX", "PE_GEX"]])
 
         vcol1, vcol2 = st.columns(2)
@@ -2487,14 +2478,16 @@ with tab4:
                                 (ecol2, "seller", "SELLER EXHAUSTION (downtrend fading)")):
             side_ = ex[key]
             scol = "#ff1744" if side_["flag"] == "CONFIRMED" else "#ffab00" if side_["flag"] in ("WATCH", "EARLY") else "#90a4ae"
-            rows = "".join(
-                f'<div class="agent">{"🔴" if v >= 1 else "🟠" if v >= 0.5 else "⚪"} <b>{esc(n)}:</b> {esc(d)}</div>'
-                for n, v, d in side_["signals"])
+            rows_html = []
+            for n, v, d in side_["signals"]:
+                dot = "🔴" if v >= 1 else "🟠" if v >= 0.5 else "⚪"
+                rows_html.append(f'<div class="agent">{dot} <b>{esc(n)}:</b> {esc(d)}</div>')
+            rows_str = "".join(rows_html)
             col.markdown(f"""<div class="bbg-panel" style="border:2px solid {scol};">
               <div class="bbg-title">{title}</div>
               <div class="bbg-big" style="color:{scol};">{side_['score']}/100</div>
               <div class="bbg-desc" style="color:{scol};">{esc(side_['status'])}</div>
-              {rows}</div>""", unsafe_allow_html=True)
+              {rows_str}</div>""", unsafe_allow_html=True)
         st.caption(f"Exhaustion is a warning, not a reversal call. CONFIRMED needs score >= {EXH_ALERT} AND a price turn of "
                    "at least 0.1σ off the window extreme. A BUY/SELL is blocked when its own side is CONFIRMED.")
     with st.expander("SESSION HISTORY (spot / basis / IV / PCR / GEX)"):
@@ -2540,11 +2533,12 @@ with tab5:
         b = top.iloc[0]
         sgn = 1 if b["Side"] == "CE" else -1
         s1 = m["spot"] + sgn * smeta["sd"]
+        _need2_lbl = ">4" if pd.isna(b["Needs2x(σ)"]) else f"{b['Needs2x(σ)']:.2f}"
         st.markdown(f"""<div class="bbg-panel">
           <div class="bbg-title">Top pick walk-through: {m['spot']:,.0f} spot, {b['Strike']:,.0f} {b['Side']} ({b['Money']}) at ₹{b['LTP']:,.1f}</div>
           <div class="agent">If spot moves 1σ in favour to ≈ <b>{s1:,.0f}</b>: premium ≈ <b>{b['x1σ']:.2f}x</b> (₹{b['LTP']*b['x1σ']:,.1f}); delta rises {b['Delta']:.2f} → {b['Delta@1σ']:.2f}, which is the gamma effect (OTM turning into ITM/ATM).</div>
           <div class="agent">With IV crush −{smeta['crush']:.0f}% on that same move: <b>{b['x1σ crush']:.2f}x</b> (₹{b['LTP']*b['x1σ crush']:,.1f}). With IV spike +{smeta['crush']:.0f}%: <b>{b['x1σ spike']:.2f}x</b> (₹{b['LTP']*b['x1σ spike']:,.1f}).</div>
-          <div class="agent">If it goes the wrong way by 0.5σ: <b>{b['xWrong']:.2f}x</b> (₹{b['LTP']*b['xWrong']:,.1f}). Spot move needed just to double the premium: <b>{('>4' if pd.isna(b['Needs2x(σ)']) else f"{b['Needs2x(σ)']:.2f}")}σ</b>.</div>
+          <div class="agent">If it goes the wrong way by 0.5σ: <b>{b['xWrong']:.2f}x</b> (₹{b['LTP']*b['xWrong']:,.1f}). Spot move needed just to double the premium: <b>{_need2_lbl}σ</b>.</div>
         </div>""", unsafe_allow_html=True)
 
 
@@ -2557,11 +2551,16 @@ with tab6:
         for i in news_items:
             link = i["link"] if i["link"].startswith(("http://", "https://")) else ""
             t = esc(i["title"])
-            t = f'<a href="{html.escape(link, quote=True)}" target="_blank" style="color:#ddd;">{t}</a>' if link else t
-            rows.append(f'<div class="agent"><b>{esc(age_label(i["age_min"]))}</b> · {esc(i["source"])} — {t}</div>')
+            if link:
+                safe_link = html.escape(link, quote=True)
+                t = f'<a href="{safe_link}" target="_blank" style="color:#ddd;">{t}</a>'
+            age_txt = esc(age_label(i["age_min"]))
+            src_txt = esc(i["source"])
+            rows.append(f'<div class="agent"><b>{age_txt}</b> · {src_txt} — {t}</div>')
+        rows_joined = "".join(rows)
         st.markdown(f"""<div class="bbg-panel">
           <div class="bbg-title">Headline tone (keyword backstop): <span style="color:{tcol};">{tone:+d}</span></div>
-          {''.join(rows)}</div>""", unsafe_allow_html=True)
+          {rows_joined}</div>""", unsafe_allow_html=True)
     else:
         st.warning("No headlines available. " + " | ".join(news_status))
     with st.expander("NEWS FEED STATUS"):
@@ -2638,26 +2637,28 @@ with tab7:
         st.info("No directional BUY/SELL signals have triggered yet in this SQLite ledger. Signals will appear here automatically as they fire.")
     else:
         closed = ldf[ldf["outcome"].isin(["TARGET_HIT", "SL_HIT", "EOD_CLOSED"])]
-        wins = (closed["outcome"] == "TARGET_HIT").sum()
-        losses = (closed["outcome"] == "SL_HIT").sum()
+        wins = int((closed["outcome"] == "TARGET_HIT").sum())
+        losses = int((closed["outcome"] == "SL_HIT").sum())
         decided = wins + losses
         win_rate = (wins / decided * 100.0) if decided > 0 else 0.0
         avg_mfe_r = float(ldf["mfe_r"].mean()) if not ldf.empty else 0.0
         avg_mae_r = float(ldf["mae_r"].mean()) if not ldf.empty else 0.0
         expectancy_r = float(closed["realized_r"].mean()) if not closed.empty else 0.0
+        open_cnt = int((ldf["outcome"] == "OPEN").sum())
 
         a1, a2, a3, a4 = st.columns(4)
-        a1.metric("TOTAL SIGNALS LOGGED", f"{len(ldf)}", f"Open: {(ldf['outcome'] == 'OPEN').sum()}", delta_color="off")
+        a1.metric("TOTAL SIGNALS LOGGED", f"{len(ldf)}", f"Open: {open_cnt}", delta_color="off")
         a2.metric("DECIDED WIN RATE", f"{win_rate:.1f}%", f"{wins} Target / {losses} SL", delta_color="off")
         a3.metric("AVG MFE / MAE (R)", f"+{avg_mfe_r:.2f}R / -{avg_mae_r:.2f}R", "Excursion ratio", delta_color="off")
         a4.metric("REALIZED EXPECTANCY", f"{expectancy_r:+.2f}R", f"across {len(closed)} closed signals", delta_color="off")
 
-        # Regime breakdown
         pos_df = ldf[ldf["gex_regime"].str.contains("POSITIVE", na=False)]
         neg_df = ldf[ldf["gex_regime"].str.contains("NEGATIVE", na=False)]
+        pos_mfe = float(pos_df["mfe_r"].mean()) if not pos_df.empty else 0.0
+        neg_mfe = float(neg_df["mfe_r"].mean()) if not neg_df.empty else 0.0
         st.caption(
-            f"Regime Split — Positive Gamma Signals: {len(pos_df)} (Avg MFE +{pos_df['mfe_r'].mean() if not pos_df.empty else 0:.2f}R) | "
-            f"Negative Gamma Signals: {len(neg_df)} (Avg MFE +{neg_df['mfe_r'].mean() if not neg_df.empty else 0:.2f}R)"
+            f"Regime Split — Positive Gamma Signals: {len(pos_df)} (Avg MFE +{pos_mfe:.2f}R) | "
+            f"Negative Gamma Signals: {len(neg_df)} (Avg MFE +{neg_mfe:.2f}R)"
         )
 
         disp_cols = [
