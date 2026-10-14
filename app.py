@@ -1,15 +1,15 @@
 """
-VIPUL BLOOMBERG PROFESSIONAL TERMINAL v8.2
-Analysis terminal: Dual-Force engine (net-capitulation aware) + option-chain cross-check
+VIPUL BLOOMBERG PROFESSIONAL TERMINAL v8.1
+Analysis terminal: Dual-Force engine (net-capitulation aware) + Jobber microstructure + option-chain cross-check
 + exhaustion monitor + live news + day levels + premium scanner + AI council.
 No trading features: this app places no orders and keeps no paper-trading ledger.
 
-v8.2 (after comparing with an independent "v8.0 Pro" script):
+v8.1 (after comparing with an independent "v8.0 Pro" script):
  - Time to expiry is continuous (decays correctly on expiry day); calendar (days/365) or trading (252 x 375 min) basis selectable.
- - Option-chain API calls are rate-limited; cross-session locking is platform-dependent.
- - Previous close uses the latest validated completed daily candle, then an explicit quote net-change fallback; dependent calculations stay disabled if unknown.
- - Premium scanner: optional spot-vol scenario assumption is clearly configurable and is not a forecast guarantee.
- - Removed unwanted microstructure panel; added AI verdict expiry and stricter reference-close handling.
+ - Option-chain API calls are spaced across ALL browser sessions with a real file lock (fcntl), not per session.
+ - Previous close defaults to "unknown" (0) instead of a stale hard-coded index level; day-change terms are skipped when unknown.
+ - Premium scanner: optional spot-vol link (IV falls when spot rises, rises when spot falls) applied consistently to every move column.
+ - Fixed a crash when the favoured side has no priced option.
 """
 
 import os
@@ -41,7 +41,7 @@ try:
 except ImportError:
     Groq = None
 
-st.set_page_config(page_title="Vipul Bloomberg Terminal v8.2", layout="wide")
+st.set_page_config(page_title="Vipul Bloomberg Terminal v8.1", layout="wide")
 
 # ============================================================
 # CSS
@@ -127,7 +127,6 @@ RISK_FREE = 0.065         # annual rate used in the Black-Scholes repricer
 MIN_PREMIUM = 5.0         # ignore options trading below this premium (points)
 
 AI_RETRY_SEC = 60             # minimum gap between AI calls after a failure
-AI_VERDICT_MAX_AGE_SEC = 600   # never present an AI verdict older than 10 minutes as current
 
 # ---- live news ----
 NEWS_MAX_AGE_H = 24       # headlines older than this are ignored
@@ -251,54 +250,31 @@ def fetch_option_chain(scrip, seg, expiry, token, client_id):
     return _fetch_chain_raw(scrip, seg, expiry, token, client_id)
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def fetch_prev_close(scrip, seg, token, client_id):
-    """Return the latest valid completed daily close before today's IST date.
-    Quote fallback is allowed only when Dhan explicitly supplies both LTP and net_change.
-    A genuine zero net_change is valid; a missing field is not treated as zero.
-    """
-    today = datetime.now(IST).date()
-    candle_error = "not attempted"
+    """Previous close = close of the last COMPLETED daily candle before today (IST). Falls back to LTP - net_change.
+    ohlc.close is deliberately NOT used: during/after the session it equals today's last price."""
+    err = ""
     try:
         candles = fetch_daily_candles(scrip, seg, token, client_id)
-        completed = []
-        for candle in candles or []:
-            try:
-                candle_day = date.fromisoformat(str(candle.get("date", ""))[:10])
-                close = float(candle.get("c"))
-            except (TypeError, ValueError, OverflowError):
-                continue
-            if candle_day < today and math.isfinite(close) and close > 0:
-                completed.append((candle_day, close))
-        if completed:
-            candle_day, close = max(completed, key=lambda item: item[0])
-            return round(close, 2), f"Dhan historical daily candle: {candle_day.isoformat()} close"
-        candle_error = "no valid completed daily candle before today's date"
-    except Exception as exc:
-        candle_error = str(exc)[:180]
-
-    quote_error = "quote not attempted"
+        today = datetime.now(IST).date().isoformat()
+        prior = [c for c in candles if c["date"] < today]
+        if prior:
+            return round(prior[-1]["c"], 2), f"daily candle close {prior[-1]['date']}"
+        err = "no completed candle before today"
+    except Exception as e:
+        err = str(e)[:100]
     try:
-        response = requests.post(
-            f"{BASE_URL}/marketfeed/quote",
-            headers=auth_headers(token, client_id),
-            json={seg: [scrip]}, timeout=10,
-        )
-        check(response)
-        payload = response.json() or {}
-        quote = ((payload.get("data") or {}).get(seg) or {}).get(str(scrip)) or {}
-        raw_ltp, raw_net = quote.get("last_price"), quote.get("net_change")
-        if raw_ltp is None or raw_net is None:
-            quote_error = "quote omitted last_price or net_change"
-        else:
-            ltp, net = float(raw_ltp), float(raw_net)
-            candidate = ltp - net
-            if math.isfinite(ltp) and ltp > 0 and math.isfinite(net) and math.isfinite(candidate) and candidate > 0:
-                return round(candidate, 2), "Dhan quote: LTP - explicitly supplied net_change (fallback)"
-            quote_error = "quote values were non-finite or produced a non-positive close"
-    except Exception as exc:
-        quote_error = str(exc)[:180]
-    return None, f"Previous close unavailable; daily candles: {candle_error}; quote fallback: {quote_error}"
+        r = requests.post(f"{BASE_URL}/marketfeed/quote", headers=auth_headers(token, client_id),
+                          json={seg: [scrip]}, timeout=10)
+        check(r)
+        q = (r.json().get("data") or {}).get(seg, {}).get(str(scrip)) or {}
+        ltp, net = _n(q.get("last_price")), _n(q.get("net_change"))
+        if ltp > 0 and net != 0:
+            return round(ltp - net, 2), "quote: LTP - net_change"
+        return None, f"candles: {err}; quote had no net_change"
+    except Exception as e:
+        return None, f"candles: {err}; quote: {str(e)[:80]}"
 
 
 # ---------------- LIVE NEWS ----------------
@@ -414,7 +390,7 @@ def parse_dte(expiry_str):
 
 
 # ============================================================
-# ANALYSIS ENGINE
+# ANALYSIS & JOBBER MICROSTRUCTURE ENGINE
 # ============================================================
 def years_to_expiry(expiry_str, now=None):
     """
@@ -585,6 +561,36 @@ def detect_gamma_blast(near):
     return "BALANCED ACCUMULATION", "WAIT", "Market in range compression. Awaiting trigger."
 
 
+def calculate_jobber_microstructure(df, spot):
+    df = df.copy()
+    df["dist"] = (df["Strike"] - spot).abs()
+    ladder = df.sort_values("dist").head(10).sort_values("Strike").copy()
+
+    if ladder.empty:
+        return {"ladder_imbalance": 0.0, "pocket_support": spot, "micro_turn": "NEUTRAL AUCTION"}
+
+    total_ce = ladder["CE_OI"].sum()
+    total_pe = ladder["PE_OI"].sum()
+    ladder_imbalance = (total_pe - total_ce) / (total_ce + total_pe) if (total_ce + total_pe) > 0 else 0.0
+
+    ladder["Net_OI_Flow"] = ladder["PE_OI_Chg"] - ladder["CE_OI_Chg"]
+    pocket_support = float(ladder.loc[ladder["Net_OI_Flow"].idxmax(), "Strike"])
+
+    ce_unwind_sum = ladder[ladder["CE_OI_Chg"] < 0]["CE_OI_Chg"].sum()
+    pe_unwind_sum = ladder[ladder["PE_OI_Chg"] < 0]["PE_OI_Chg"].sum()
+
+    if ce_unwind_sum < -5000 and pe_unwind_sum > -2000:
+        micro_turn_signal = "ABSORPTION BULLISH (Shorts Trapped)"
+    elif pe_unwind_sum < -5000 and ce_unwind_sum > -2000:
+        micro_turn_signal = "ABSORPTION BEARISH (Longs Trapped)"
+    else:
+        micro_turn_signal = "NEUTRAL AUCTION (Balanced)"
+
+    return {
+        "ladder_imbalance": round(float(ladder_imbalance), 3),
+        "pocket_support": pocket_support,
+        "micro_turn": micro_turn_signal,
+    }
 
 
 def find_structure(df, spot, step, exp_move, call_wall, put_wall):
@@ -651,6 +657,7 @@ def compute_metrics(df, spot, prev_close, expiry_str, step):
     status, signal, desc = detect_gamma_blast(near)
     engine = engine_sums(near)
     struct = find_structure(df, spot, step, exp_move, call_wall, put_wall)
+    jobber = calculate_jobber_microstructure(df, spot)
 
     return {
         "df": df, "near": near, "spot": spot, "step": step, "pcr": pcr,
@@ -661,7 +668,7 @@ def compute_metrics(df, spot, prev_close, expiry_str, step):
         "gamma_strike": gamma_strike, "call_wall": call_wall, "put_wall": put_wall, "max_pain": max_pain,
         "ce_trap": ce_trap, "pe_trap": pe_trap,
         "score": score, "bias": bias, "status": status, "engine_signal": signal, "desc": desc,
-        "engine": engine, "struct": struct,
+        "jobber": jobber, "engine": engine, "struct": struct,
         "iv_gap": iv_gap, "atm_iv_ce": ce_iv, "atm_iv_pe": pe_iv,
     }
 
@@ -775,6 +782,7 @@ def run_council(m, vel, news, api_key, model):
 
 MARKET DATA:
 - Spot: {m['spot']:.2f} | PCR: {m['pcr']:.3f} | Bias: {m['bias']} (score {m['score']}/100)
+- Jobber Microstructure: Ladder Imbalance={m['jobber']['ladder_imbalance']}, Pocket Support={m['jobber']['pocket_support']}, Micro-Turn={m['jobber']['micro_turn']}
 - Engine status: {m['status']} | OI battle: {m['battle']}
 - Dual-Force flow (near-spot strikes only, % = share of that side's near-spot OI):
   CE exits {eg['ce_exits']:,.0f} ({eg['ce_exit_pct']:.1f}%) | CE builds {eg['ce_build']:,.0f} ({eg['ce_build_pct']:.1f}%) | CE net flow {eg['ce_net_flow']:+,.0f}
@@ -836,7 +844,7 @@ Return ONLY this JSON:
 # ============================================================
 def chain_checks(m):
     """Independent option-chain reads. v = +1 bullish, -1 bearish, 0 neutral."""
-    e = m["engine"]
+    e, j = m["engine"], m["jobber"]
     checks = []
 
     def add(name, v, detail):
@@ -851,12 +859,14 @@ def chain_checks(m):
     add("Near-spot net OI flow", 1 if gap >= FLOW_EDGE_PCT else -1 if gap <= -FLOW_EDGE_PCT else 0,
         f"PE {pe_pct:+.1f}% vs CE {ce_pct:+.1f}% of near-spot OI")
 
-    total = e["ce_oi_near"] + e["pe_oi_near"]
-    oi_imbalance = (e["pe_oi_near"] - e["ce_oi_near"]) / total if total > 0 else 0.0
-    add("Near-spot OI balance", 1 if oi_imbalance >= 0.10 else -1 if oi_imbalance <= -0.10 else 0,
-        f"{oi_imbalance:+.3f} (PE-heavy is +; positioning context only)")
+    li = j["ladder_imbalance"]
+    add("Ladder OI imbalance", 1 if li >= 0.10 else -1 if li <= -0.10 else 0, f"{li:+.3f} (PE-heavy is +)")
+
+    mt = j["micro_turn"]
+    add("Micro-turn", 1 if "BULLISH" in mt else -1 if "BEARISH" in mt else 0, mt)
 
     add("PCR (whole chain)", 1 if m["pcr"] > 1.2 else -1 if m["pcr"] < 0.8 else 0, f"{m['pcr']:.2f}")
+
     add("Bias score", 1 if m["score"] > 55 else -1 if m["score"] < 45 else 0, f"{m['score']}/100 {m['bias']}")
 
     mp_gap = m["spot"] - m["max_pain"]
@@ -937,54 +947,28 @@ def _candle_date(ts):
     return d
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def fetch_daily_candles(scrip, seg, token, client_id):
-    """Fetch daily OHLC from Dhan v2 POST /charts/historical.
-    Validates parallel arrays and returns normalized records; raises a useful error otherwise.
-    """
+    """Daily OHLC for the index (last ~35 days) from POST /v2/charts/historical. Returns list of dicts."""
     today = datetime.now(IST).date()
     last_err = None
-    for to_date in (today + timedelta(days=1), today):
+    for to_date in (today + timedelta(days=1), today):      # toDate may be exclusive; fall back if rejected
         try:
-            response = requests.post(
-                f"{BASE_URL}/charts/historical",
-                headers=auth_headers(token, client_id),
-                json={
-                    "securityId": str(scrip), "exchangeSegment": seg, "instrument": "INDEX",
-                    "expiryCode": 0, "oi": False,
-                    "fromDate": (today - timedelta(days=45)).isoformat(),
-                    "toDate": to_date.isoformat(),
-                }, timeout=12,
-            )
-            check(response)
-            payload = response.json() or {}
-            data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-            closes = data.get("close") or []
-            timestamps = data.get("timestamp") or []
-            opens, highs, lows = data.get("open") or [], data.get("high") or [], data.get("low") or []
-            if not closes or not timestamps:
-                raise RuntimeError(f"empty/malformed candle response; keys={list(data.keys())[:12]}")
-            count = min(len(closes), len(timestamps), len(opens), len(highs), len(lows))
-            candles = []
-            for i in range(count):
-                try:
-                    day = _candle_date(timestamps[i]).isoformat()
-                    o, h, lo, c = map(float, (opens[i], highs[i], lows[i], closes[i]))
-                    if not all(math.isfinite(v) for v in (o, h, lo, c)) or min(o, h, lo, c) <= 0:
-                        continue
-                    if h < max(o, lo, c) or lo > min(o, h, c):
-                        continue
-                    candles.append({"date": day, "o": o, "h": h, "l": lo, "c": c})
-                except (TypeError, ValueError, OverflowError, IndexError, OSError):
-                    continue
-            if not candles:
-                raise RuntimeError(f"no valid OHLC candles after validation; lengths={len(timestamps)}/{len(opens)}/{len(highs)}/{len(lows)}/{len(closes)}")
-            # Deduplicate by date and return chronological order.
-            by_day = {item["date"]: item for item in candles}
-            return [by_day[day] for day in sorted(by_day)]
-        except Exception as exc:
-            last_err = exc
-    raise RuntimeError(f"Dhan daily candles failed: {last_err}")
+            r = requests.post(f"{BASE_URL}/charts/historical", headers=auth_headers(token, client_id),
+                              json={"securityId": str(scrip), "exchangeSegment": seg, "instrument": "INDEX",
+                                    "expiryCode": 0, "fromDate": (today - timedelta(days=35)).isoformat(),
+                                    "toDate": to_date.isoformat()}, timeout=12)
+            check(r)
+            d = r.json()
+            n = len(d.get("close", []))
+            if n == 0:
+                raise RuntimeError("empty candle response")
+            return [{"date": _candle_date(d["timestamp"][i]).isoformat(), "o": float(d["open"][i]),
+                     "h": float(d["high"][i]), "l": float(d["low"][i]), "c": float(d["close"][i])}
+                    for i in range(n)]
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(f"daily candles failed: {last_err}")
 
 
 def compute_day_levels(candles, spot, sd, m, prev_close_fallback, today_ohlc=None):
@@ -1001,12 +985,6 @@ def compute_day_levels(candles, spot, sd, m, prev_close_fallback, today_ohlc=Non
 
     ref = done[-1] if done else None
     levels = []                      # (name, price, kind)
-
-    if ref is None and (prev_close_fallback is None or not math.isfinite(float(prev_close_fallback)) or float(prev_close_fallback) <= 0):
-        return {"available": False, "table": pd.DataFrame(columns=["Level", "Price", "Dist pts", "Dist σ", "OI confluence"]),
-                "ref_close": None, "basis": "Unavailable: no verified prior close or completed daily candle",
-                "atr": None, "sd": sd, "tol": max(m["step"] * 0.5, 0.15 * sd), "band1": None, "band2": None,
-                "live": live, "moved_sigma": None}
 
     def add(name, price, kind):
         levels.append((name, float(price), kind))
@@ -1062,7 +1040,7 @@ def compute_day_levels(candles, spot, sd, m, prev_close_fallback, today_ohlc=Non
                      "OI confluence": ("★ " + ", ".join(hits)) if hits else ""})
     rows.append({"Level": "◄ SPOT", "Price": spot, "Dist pts": 0.0, "Dist σ": 0.0, "OI confluence": ""})
     tbl = pd.DataFrame(rows).sort_values("Price", ascending=False).reset_index(drop=True)
-    return {"available": True, "table": tbl, "ref_close": c, "basis": basis, "atr": atr, "sd": sd, "tol": tol,
+    return {"table": tbl, "ref_close": c, "basis": basis, "atr": atr, "sd": sd, "tol": tol,
             "band1": (c - sd, c + sd), "band2": (c - 2 * sd, c + 2 * sd), "live": live,
             "moved_sigma": (spot - c) / sd if sd else 0.0}
 
@@ -1338,12 +1316,13 @@ def premium_scanner(m, horizon_days=0.25, iv_shock=15.0, skew=True):
     """
     df, S0, step = m["df"], m["spot"], m["step"]
     atm_iv = m["atm_iv"]
-    sd = daily_sigma(m)                                             # daily 1-sigma in index points
     cal = TIME_BASIS["mode"] == "calendar"
     basis_days = 365.0 if cal else 252.0
     min_t = 10.0 / (basis_days * (1440.0 if cal else 375.0))        # 10 minutes
     T0 = max(m.get("t_years", m["dte"] / 365.0), min_t)
     T1 = max(T0 - horizon_days / basis_days, min_t)
+    # scenario sigma: one daily move, but never more than the option's remaining life allows (expiry day)
+    sd = min(daily_sigma(m), S0 * atm_iv / 100.0 * math.sqrt(T0))
     span = max(2.5 * sd, 8 * step)
     cand = df[(df["Strike"] >= S0 - span) & (df["Strike"] <= S0 + span)]
     res, sup = m["struct"]["res"], m["struct"]["sup"]
@@ -1587,15 +1566,9 @@ nhash = news_hash(news_items)
 
 # ---- AI gating + cache ----
 changed, reason = evaluate_market_state_change(m, vel, nhash)
-_now_ai = datetime.now(IST)
-_last_ai_time = st.session_state.get("last_ai_time")
-_ai_age = (_now_ai - _last_ai_time).total_seconds() if isinstance(_last_ai_time, datetime) else float("inf")
-_ai_stale = _ai_age >= AI_VERDICT_MAX_AGE_SEC
-if _ai_stale and not changed:
-    reason = "VERDICT_EXPIRED"
 _last_try = st.session_state.get("last_ai_attempt")
-_retry_ok = _last_try is None or (_now_ai - _last_try).total_seconds() >= AI_RETRY_SEC
-if force_run or ((changed or _ai_stale) and _retry_ok):
+_retry_ok = _last_try is None or (datetime.now(IST) - _last_try).total_seconds() >= AI_RETRY_SEC
+if force_run or (changed and _retry_ok):
     st.session_state["last_ai_attempt"] = datetime.now(IST)
     ai = run_council(m, vel, news_text, groq_key, groq_model)
     if "error" not in ai:
@@ -1612,18 +1585,12 @@ if force_run or ((changed or _ai_stale) and _retry_ok):
     else:
         err = ai["error"]
         cached = st.session_state.get("last_ai_verdict")
-        # A cached verdict may be shown only while within the configured freshness window.
-        ai = cached if cached and not _ai_stale else {"error": err}
-        gate_label = f"AI ERROR: {err}" + (" (showing fresh cached verdict)" if cached and not _ai_stale else " (no fresh verdict available)")
+        ai = cached if cached else ai
+        gate_label = f"AI ERROR: {err}" + (" (showing cached)" if cached else "")
 else:
-    cached = st.session_state.get("last_ai_verdict")
+    ai = st.session_state.get("last_ai_verdict", {"error": "No verdict yet."})
     t = st.session_state.get("last_ai_time")
-    if cached and not _ai_stale:
-        ai = cached
-        gate_label = f"CACHED {t.strftime('%H:%M:%S') if t else ''} | age {_ai_age:.0f}s"
-    else:
-        ai = {"error": "AI verdict expired; waiting for a fresh successful Groq response."}
-        gate_label = f"STALE / NO CURRENT VERDICT | last success {t.strftime('%H:%M:%S') if t else 'never'}"
+    gate_label = f"CACHED {t.strftime('%H:%M:%S') if t else ''}"
 
 # ---- risk-validated signal + premium scanner ----
 now_ist = datetime.now(IST)
@@ -1709,6 +1676,13 @@ with tab1:
     c11.metric("NET CE OI Δ", f"{m['dce']:+,.0f}")
     c12.metric("NET PE OI Δ", f"{m['dpe']:+,.0f}")
 
+    # ---- JOBBER MICRO-LADDER PANEL ----
+    st.markdown("#### ⚡ JOBBER MICRO-LADDER & ABSORPTION FEED")
+    j1, j2, j3 = st.columns(3)
+    j1.metric("LADDER IMBALANCE", f"{m['jobber']['ladder_imbalance']:+.3f}", "Range: -1.0 to +1.0")
+    j2.metric("MAX PRESSURE POCKET", f"{m['jobber']['pocket_support']:,.0f}", "Closest High-Liquidity Node")
+    j3.metric("MICRO-TURN STATUS", m["jobber"]["micro_turn"])
+
     st.markdown("#### 3-MIN OI VELOCITY (near spot)")
     v1, v2, v3, v4 = st.columns(4)
     v1.metric("CE BUILDS", f"{vel['ce_builds']:,.0f}")
@@ -1732,23 +1706,20 @@ with tab2:
     dl = compute_day_levels(candles, m["spot"], daily_sigma(m), m, prev_close, _today_ohlc)
     if candle_err:
         st.warning(f"Daily candles unavailable ({candle_err[:160]}). Showing sigma bands around the sidebar PREV CLOSE only.")
-    if not dl.get("available", True):
-        st.warning(dl["basis"] + ". Day-change levels are disabled until a valid reference close is available; the rest of the option-chain dashboard remains usable.")
-    else:
-        st.caption(f"Basis: {dl['basis']} | 1σ daily = Spot × ATM IV × √(1/365) ≈ {dl['sd']:,.0f} pts"
-                   + (f" | ATR(14) ≈ {dl['atr']:,.0f} pts" if dl["atr"] else ""))
-        lc1, lc2, lc3 = st.columns(3)
-        lc1.metric("1σ RANGE (68%)", f"{dl['band1'][0]:,.0f} – {dl['band1'][1]:,.0f}")
-        lc2.metric("2σ RANGE (95%)", f"{dl['band2'][0]:,.0f} – {dl['band2'][1]:,.0f}")
-        lc3.metric("MOVE SO FAR", f"{dl['moved_sigma']:+.2f}σ", f"{m['spot'] - dl['ref_close']:+,.0f} pts vs ref close", delta_color="off")
-        show = dl["table"].copy()
-        show["Price"] = show["Price"].map(lambda v: f"{v:,.0f}")
-        show["Dist pts"] = show["Dist pts"].map(lambda v: f"{v:+,.0f}")
-        show["Dist σ"] = show["Dist σ"].map(lambda v: f"{v:+.2f}")
-        show_df(show, hide_index=True)
-        st.caption(f"★ = level within ±{dl['tol']:,.0f} pts of an OI level (wall, max pain, gamma strike): confluence makes a level more meaningful. "
-                   "Pivots: P=(H+L+C)/3, R1=2P−L, S1=2P−H, R2=P+(H−L), S2=P−(H−L). After 15:40 IST the basis is today's completed session. "
-                   "Ranges are probability ranges from IV (normal-return assumption), not guarantees.")
+    st.caption(f"Basis: {dl['basis']} | 1σ daily = Spot × ATM IV × √(1/365) ≈ {dl['sd']:,.0f} pts"
+               + (f" | ATR(14) ≈ {dl['atr']:,.0f} pts" if dl["atr"] else ""))
+    lc1, lc2, lc3 = st.columns(3)
+    lc1.metric("1σ RANGE (68%)", f"{dl['band1'][0]:,.0f} – {dl['band1'][1]:,.0f}")
+    lc2.metric("2σ RANGE (95%)", f"{dl['band2'][0]:,.0f} – {dl['band2'][1]:,.0f}")
+    lc3.metric("MOVE SO FAR", f"{dl['moved_sigma']:+.2f}σ", f"{m['spot'] - dl['ref_close']:+,.0f} pts vs ref close", delta_color="off")
+    show = dl["table"].copy()
+    show["Price"] = show["Price"].map(lambda v: f"{v:,.0f}")
+    show["Dist pts"] = show["Dist pts"].map(lambda v: f"{v:+,.0f}")
+    show["Dist σ"] = show["Dist σ"].map(lambda v: f"{v:+.2f}")
+    show_df(show, hide_index=True)
+    st.caption(f"★ = level within ±{dl['tol']:,.0f} pts of an OI level (wall, max pain, gamma strike): confluence makes a level more meaningful. "
+               "Pivots: P=(H+L+C)/3, R1=2P−L, S1=2P−H, R2=P+(H−L), S2=P−(H−L). After 15:40 IST the basis is today's completed session. "
+               "Ranges are probabilities from IV (assumes normal returns), not guarantees.")
 
 
 with tab3:
@@ -1802,7 +1773,7 @@ with tab4:
     else:
         fav_txt = {"CE": "CALLS (bullish side)", "PE": "PUTS (bearish side)"}.get(fav, "NO CLEAR SIDE - both shown, treat as low edge")
         st.caption(f"Chain lean {lean_now:+d} | status {m['status']} → favoured: {fav_txt}. "
-                   f"1σ daily move ≈ {smeta['sd']:,.0f} pts | horizon {horizon_label} (time left {smeta['T0d']:.1f}d → {smeta['T1d']:.1f}d) | "
+                   f"scenario 1σ move ≈ {smeta['sd']:,.0f} pts | horizon {horizon_label} (time left {smeta['T0d']:.1f}d → {smeta['T1d']:.1f}d) | "
                    f"IV shock ±{smeta['crush']:.0f}%" + (f" | spot-vol link ±{smeta['skew'] * smeta['crush']:.1f}% IV per σ." if smeta["skew"] else "."))
         top = scan[scan["Side"] == fav].head(5) if fav else scan.head(6)
         other = scan[scan["Side"] != fav].head(3) if fav else None
