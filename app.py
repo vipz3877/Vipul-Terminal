@@ -1,19 +1,16 @@
 """
-VIPUL BLOOMBERG PROFESSIONAL TERMINAL v8.1
+VIPUL BLOOMBERG PROFESSIONAL TERMINAL v9.0
 Analysis terminal: Dual-Force engine (net-capitulation aware) + Jobber microstructure + option-chain cross-check
-+ exhaustion monitor + live news + day levels + premium scanner + AI council.
-No trading features: this app places no orders and keeps no paper-trading ledger.
-
-v8.1 (after comparing with an independent "v8.0 Pro" script):
- - Time to expiry is continuous (decays correctly on expiry day); calendar (days/365) or trading (252 x 375 min) basis selectable.
- - Option-chain API calls are spaced across ALL browser sessions with a real file lock (fcntl), not per session.
- - Previous close defaults to "unknown" (0) instead of a stale hard-coded index level; day-change terms are skipped when unknown.
- - Premium scanner: optional spot-vol link (IV falls when spot rises, rises when spot falls) applied consistently to every move column.
- - Fixed a crash when the favoured side has no priced option.
++ exhaustion monitor + live news + day levels + premium scanner + AI council
++ SIGNAL SCORECARD (logs every validated and rejected signal, tracks what spot did next, shows which checks have edge)
++ DATA HEALTH (token expiry, feed freshness, quotes, candles, news, AI, history)
++ ALERTS (Telegram / webhook) and an optional scorecard webhook for durable logging.
+No trading features: this app places no orders. Analysis only, not trading advice.
 """
 
 import os
 import re
+import base64
 import json
 import math
 import html
@@ -41,7 +38,7 @@ try:
 except ImportError:
     Groq = None
 
-st.set_page_config(page_title="Vipul Bloomberg Terminal v8.1", layout="wide")
+st.set_page_config(page_title="Vipul Bloomberg Terminal v9.0", layout="wide")
 
 # ============================================================
 # CSS
@@ -1445,6 +1442,434 @@ def fetch_today_ohlc(scrip, seg, token, client_id):
     return None
 
 
+# ============================================================
+# TOKEN EXPIRY, ALERTS, SIGNAL SCORECARD, DATA HEALTH (v9.0)
+# ============================================================
+SCORECARD_FILE = os.path.join(tempfile.gettempdir(), "bbg_scorecard_v1.json")
+ALERT_FILE = os.path.join(tempfile.gettempdir(), "bbg_alerts_sent_v1.json")
+SIGNAL_DEDUP_MIN = 30        # a same-direction signal is logged at most once per this many minutes
+OUTCOME_HORIZONS = (15, 30, 60)
+HORIZON_TOL_MIN = 10         # a horizon sample counts only if taken within this many minutes after the horizon
+MIN_SAMPLE_FOR_VERDICT = 30  # below this many resolved signals the scorecard says "too few to conclude"
+
+
+def _mins(now):
+    return now.hour * 60 + now.minute
+
+
+def is_trading_day(now):
+    return now.weekday() < 5
+
+
+def _load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _save_json(path, obj):
+    try:
+        with open(path, "w") as f:
+            json.dump(obj, f)
+    except Exception:
+        pass
+
+
+def token_expiry(token):
+    """Expiry (IST) read from the JWT 'exp' claim, or None when the token is not a decodable JWT."""
+    try:
+        payload = token.split(".")[1]
+        data = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        exp = data.get("exp")
+        return datetime.fromtimestamp(float(exp), IST) if exp else None
+    except Exception:
+        return None
+
+
+# ---------------- alerts ----------------
+def _scrub(text, *secrets):
+    text = str(text)
+    for s in secrets:
+        if s:
+            text = text.replace(s, "***")
+    return text
+
+
+def send_alert(text, tg_token="", tg_chat="", webhook=""):
+    """Send to every configured channel. Returns [(channel, ok, detail)]. Never raises and never echoes secrets."""
+    out = []
+    if tg_token and tg_chat:
+        try:
+            r = requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage",
+                              json={"chat_id": tg_chat, "text": text, "disable_web_page_preview": True}, timeout=8)
+            out.append(("telegram", bool(r.ok), "" if r.ok else f"HTTP {r.status_code}"))
+        except Exception as e:
+            out.append(("telegram", False, _scrub(e, tg_token)[:90]))
+    if webhook:
+        try:
+            r = requests.post(webhook, json={"text": text, "content": text}, timeout=8)
+            out.append(("webhook", bool(r.ok), "" if r.ok else f"HTTP {r.status_code}"))
+        except Exception as e:
+            out.append(("webhook", False, _scrub(e, webhook)[:90]))
+    return out
+
+
+def fire_alert(key, text, cooldown_min, cfg):
+    """Send once per cooldown window per key (state kept in a file so reruns and restarts do not re-send)."""
+    if not cfg.get("enabled") or not (cfg.get("tg_token") and cfg.get("tg_chat") or cfg.get("hook")):
+        return []
+    state = _load_json(ALERT_FILE, {})
+    now_ts = time.time()
+    if now_ts - float(state.get(key, 0)) < cooldown_min * 60:
+        return []
+    res = send_alert(text, cfg.get("tg_token", ""), cfg.get("tg_chat", ""), cfg.get("hook", ""))
+    if any(ok for _, ok, _ in res):
+        state[key] = now_ts
+        _save_json(ALERT_FILE, state)
+    return res
+
+
+def signal_alert_text(r):
+    tgt = f"{r['target']:,.0f}" if r.get("target") else "-"
+    sl = f"{r['sl']:,.0f}" if r.get("sl") else "-"
+    rr = f"1:{r['rr']:.2f}" if r.get("rr") else "-"
+    return (f"📣 {r['index']} {r['signal']} @ {r['entry']:,.0f}\nTarget {tgt} | Stop {sl} | R:R {rr}\n"
+            f"AI confidence {r['confidence']}% | chain agreement {r['net']:+d} | {r['status']}\n"
+            f"Own-side exhaustion: {r.get('exh_own_flag') or 'none'} | news tone {r['tone']:+d}\n"
+            f"{r['time']} IST. Analysis only, not trading advice.")
+
+
+def post_webhook(url, payload):
+    if not url:
+        return
+    try:
+        requests.post(url, json=payload, timeout=8)
+    except Exception:
+        pass
+
+
+# ---------------- signal scorecard ----------------
+def load_scorecard():
+    recs = _load_json(SCORECARD_FILE, [])
+    return recs if isinstance(recs, list) else []
+
+
+def save_scorecard(recs):
+    _save_json(SCORECARD_FILE, recs)
+
+
+def _dir(sig):
+    return 1 if sig == "BUY" else -1
+
+
+def make_record(kind, idx_name, expiry, m, sig, ai, tone, now):
+    direction = sig["signal"] if kind == "VALIDATED" else sig["ai_signal"]
+    ex = m.get("exh") or {}
+    ready = bool(ex.get("ready"))
+    own = (ex["buyer"] if direction == "BUY" else ex["seller"]) if ready else None
+    return {
+        "id": hashlib.md5(f"{now.timestamp()}{idx_name}{kind}{direction}".encode()).hexdigest()[:8],
+        "kind": kind, "ts": now.timestamp(), "date": now.date().isoformat(), "time": now.strftime("%H:%M:%S"),
+        "index": idx_name, "expiry": str(expiry)[:10], "signal": direction, "entry": round(float(m["spot"]), 2),
+        "target": sig["target"] if kind == "VALIDATED" else None, "sl": sig["sl"] if kind == "VALIDATED" else None,
+        "rr": sig["rr"] if kind == "VALIDATED" else None, "confidence": sig["confidence"], "net": sig["net"],
+        "lean": sig["lean"], "checks": {c["name"]: c["v"] for c in sig["checks"]},
+        "status": m["status"], "bias": m["score"], "pcr": round(float(m["pcr"]), 3), "atm_iv": round(float(m["atm_iv"]), 2),
+        "sd": round(daily_sigma(m), 1),
+        "exh_buyer": ex["buyer"]["score"] if ready else None, "exh_seller": ex["seller"]["score"] if ready else None,
+        "exh_own_flag": own["flag"] if own else None, "tone": tone, "news_score": ai.get("news_score"),
+        "reason": sig["note"] if kind == "REJECTED" else "",
+        "s15": None, "s30": None, "s60": None, "sclose": None, "first_touch": None, "mfe": 0.0, "mae": 0.0,
+        "samples": 0, "last_sample_ts": None, "max_gap_min": 0.0, "resolved": False, "outcome": "OPEN",
+    }
+
+
+def maybe_log_signal(recs, idx_name, expiry, m, sig, ai, tone, now):
+    """Log a validated signal, or an AI signal the validation rejected (so the filter itself can be judged)."""
+    if not market_open_now(now):
+        return []
+
+    def recent(kind, direction):
+        return any(r["index"] == idx_name and r["kind"] == kind and r["signal"] == direction
+                   and now.timestamp() - r["ts"] < SIGNAL_DEDUP_MIN * 60 for r in recs)
+
+    new = []
+    if sig["signal"] in ("BUY", "SELL"):
+        if not recent("VALIDATED", sig["signal"]):
+            new.append(make_record("VALIDATED", idx_name, expiry, m, sig, ai, tone, now))
+    elif sig["ai_signal"] in ("BUY", "SELL"):
+        if not recent("REJECTED", sig["ai_signal"]):
+            new.append(make_record("REJECTED", idx_name, expiry, m, sig, ai, tone, now))
+    recs.extend(new)
+    return new
+
+
+def update_outcomes(recs, idx_name, spot, now, candles):
+    """
+    Called on every refresh. Samples the spot against open records (excursions, target/stop first touch, 15/30/60-minute
+    marks) and finalises them after the close. Returns (changed, newly_resolved). Outcomes are only as fine as the
+    refresh interval; days when the app was closed are never guessed from the daily high/low (it may pre-date the signal).
+    """
+    changed, resolved_now = False, []
+    today = now.date().isoformat()
+    live = market_open_now(now)
+    closes = {c["date"]: c["c"] for c in (candles or [])}
+    for r in recs:
+        if r["resolved"] or r["index"] != idx_name:
+            continue
+        d = _dir(r["signal"])
+        el = (now.timestamp() - r["ts"]) / 60.0
+        same_day = r["date"] == today
+        if same_day and live:
+            fav = d * (spot - r["entry"])
+            if r["last_sample_ts"]:
+                r["max_gap_min"] = max(r["max_gap_min"], (now.timestamp() - r["last_sample_ts"]) / 60.0)
+            r["last_sample_ts"] = now.timestamp()
+            r["samples"] += 1
+            r["mfe"] = round(max(r["mfe"], fav), 2)
+            r["mae"] = round(max(r["mae"], -fav), 2)
+            if r["first_touch"] is None and r["target"] is not None and r["sl"] is not None:
+                if (d > 0 and spot >= r["target"]) or (d < 0 and spot <= r["target"]):
+                    r["first_touch"] = "TARGET"
+                elif (d > 0 and spot <= r["sl"]) or (d < 0 and spot >= r["sl"]):
+                    r["first_touch"] = "STOP"
+            for h in OUTCOME_HORIZONS:
+                if r[f"s{h}"] is None and h <= el <= h + HORIZON_TOL_MIN:
+                    r[f"s{h}"] = round(spot, 2)
+            changed = True
+        past_close = (r["date"] < today) or (same_day and not live and is_trading_day(now) and _mins(now) >= 15 * 60 + 30)
+        if past_close:
+            if r["date"] in closes:
+                r["sclose"] = round(float(closes[r["date"]]), 2)
+            elif same_day:
+                r["sclose"] = round(spot, 2)          # after the close on the signal day, spot is the closing price
+            r["resolved"] = True
+            if r["first_touch"] in ("TARGET", "STOP"):
+                r["outcome"] = r["first_touch"]
+            elif r["target"] is not None:
+                r["outcome"] = "TIMEOUT"
+            else:
+                r["outcome"] = "RESOLVED"
+            changed = True
+            resolved_now.append(r)
+    return changed, resolved_now
+
+
+def fav_points(r, key):
+    v = r.get(key)
+    return None if v is None else _dir(r["signal"]) * (v - r["entry"])
+
+
+def scorecard_summary(recs):
+    rows = []
+    labels = {"s15": "15 min", "s30": "30 min", "s60": "60 min", "sclose": "Close"}
+    for kind in ("VALIDATED", "REJECTED"):
+        rs = [r for r in recs if r["kind"] == kind]
+        for key, lab in labels.items():
+            vals = [(fav_points(r, key), r["sd"]) for r in rs if r.get(key) is not None]
+            n = len(vals)
+            rows.append({"Type": kind, "Horizon": lab, "n": n,
+                         "Hit % (moved the signal's way)": round(sum(1 for v, _ in vals if v > 0) / n * 100, 1) if n else None,
+                         "Avg move (pts)": round(sum(v for v, _ in vals) / n, 1) if n else None,
+                         "Avg move (σ)": round(sum(v / sd for v, sd in vals if sd) / n, 2) if n else None})
+    return pd.DataFrame(rows)
+
+
+def touch_stats(recs):
+    v = [r for r in recs if r["kind"] == "VALIDATED" and r["target"] is not None]
+    n_t = sum(1 for r in v if r["outcome"] == "TARGET")
+    n_s = sum(1 for r in v if r["outcome"] == "STOP")
+    n_o = sum(1 for r in v if r["outcome"] == "TIMEOUT")
+    n_open = sum(1 for r in v if not r["resolved"])
+    done = n_t + n_s
+    return {"target": n_t, "stop": n_s, "timeout": n_o, "open": n_open,
+            "target_rate": round(n_t / done * 100, 1) if done else None}
+
+
+def check_edge_table(recs, horizon="s60"):
+    names = sorted({k for r in recs for k in r.get("checks", {})})
+    rows = []
+    for nm in names:
+        ag, dg = [], []
+        for r in recs:
+            fav = fav_points(r, horizon)
+            if fav is None:
+                continue
+            v = r.get("checks", {}).get(nm, 0) * _dir(r["signal"])
+            (ag if v > 0 else dg if v < 0 else []).append(fav > 0)
+        ha = round(sum(ag) / len(ag) * 100, 1) if ag else None
+        hd = round(sum(dg) / len(dg) * 100, 1) if dg else None
+        rows.append({"Check": nm, "n agreed": len(ag), "Hit % when agreed": ha, "n disagreed": len(dg),
+                     "Hit % when disagreed": hd, "Edge (pts)": round(ha - hd, 1) if (ha is not None and hd is not None) else None})
+    return pd.DataFrame(rows)
+
+
+def group_table(recs, keyfn, horizon="s60"):
+    buckets = {}
+    for r in recs:
+        fav = fav_points(r, horizon)
+        if fav is None:
+            continue
+        buckets.setdefault(keyfn(r), []).append((fav, r["sd"]))
+    rows = [{"Group": k, "n": len(v), "Hit %": round(sum(1 for f, _ in v if f > 0) / len(v) * 100, 1),
+             "Avg move (σ)": round(sum(f / sd for f, sd in v if sd) / len(v), 2)} for k, v in sorted(buckets.items(), key=lambda kv: str(kv[0]))]
+    return pd.DataFrame(rows)
+
+
+def cumulative_curve(recs):
+    vals = []
+    for r in sorted([x for x in recs if x["kind"] == "VALIDATED"], key=lambda x: x["ts"]):
+        f = fav_points(r, "s60")
+        f = f if f is not None else fav_points(r, "sclose")
+        if f is not None and r["sd"]:
+            vals.append(f / r["sd"])
+    return pd.Series(vals).cumsum() if vals else pd.Series(dtype=float)
+
+
+def scorecard_to_df(recs):
+    rows = []
+    for r in recs:
+        row = {k: r.get(k) for k in ("id", "kind", "date", "time", "index", "expiry", "signal", "entry", "target", "sl", "rr",
+                                      "confidence", "net", "lean", "status", "bias", "pcr", "atm_iv", "sd", "exh_buyer",
+                                      "exh_seller", "exh_own_flag", "tone", "news_score", "reason", "s15", "s30", "s60",
+                                      "sclose", "first_touch", "mfe", "mae", "samples", "max_gap_min", "resolved", "outcome")}
+        for nm, v in (r.get("checks") or {}).items():
+            row[f"check:{nm}"] = v
+        for key in ("s15", "s30", "s60", "sclose"):
+            row[f"move_{key}"] = fav_points(r, key)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def merge_scorecard(existing, incoming):
+    have = {r["id"] for r in existing}
+    added = [r for r in incoming if isinstance(r, dict) and r.get("id") and r["id"] not in have]
+    existing.extend(added)
+    existing.sort(key=lambda r: r["ts"])
+    return len(added)
+
+
+# ---------------- data health ----------------
+def data_health(c):
+    """Pass / warn / fail checks on every data source the signals depend on. c is a context dict."""
+    rows = []
+
+    def add(name, status, detail):
+        rows.append({"Check": name, "Status": status, "Detail": detail})
+
+    now, m, df, spot = c["now"], c["m"], c["df"], c["spot"]
+    live = market_open_now(now)
+
+    tok = c["token"]
+    exp = token_expiry(tok)
+    if not tok.startswith("eyJ"):
+        add("Dhan token", "FAIL", "Does not look like a JWT access token (is this the API key?)")
+    elif exp is None:
+        add("Dhan token", "WARN", "Looks like a JWT but the expiry could not be read, so no expiry warning is possible")
+    else:
+        left = (exp - now).total_seconds() / 3600.0
+        if left <= 0:
+            add("Dhan token", "FAIL", f"Expired {-left:.1f} h ago ({exp:%d %b %H:%M} IST). Generate a new token")
+        elif left < 2:
+            add("Dhan token", "WARN", f"Expires in {left:.1f} h ({exp:%d %b %H:%M} IST)")
+        else:
+            add("Dhan token", "OK", f"Expires {exp:%d %b %H:%M} IST ({left:.0f} h left)")
+
+    n_strikes = len(df)
+    add("Option chain", "OK" if n_strikes >= 20 and spot > 0 else "FAIL", f"{n_strikes} strikes, spot {spot:,.2f}")
+
+    w = max(300, m["step"] * 6)
+    near = df[(df["Strike"] >= spot - w) & (df["Strike"] <= spot + w)]
+    if len(near):
+        ltp_ok = ((near["CE_LTP"] > 0) & (near["PE_LTP"] > 0)).mean()
+        ba_ok = ((near["CE_Bid"] > 0) & (near["CE_Ask"] > 0) & (near["PE_Bid"] > 0) & (near["PE_Ask"] > 0)).mean()
+        add("Premiums (LTP)", "OK" if ltp_ok >= 0.8 else "WARN", f"{ltp_ok:.0%} of near-spot strikes have a call and put LTP")
+        if live:
+            add("Bid / ask quotes", "OK" if ba_ok >= 0.5 else "WARN", f"{ba_ok:.0%} of near-spot strikes quoted on both sides")
+        else:
+            add("Bid / ask quotes", "OK", "Market closed, quotes are not expected")
+
+    gap_txt = f", CE/PE gap {m['iv_gap']:.1f} pts" if m["iv_gap"] else ""
+    iv_ok = 5 <= m["atm_iv"] <= 60 and m["iv_gap"] <= 3
+    add("ATM implied volatility", "OK" if iv_ok else "WARN", f"{m['atm_iv']:.1f}%{gap_txt}" + ("" if iv_ok else " (outside 5-60% or CE/PE mismatch: possible stale quotes)"))
+
+    dq = data_quality(m)
+    add("Previous-day OI", "WARN" if dq else "OK", dq or "OI change baseline looks populated")
+
+    pc, src = c["prev_close"], c.get("prev_src", "")
+    if not pc or pc <= 0:
+        add("Previous close", "WARN", "Unknown: day-change terms are skipped. Enter it manually or fix the candle feed")
+    elif abs(pc - spot) / spot > 0.05:
+        add("Previous close", "WARN", f"{pc:,.2f} is more than 5% from spot ({src})")
+    else:
+        add("Previous close", "OK", f"{pc:,.2f} ({src})")
+
+    cs = c.get("candles") or []
+    if c.get("candle_err"):
+        add("Daily candles", "WARN", f"Failed: {str(c['candle_err'])[:90]}")
+    elif len(cs) < 10:
+        add("Daily candles", "WARN", f"Only {len(cs)} candles loaded")
+    else:
+        done = [x["date"] for x in cs if x["date"] < now.date().isoformat()]
+        last = done[-1] if done else None
+        stale = bool(last) and (now.date() - date.fromisoformat(last)).days > 4
+        add("Daily candles", "WARN" if stale else "OK", f"{len(cs)} loaded, last completed session {last}" + (" (older than expected)" if stale else ""))
+
+    hist = c.get("hist") or []
+    if live and len(hist) >= 4:
+        last4 = hist[-4:]
+        frozen = len({round(h["spot"], 2) for h in last4}) == 1 and len({round(h["iv"], 3) for h in last4}) == 1 and len({round(h["pcr"], 4) for h in last4}) == 1
+        add("Feed freshness", "WARN" if frozen else "OK",
+            "Spot, IV and PCR identical across the last 4 snapshots: the feed may be stale" if frozen else "Values are changing between snapshots")
+    else:
+        add("Feed freshness", "OK", "Not enough snapshots yet, or market closed")
+
+    if len(hist) >= 2 and live:
+        today_ts = [h["ts"] for h in hist]
+        gaps = [(b - a) / 60.0 for a, b in zip(today_ts, today_ts[1:])]
+        mg = max(gaps)
+        add("Snapshot history", "WARN" if mg > 10 else "OK", f"{len(hist)} snapshots today, longest gap {mg:.0f} min" + (" (the app was closed or refresh was off)" if mg > 10 else ""))
+    else:
+        add("Snapshot history", "OK", f"{len(hist)} snapshot(s) stored today")
+
+    ni, ns_ = c.get("news_items") or [], c.get("news_status") or []
+    ok_feeds = sum(1 for s in ns_ if ": OK" in s)
+    if not c.get("live_news"):
+        add("News feed", "OK", "Turned off")
+    elif not ni:
+        add("News feed", "WARN", "No headlines. " + " | ".join(ns_)[:120])
+    else:
+        newest = min(i["age_min"] for i in ni)
+        add("News feed", "WARN" if newest > 360 else "OK", f"{len(ni)} headlines from {ok_feeds} feed(s), newest {age_label(newest)}")
+
+    ai = c.get("ai") or {}
+    lt = c.get("last_ai_time")
+    if not c.get("groq_key"):
+        add("AI Council", "WARN", "No Groq API key: the AI Council and signals are unavailable")
+    elif "error" in ai and "signal" not in ai:
+        add("AI Council", "WARN", f"Last call failed: {str(ai['error'])[:100]}")
+    elif lt is None:
+        add("AI Council", "WARN", "No verdict yet")
+    else:
+        age = (now - lt).total_seconds() / 60.0
+        add("AI Council", "WARN" if (live and age > 60) else "OK", f"Last verdict {age:.0f} min ago ({ai.get('_model', '')})")
+
+    add("Clock", "OK", f"{now:%a %d %b %H:%M:%S} IST, market {'OPEN' if live else 'CLOSED'}")
+
+    if c.get("alerts_on"):
+        ch = [n for n, ok in (("Telegram", c.get("tg_ok")), ("Webhook", c.get("hook_ok"))) if ok]
+        add("Alerts", "OK" if ch else "WARN", ("Channels: " + ", ".join(ch)) if ch else "Alerts are on but no channel is configured")
+    else:
+        add("Alerts", "OK", "Off")
+
+    writable = os.access(tempfile.gettempdir(), os.W_OK)
+    add("Log storage", "OK" if writable else "FAIL",
+        ("Temp storage writable. Download backups: it can be wiped on restart" if writable else "Temp folder is not writable: scorecard cannot be saved"))
+    return rows
+
+
 def esc(x):
     return html.escape(str(x if x is not None else "-"))
 
@@ -1483,6 +1908,16 @@ with st.sidebar:
                 st.code(f"{pr.status_code}\n{pr.text[:600]}")
             except Exception as e:
                 st.error(e)
+
+    _exp = token_expiry(dhan_token)
+    if _exp:
+        _left = (_exp - datetime.now(IST)).total_seconds() / 3600.0
+        if _left <= 0:
+            st.error(f"Dhan token EXPIRED {-_left:.1f} h ago. Generate a new one.")
+        elif _left < 2:
+            st.warning(f"Dhan token expires in {_left:.1f} h ({_exp:%H:%M} IST).")
+        else:
+            st.caption(f"Dhan token valid until {_exp:%d %b %H:%M} IST ({_left:.0f} h left)")
 
     idx_name = st.selectbox("INDEX SELECTION", list(INDEX_MAP.keys()))
     info = INDEX_MAP[idx_name]
@@ -1528,6 +1963,23 @@ with st.sidebar:
     TIME_BASIS["mode"] = "calendar" if _basis.startswith("Calendar") else "trading"
     exh_lookback = st.slider("EXHAUSTION LOOKBACK (min)", 6, 45, 15, step=3,
                              help="History window used by the exhaustion monitor. With a 3-min refresh, 15 min = 5 snapshots.")
+    st.markdown("---")
+    st.markdown("### 🔔 SCORECARD & ALERTS")
+    log_on = st.toggle("LOG SIGNALS TO SCORECARD", value=True, key="log_on",
+                       help="Logs validated signals and the AI signals the filter rejected, then tracks what spot did afterwards.")
+    alerts_on = st.toggle("SEND ALERTS", value=False, key="alerts_on",
+                          help="Telegram and/or webhook. Alerts are only sent while this app is open and refreshing.")
+    tg_token = st.text_input("TELEGRAM BOT TOKEN", type="password", value=get_secret("TELEGRAM_BOT_TOKEN", ""), key="tg_token").strip()
+    tg_chat = st.text_input("TELEGRAM CHAT ID", value=get_secret("TELEGRAM_CHAT_ID", ""), key="tg_chat").strip()
+    hook_url = st.text_input("ALERT WEBHOOK URL (optional)", type="password", value=get_secret("ALERT_WEBHOOK_URL", ""), key="hook_url").strip()
+    log_hook = st.text_input("SCORECARD WEBHOOK URL (optional)", type="password", value=get_secret("LOG_WEBHOOK_URL", ""), key="log_hook",
+                             help="Every logged / resolved signal is POSTed here as JSON, e.g. a Google Apps Script that appends a sheet row, so the log survives restarts.").strip()
+    if st.button("Send test alert", key="test_alert"):
+        _res = send_alert("BBG terminal test alert. If you can read this, alerts work.", tg_token, tg_chat, hook_url)
+        if not _res:
+            st.warning("No channel configured.")
+        for _c, _ok, _d in _res:
+            (st.success if _ok else st.error)(f"{_c}: {'sent' if _ok else 'failed ' + _d}")
     force_run = st.button("FORCE AI RUN")
 
     auto_refresh = st.toggle("AUTO REFRESH (3 MIN)", value=True)
@@ -1598,16 +2050,76 @@ ai_ok = not ("error" in ai and "signal" not in ai)
 sig = build_signal(m, ai) if ai_ok else None
 scan, smeta = premium_scanner(m, horizon_days, iv_shock, skew=use_skew)
 
+# ---- scorecard logging, outcome tracking, data health, alerts ----
+try:
+    candles_pre, candle_err = fetch_daily_candles(info["scrip"], info["seg"], dhan_token, client_id), ""
+except Exception as _e:
+    candles_pre, candle_err = [], str(_e)
+if "scorecard" not in st.session_state:
+    st.session_state["scorecard"] = load_scorecard()
+card = st.session_state["scorecard"]
+tone_now = headline_tone(news_items) if news_items else 0
+new_recs = []
+if log_on and sig is not None:
+    _chg, _resolved = update_outcomes(card, idx_name, spot, now_ist, candles_pre)
+    new_recs = maybe_log_signal(card, idx_name, expiry, m, sig, ai, tone_now, now_ist)
+    if _chg or new_recs:
+        save_scorecard(card)
+    for _r in new_recs:
+        post_webhook(log_hook, {"event": "signal_logged", **_r})
+    for _r in _resolved:
+        post_webhook(log_hook, {"event": "signal_resolved", **_r})
+
+health_rows = data_health({
+    "now": now_ist, "m": m, "df": m["df"], "spot": spot, "token": dhan_token, "prev_close": prev_close,
+    "prev_src": auto_src if (auto_prev and auto_val) else "manual entry", "candles": candles_pre, "candle_err": candle_err,
+    "hist": hist, "news_items": news_items, "news_status": news_status, "live_news": live_news, "ai": ai,
+    "last_ai_time": st.session_state.get("last_ai_time"), "groq_key": groq_key, "alerts_on": alerts_on,
+    "tg_ok": bool(tg_token and tg_chat), "hook_ok": bool(hook_url)})
+
+alert_cfg = {"enabled": alerts_on, "tg_token": tg_token, "tg_chat": tg_chat, "hook": hook_url}
+alert_results = []
+if alerts_on:
+    for _r in new_recs:
+        if _r["kind"] == "VALIDATED":
+            alert_results += fire_alert(f"sig_{_r['id']}", signal_alert_text(_r), 0, alert_cfg)
+    _ex = m["exh"]
+    if _ex.get("ready"):
+        for _side, _lab in (("buyer", "BUYER"), ("seller", "SELLER")):
+            if _ex[_side]["flag"] == "CONFIRMED":
+                alert_results += fire_alert(
+                    f"exh_{idx_name}_{_side}_{now_ist.date().isoformat()}",
+                    f"⚠ {idx_name}: {_lab} exhaustion CONFIRMED ({_ex[_side]['score']}/100) at {spot:,.0f}. "
+                    f"{now_ist:%H:%M} IST. Analysis only, not trading advice.", 60, alert_cfg)
+    for _row in health_rows:
+        _tok_soon = _row["Check"] == "Dhan token" and _row["Status"] == "WARN" and "Expires in" in _row["Detail"]
+        if _row["Status"] == "FAIL" or _tok_soon:
+            alert_results += fire_alert(f"health_{_row['Check']}_{_row['Status']}", f"🩺 {_row['Check']}: {_row['Detail']}",
+                                        360 if _row["Check"] == "Dhan token" else 60, alert_cfg)
+
+
 # ============================================================
 # DASHBOARD
 # ============================================================
 st.markdown(f"## {idx_name} // SPOT {spot:,.2f}" + (f"  ({spot - prev_close:+,.2f})" if prev_close > 0 else ""))
 _mkt = "OPEN" if market_open_now(now_ist) else "CLOSED (spot, OI and premiums shown are the last close, not live)"
 st.caption(f"{now_ist.strftime('%a %d %b %Y %H:%M:%S')} IST | market {_mkt}")
+_hc = {"OK": 0, "WARN": 0, "FAIL": 0}
+for _row in health_rows:
+    _hc[_row["Status"]] += 1
+st.caption(f"DATA HEALTH: {_hc['OK']} OK · {_hc['WARN']} warn · {_hc['FAIL']} fail (details in the Data Health tab)")
+_fails = [r for r in health_rows if r["Status"] == "FAIL"]
+if _fails:
+    st.error("Data problem: " + "; ".join(f"{r['Check']}: {r['Detail']}" for r in _fails[:3]))
+for _r in new_recs:
+    st.info(f"Scorecard: logged {_r['kind']} {_r['signal']} at {_r['entry']:,.0f}")
+_alert_fail = [f"{c}: {d}" for c, ok, d in alert_results if not ok]
+if _alert_fail:
+    st.warning("Alert delivery failed: " + " | ".join(_alert_fail))
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "📊 Dashboard & Engine", "📐 Day Levels", "🧭 Exhaustion", "🎯 Premium Scanner",
-    "🤖 AI Council & News", "📋 Option Chain"])
+    "🤖 AI Council & News", "📋 Option Chain", "📒 Scorecard", "🩺 Data Health"])
 
 with tab1:
     status = m["status"]
@@ -1880,3 +2392,100 @@ with tab5:
 with tab6:
     st.caption(f"1σ range to expiry: {m['lower_1sigma']:,.0f} to {m['upper_1sigma']:,.0f}  |  Updated {datetime.now(IST).strftime('%H:%M:%S')} IST")
     show_df(m["df"], hide_index=True)
+
+with tab7:
+    st.markdown("#### 📒 SIGNAL SCORECARD: does the engine have an edge?")
+    recs = st.session_state["scorecard"]
+    vals = [r for r in recs if r["kind"] == "VALIDATED"]
+    rejs = [r for r in recs if r["kind"] == "REJECTED"]
+    res60 = [r for r in recs if r.get("s60") is not None]
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("LOGGED", len(recs))
+    k2.metric("VALIDATED", len(vals))
+    k3.metric("REJECTED BY FILTER", len(rejs))
+    k4.metric("RESOLVED", sum(1 for r in recs if r["resolved"]))
+    k5.metric("WITH 60-MIN OUTCOME", len(res60))
+    st.caption(f"A signal is logged only while the market is open, at most once per {SIGNAL_DEDUP_MIN} min per direction. Outcomes are sampled on each "
+               f"refresh (about every 3 min), so target/stop 'first touch' is approximate. Records are stored in the server's temp folder: "
+               f"download a backup below or set a scorecard webhook.")
+    if not recs:
+        st.info("No signals logged yet. They appear here when the validated signal turns BUY/SELL, or when the AI signals but the filter rejects it.")
+    else:
+        if len(res60) < MIN_SAMPLE_FOR_VERDICT:
+            st.warning(f"Only {len(res60)} signal(s) have a 60-minute outcome. Below about {MIN_SAMPLE_FOR_VERDICT} the numbers are noise, not evidence.")
+        st.markdown("##### Hit rate and average move by horizon")
+        show_df(scorecard_summary(recs), hide_index=True)
+        ts_ = touch_stats(recs)
+        st.caption(f"Validated signals with levels: target first {ts_['target']}, stop first {ts_['stop']}, neither by the close {ts_['timeout']}, still open {ts_['open']}"
+                   + (f" | target-before-stop rate {ts_['target_rate']}%" if ts_["target_rate"] is not None else ""))
+
+        def _hit(rs, key="s60"):
+            v = [fav_points(r, key) for r in rs if r.get(key) is not None]
+            return (sum(1 for x in v if x > 0) / len(v) * 100, len(v)) if v else (None, 0)
+        hv, nv = _hit(vals)
+        hr, nr = _hit(rejs)
+        if hv is not None and hr is not None and nv >= 15 and nr >= 15:
+            if hv >= hr + 10:
+                st.success(f"The validation filter looks useful: validated signals hit {hv:.0f}% at 60 min versus {hr:.0f}% for the ones it rejected.")
+            elif hr >= hv + 10:
+                st.warning(f"Rejected signals did better ({hr:.0f}%) than validated ones ({hv:.0f}%): the filter may be too strict.")
+            else:
+                st.info(f"No clear difference between validated ({hv:.0f}%) and rejected ({hr:.0f}%) signals at 60 min.")
+        else:
+            st.caption("Needs at least 15 resolved validated and 15 rejected signals before the filter can be judged.")
+
+        st.markdown("##### Which checks have edge? (60-min hit rate when the check agreed vs disagreed with the signal)")
+        show_df(check_edge_table(recs), hide_index=True)
+        g1, g2, g3 = st.columns(3)
+        g1.caption("By chain agreement score")
+        with g1:
+            show_df(group_table(recs, lambda r: f"{r['net']:+d}"), hide_index=True)
+        g2.caption("By AI confidence")
+        with g2:
+            show_df(group_table(recs, lambda r: "75+" if (r["confidence"] or 0) >= 75 else "60-74" if (r["confidence"] or 0) >= 60 else "<60"), hide_index=True)
+        g3.caption("By own-side exhaustion")
+        with g3:
+            show_df(group_table(recs, lambda r: r.get("exh_own_flag") or "none"), hide_index=True)
+        curve = cumulative_curve(recs)
+        if len(curve) >= 2:
+            st.markdown("##### Cumulative move of validated signals (σ units, 60-min mark)")
+            st.line_chart(curve.rename("Cumulative move (σ)"))
+        st.markdown("##### Recent records")
+        _df = scorecard_to_df(recs).iloc[::-1].head(25)
+        _cols = [c for c in ("date", "time", "index", "kind", "signal", "entry", "target", "sl", "confidence", "net", "exh_own_flag",
+                             "move_s15", "move_s30", "move_s60", "move_sclose", "first_touch", "outcome", "samples") if c in _df.columns]
+        show_df(_df[_cols], hide_index=True)
+
+    st.markdown("##### Export / backup")
+    e1, e2 = st.columns(2)
+    if recs:
+        e1.download_button("📄 Scorecard CSV", scorecard_to_df(recs).to_csv(index=False), file_name="signal_scorecard.csv", mime="text/csv")
+        e2.download_button("💾 Scorecard backup (JSON)", json.dumps(recs), file_name="signal_scorecard_backup.json", mime="application/json")
+    _up = st.file_uploader("Merge a scorecard backup (JSON)", type="json", key="sc_upload")
+    if _up is not None and st.button("♻ MERGE BACKUP", key="sc_merge"):
+        try:
+            _added = merge_scorecard(recs, json.load(_up))
+            save_scorecard(recs)
+            st.success(f"Merged {_added} new record(s).")
+        except Exception as e:
+            st.error(f"Could not merge: {e}")
+    if st.checkbox("I want to delete the whole scorecard", key="sc_reset_ok") and st.button("🗑 RESET SCORECARD", key="sc_reset"):
+        st.session_state["scorecard"] = []
+        save_scorecard([])
+        st.rerun()
+
+with tab8:
+    st.markdown("#### 🩺 DATA HEALTH")
+    _hdf = pd.DataFrame(health_rows)
+    _hdf["Status"] = _hdf["Status"].map({"OK": "✅ OK", "WARN": "⚠️ WARN", "FAIL": "❌ FAIL"})
+    show_df(_hdf, hide_index=True)
+    st.caption("Checks run on every refresh. A WARN means a signal may be less reliable; a FAIL means the data cannot be trusted until it is fixed.")
+    if st.button("Run Dhan profile check (/v2/profile)", key="hc_profile"):
+        try:
+            _pr = requests.get(PROFILE_URL, headers=auth_headers(dhan_token, client_id), timeout=10)
+            st.code(f"HTTP {_pr.status_code}\n{_pr.text[:500]}")
+        except Exception as e:
+            st.error(f"Profile check failed: {e}")
+    with st.expander("News feed status"):
+        for _line in news_status:
+            st.write(_line)
