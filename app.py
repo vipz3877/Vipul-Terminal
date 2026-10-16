@@ -54,10 +54,10 @@ section[data-testid="stSidebar"] { background-color:#0b0b0b; border-right:1px so
 h1,h2,h3,h4 { color:#ff9800 !important; font-family:'Courier New',monospace; letter-spacing:1px; }
 [data-testid="stMetricValue"] { color:#fff; }
 [data-testid="stMetricLabel"] { color:#ff9800; }
-.vipul-panel { border:1px solid #333; background:#0f0f0f; padding:14px; border-radius:4px; margin-bottom:12px; }
-.vipul-title { font-size:12px; color:#888; letter-spacing:2px; text-transform:uppercase; }
-.vipul-big { font-size:26px; font-weight:800; }
-.vipul-desc { font-size:14px; margin-top:6px; color:#ddd; }
+.bbg-panel { border:1px solid #333; background:#0f0f0f; padding:14px; border-radius:4px; margin-bottom:12px; }
+.bbg-title { font-size:12px; color:#888; letter-spacing:2px; text-transform:uppercase; }
+.bbg-big { font-size:26px; font-weight:800; }
+.bbg-desc { font-size:14px; margin-top:6px; color:#ddd; }
 .agent { font-size:13px; color:#ddd; margin:4px 0; }
 .agent b { color:#ff9800; }
 @keyframes flashGreen { 0%,100% {box-shadow:0 0 0 rgba(0,230,118,0);} 50% {box-shadow:0 0 28px rgba(0,230,118,.9);} }
@@ -2163,7 +2163,7 @@ def esc(x):
 # SIDEBAR
 # ============================================================
 with st.sidebar:
-    st.markdown("### BBG // TERMINAL CONFIG")
+    st.markdown("### Quick Insight Trades")
     dhan_token = clean(st.text_input("DHAN ACCESS TOKEN", type="password", value=DEFAULT_DHAN_TOKEN,
                                      help="The long JWT (starts with 'eyJ'). NOT the API key/secret."))
     client_id = clean(st.text_input("DHAN CLIENT ID", value=DEFAULT_CLIENT_ID))
