@@ -2116,9 +2116,17 @@ if alerts_on and tg_token and tg_chat:
             alert_results += fire_alert(f"auto_res_{_r['id']}", outcome_alert_text(_r), 0, alert_cfg)
 
 # ============================================================
-# DASHBOARD
+# DASHBOARD HEADER — title left, brand logo top-right
 # ============================================================
-st.markdown(f"## {idx_name} // SPOT {spot:,.2f}" + (f"  ({spot - prev_close:+,.2f})" if prev_close > 0 else ""))
+_header_title, _header_logo = st.columns([10, 1], vertical_alignment="center")
+with _header_title:
+    st.markdown(f"## {idx_name} // SPOT {spot:,.2f}" + (f"  ({spot - prev_close:+,.2f})" if prev_close > 0 else ""))
+with _header_logo:
+    # Keep logo asset in the same GitHub repository folder as app.py.
+    _logo_path = "logo.png" if os.path.exists("logo.png") else "logo.jpg" if os.path.exists("logo.jpg") else None
+    if _logo_path:
+        st.image(_logo_path, width=100, caption=None)
+
 _mkt = "OPEN" if market_open_now(now_ist) else "CLOSED"
 st.caption(f"{now_ist.strftime('%a %d %b %Y %H:%M:%S')} IST | market {_mkt} | dealer gamma {m['gex_regime']}")
 
