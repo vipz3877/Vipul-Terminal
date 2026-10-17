@@ -100,7 +100,23 @@ EXPIRY_URL = f"{BASE_URL}/optionchain/expirylist"
 PROFILE_URL = f"{BASE_URL}/profile"
 
 YEAR_DAYS = 365
-TIME_BASIS = {"mode": "calendar"}
+class _SessionFlag:
+    """Per-session stand-in for a module-level dict (module globals are shared by every user)."""
+
+    def __init__(self, name, default):
+        self._name, self._default = name, default
+
+    def _store(self):
+        return st.session_state.setdefault("_bbg_flags", {})
+
+    def __getitem__(self, key):
+        return self._store().get(self._name, self._default)
+
+    def __setitem__(self, key, value):
+        self._store()[self._name] = value
+
+
+TIME_BASIS = _SessionFlag("time_basis", "calendar")
 SKEW_COEF = 0.5
 VELOCITY_WINDOW_SEC = 150
 MIN_CHAIN_GAP_SEC = 3.0
@@ -112,6 +128,11 @@ MIN_CONFIRM = 2
 SL_BUFFER = 35
 FLOW_EDGE_PCT = 2.0
 IST = timezone(timedelta(hours=5, minutes=30))
+DATA_DIR = os.getenv("BBG_DATA_DIR") or tempfile.gettempdir()
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+except Exception:
+    DATA_DIR = tempfile.gettempdir()
 
 HIST_MIN_GAP_SEC = 60
 HIST_MAX = 400
@@ -143,7 +164,7 @@ GEX_BAND_PCT = 5.0
 GEX_WINDOWS = (4, 8, 16)
 BASIS_MIN_PTS = 8.0
 SURF_CHECK_NAME = "Synthetic basis vs fair carry"
-USE_SURFACE_CHECK = {"on": False}
+USE_SURFACE_CHECK = _SessionFlag("surface_check", False)
 SURFACE_KEYS = ("syn_fut", "fair_fwd", "carry", "basis", "excess_basis", "surface_ok", "iv_25c", "iv_25p", "rr_25", "bf_25",
                 "net_gex", "gross_gex", "gex_regime", "gex_regime_label", "regime_stable", "regime_by_window", "crossover",
                 "zero_gamma", "total_gex_at_spot", "net_vex", "net_cex")
@@ -183,7 +204,7 @@ def get_expiries(scrip, seg, token, client_id):
 
 def enforce_global_api_throttle(min_interval=None):
     min_interval = MIN_CHAIN_GAP_SEC if min_interval is None else min_interval
-    path = os.path.join(tempfile.gettempdir(), "bbg_api_throttle.lock")
+    path = os.path.join(DATA_DIR, "bbg_api_throttle.lock")
     try:
         import fcntl
     except ImportError:
@@ -605,9 +626,10 @@ def compute_bias(dce, dpe, spot, prev_close, pcr, basis, rr_25):
     elif pcr < 0.8:
         score -= 8
 
-    if basis > 0.001 * spot and rr_25 > -0.5:
+    thr = max(BASIS_MIN_PTS, 0.0004 * spot)
+    if basis > thr and rr_25 > -0.5:
         score += 5
-    elif basis < -0.001 * spot and rr_25 < -1.5:
+    elif basis < -thr and rr_25 < -1.5:
         score -= 5
 
     score = max(0, min(100, score))
@@ -779,15 +801,16 @@ def compute_metrics(df, spot, prev_close, expiry_str, step):
     near = df[(df["Strike"] >= spot - window) & (df["Strike"] <= spot + window)].copy()
 
     ce_trap, pe_trap = None, None
+    trap_buf = SL_BUFFER * step / 50.0
     if not near.empty:
         i = near["CE_OI_Chg"].idxmax()
         if near.loc[i, "CE_OI_Chg"] > 10000:
-            ce_trap = float(near.loc[i, "Strike"]) + 35
+            ce_trap = float(near.loc[i, "Strike"]) + trap_buf
         j = near["PE_OI_Chg"].idxmax()
         if near.loc[j, "PE_OI_Chg"] > 10000:
-            pe_trap = float(near.loc[j, "Strike"]) - 35
+            pe_trap = float(near.loc[j, "Strike"]) - trap_buf
 
-    score, bias = compute_bias(dce, dpe, spot, prev_close, pcr, surf["basis"], surf["rr_25"])
+    score, bias = compute_bias(dce, dpe, spot, prev_close, pcr, surf["excess_basis"], surf["rr_25"])
     status, signal, desc = detect_gamma_blast(near)
     engine = engine_sums(near)
     struct = find_structure(df, spot, step, exp_move, call_wall, put_wall)
@@ -854,6 +877,11 @@ def evaluate_market_state_change(m, vel, nhash=""):
     last = st.session_state.get("last_ai_state")
     if last is None:
         return True, "INITIAL_SCAN"
+    if last.get("key") != st.session_state.get("_cur_ai_key"):
+        return True, "INDEX_OR_EXPIRY_CHANGED"
+    _t0 = st.session_state.get("last_ai_time")
+    if _t0 is not None and (datetime.now(IST) - _t0).total_seconds() > AI_VERDICT_MAX_AGE_SEC:
+        return True, "VERDICT_EXPIRED"
 
     step_thresh = max(20.0, m["step"] * 0.5)
     spot_diff = m["spot"] - last["spot"]
@@ -884,6 +912,16 @@ def evaluate_market_state_change(m, vel, nhash=""):
     if nhash and nhash != last.get("news_hash", "") and gap_ok:
         return True, "NEWS_CHANGED"
     return False, "STATE_UNCHANGED"
+
+
+def valid_cached_verdict(key):
+    v = st.session_state.get("last_ai_verdict")
+    t = st.session_state.get("last_ai_time")
+    if not v or t is None or st.session_state.get("last_ai_verdict_key") != key:
+        return None
+    if (datetime.now(IST) - t).total_seconds() > AI_VERDICT_MAX_AGE_SEC:
+        return None
+    return v
 
 
 # ============================================================
@@ -972,7 +1010,8 @@ Return ONLY this JSON:
             return out
         except Exception as e:
             last_err = f"{mdl}: {e}"
-            if "model_not_found" in str(e) or "404" in str(e):
+            _es = str(e).lower()
+            if any(t in _es for t in ("model_not_found", "404", "429", "rate limit", "rate_limit", "503", "overloaded")):
                 continue
             break
     return {"error": f"Groq call failed: {last_err}"}
@@ -1041,6 +1080,7 @@ def build_signal(m, ai):
     entry = m["spot"]
     res, sup = m["struct"]["res"], m["struct"]["sup"]
     notes = []
+    sl_buf = SL_BUFFER * m["step"] / 50.0
     sig, target, sl, rr = ai_sig, None, None, None
 
     if sig != "WAIT":
@@ -1063,9 +1103,9 @@ def build_signal(m, ai):
             notes.append(f"{sig} rejected: no usable OI wall on one side of spot.")
             sig = "WAIT"
         elif sig == "BUY":
-            target, sl = res["level"], sup["level"] - SL_BUFFER
+            target, sl = res["level"], sup["level"] - sl_buf
         else:
-            target, sl = sup["level"], res["level"] + SL_BUFFER
+            target, sl = sup["level"], res["level"] + sl_buf
 
     if sig != "WAIT":
         risk = abs(entry - sl)
@@ -1137,7 +1177,7 @@ def compute_day_levels(candles, spot, sd, m, prev_close_fallback, today_ohlc=Non
         c, h, l = ref["c"], ref["h"], ref["l"]
         basis = f"session {ref['date']} (H {h:,.0f} / L {l:,.0f} / C {c:,.0f})" + (" [OHLC from quote]" if synthetic and ref["date"] == today else "")
     else:
-        c, h, l = prev_close_fallback, None, None
+        c, h, l = (prev_close_fallback or spot), None, None
         basis = f"previous close {c:,.0f} (no candle data, pivots unavailable)"
 
     for k in (2, 1):
@@ -1170,8 +1210,8 @@ def compute_day_levels(candles, spot, sd, m, prev_close_fallback, today_ohlc=Non
 
     oi_refs = {"Call wall": m["call_wall"], "Put wall": m["put_wall"], "Max pain": m["max_pain"],
                "Gamma strike": m["gamma_strike"]}
-    if m.get("gamma_flip"):
-        oi_refs["Gamma flip"] = m["gamma_flip"]
+    if m.get("zero_gamma"):
+        oi_refs["Gamma flip"] = m["zero_gamma"]
     if m["struct"]["res"]:
         oi_refs["Nearest OI resistance"] = m["struct"]["res"]["level"]
     if m["struct"]["sup"]:
@@ -1181,7 +1221,7 @@ def compute_day_levels(candles, spot, sd, m, prev_close_fallback, today_ohlc=Non
     rows = []
     for name, price, kind in levels:
         hits = [f"{n} {v:,.0f}" for n, v in oi_refs.items() if abs(v - price) <= tol]
-        rows.append({"Level": name, "Price": price, "Dist pts": price - spot, "Dist σ": (price - spot) / sd,
+        rows.append({"Level": name, "Price": price, "Dist pts": price - spot, "Dist σ": ((price - spot) / sd) if sd else 0.0,
                      "OI confluence": ("★ " + ", ".join(hits)) if hits else ""})
     rows.append({"Level": "◄ SPOT", "Price": spot, "Dist pts": 0.0, "Dist σ": 0.0, "OI confluence": ""})
     tbl = pd.DataFrame(rows).sort_values("Price", ascending=False).reset_index(drop=True)
@@ -1200,7 +1240,7 @@ def daily_sigma(m):
 
 def hist_path(key):
     safe = re.sub(r"[^A-Za-z0-9]+", "_", key)
-    return os.path.join(tempfile.gettempdir(), f"bbg_hist_{datetime.now(IST).date().isoformat()}_{safe}.json")
+    return os.path.join(DATA_DIR, f"bbg_hist_{datetime.now(IST).date().isoformat()}_{safe}.json")
 
 
 def load_hist(key):
@@ -1427,6 +1467,7 @@ def premium_scanner(m, horizon_days=0.25, iv_shock=15.0, skew=True):
     cand = df[(df["Strike"] >= S0 - span) & (df["Strike"] <= S0 + span)]
     res, sup = m["struct"]["res"], m["struct"]["sup"]
     crush, spike = 1.0 - iv_shock / 100.0, 1.0 + iv_shock / 100.0
+    coef = SKEW_COEF if skew else 0.0
 
     rows = []
     for _, r in cand.iterrows():
@@ -1543,8 +1584,8 @@ def fetch_today_ohlc(scrip, seg, token, client_id):
 # ============================================================
 # SCORECARD, ALERTS & DATA HEALTH (FULLY AUTOMATED v13.2)
 # ============================================================
-SCORECARD_FILE = os.path.join(tempfile.gettempdir(), "bbg_scorecard_v13_2.json")
-ALERT_FILE = os.path.join(tempfile.gettempdir(), "bbg_alerts_sent_v13_2.json")
+SCORECARD_FILE = os.path.join(DATA_DIR, "bbg_scorecard_v13_2.json")
+ALERT_FILE = os.path.join(DATA_DIR, "bbg_alerts_sent_v13_2.json")
 SIGNAL_DEDUP_MIN = 30
 OUTCOME_HORIZONS = (15, 30, 60)
 HORIZON_TOL_MIN = 10
@@ -1569,8 +1610,10 @@ def _load_json(path, default):
 
 def _save_json(path, obj):
     try:
-        with open(path, "w") as f:
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
             json.dump(obj, f)
+        os.replace(tmp, path)
     except Exception:
         pass
 
@@ -1598,7 +1641,7 @@ def send_alert(text, tg_token="", tg_chat="", webhook=""):
     if tg_token and tg_chat:
         try:
             r = requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage",
-                              json={"chat_id": tg_chat, "text": text, "disable_web_page_preview": True}, timeout=8)
+                              json={"chat_id": tg_chat, "text": text.replace("**", ""), "disable_web_page_preview": True}, timeout=8)
             out.append(("telegram", bool(r.ok), "" if r.ok else f"HTTP {r.status_code}"))
         except Exception as e:
             out.append(("telegram", False, _scrub(e, tg_token)[:90]))
@@ -1658,7 +1701,27 @@ def load_scorecard():
     return recs if isinstance(recs, list) else []
 
 
+def sync_scorecard(card):
+    """Pull in records written by other sessions/tabs so they are not overwritten or double-logged."""
+    try:
+        disk = load_scorecard()
+    except Exception:
+        return
+    idx = {r.get("id"): i for i, r in enumerate(card)}
+    for r in disk:
+        if not isinstance(r, dict) or not r.get("id"):
+            continue
+        i = idx.get(r["id"])
+        if i is None:
+            card.append(r)
+            idx[r["id"]] = len(card) - 1
+        elif r.get("resolved") and not card[i].get("resolved"):
+            card[i] = r
+    card.sort(key=lambda x: x.get("ts", 0))
+
+
 def save_scorecard(recs):
+    sync_scorecard(recs)
     _save_json(SCORECARD_FILE, recs)
 
 
@@ -1734,7 +1797,7 @@ def maybe_log_signal(recs, idx_name, expiry, m, sig, ai, tone, now):
 
 
 def update_outcomes(recs, idx_name, spot, now, candles):
-    changed, resolved_now = False, []
+    changed, resolved_now, touched_now = False, [], []
     today = now.date().isoformat()
     live = market_open_now(now)
     closes = {c["date"]: c["c"] for c in (candles or [])}
@@ -1757,6 +1820,9 @@ def update_outcomes(recs, idx_name, spot, now, candles):
                     r["first_touch"] = "TARGET"
                 elif (d > 0 and spot <= r["sl"]) or (d < 0 and spot >= r["sl"]):
                     r["first_touch"] = "STOP"
+            if r["first_touch"] in ("TARGET", "STOP") and not r.get("touch_alerted"):
+                r["touch_alerted"] = True
+                touched_now.append({**r, "outcome": r["first_touch"], "time": now.strftime("%H:%M:%S")})
             for h in OUTCOME_HORIZONS:
                 if r[f"s{h}"] is None and h <= el <= h + HORIZON_TOL_MIN:
                     r[f"s{h}"] = round(spot, 2)
@@ -1776,7 +1842,7 @@ def update_outcomes(recs, idx_name, spot, now, candles):
                 r["outcome"] = "RESOLVED"
             changed = True
             resolved_now.append(r)
-    return changed, resolved_now
+    return changed, resolved_now, touched_now
 
 
 def fav_points(r, key):
@@ -1930,10 +1996,16 @@ def data_health(c):
     else:
         add("Synthetic future", "WARN", "No balanced near-ATM call/put mids")
 
-    add("Previous close", "OK", f"{c['prev_close']:,.2f} ({c.get('prev_src', '')})")
-    add("Daily candles", "OK", f"{len(c.get('candles') or [])} loaded")
+    add("Previous close", "OK" if c["prev_close"] and c["prev_close"] > 0 else "WARN",
+        f"{c['prev_close']:,.2f} ({c.get('prev_src', '')})")
+    add("Daily candles", "OK" if c.get("candles") else "WARN",
+        f"{len(c.get('candles') or [])} loaded" + (f" | {c['candle_err'][:80]}" if c.get("candle_err") else ""))
     add("Snapshot history", "OK", f"{len(c.get('hist') or [])} snapshot(s) stored today")
-    add("AI Council", "OK", f"Active ({c.get('ai', {}).get('_model', '')})")
+    _ai = c.get("ai") or {}
+    if "error" in _ai and "signal" not in _ai:
+        add("AI Council", "FAIL", str(_ai["error"])[:120])
+    else:
+        add("AI Council", "OK", f"Active ({_ai.get('_model', '')})")
     add("Clock", "OK", f"{now:%a %d %b %H:%M:%S} IST, market {'OPEN' if live else 'CLOSED'}")
     return rows
 
@@ -1946,10 +2018,6 @@ def esc(x):
 # SIDEBAR
 # ============================================================
 with st.sidebar:
-    if os.path.exists("logo.jpg"):
-        st.image("logo.jpg", width=220)
-    elif os.path.exists("logo.png"):
-        st.image("logo.png", width=220)
     
     st.markdown("### BBG // TERMINAL v13.2")
     dhan_token = clean(get_secret("DHAN_ACCESS_TOKEN", DEFAULT_DHAN_TOKEN))
@@ -2014,6 +2082,8 @@ with st.sidebar:
     auto_refresh = st.toggle("AUTO REFRESH (3 MIN)", value=True)
     if auto_refresh and st_autorefresh:
         st_autorefresh(interval=180000, limit=None, key="bbg")
+    elif auto_refresh:
+        st.caption("Auto refresh needs: pip install streamlit-autorefresh")
 
 
 # ============================================================
@@ -2047,6 +2117,8 @@ if live_news:
 news_text = news_for_ai(news_items, news)
 nhash = news_hash(news_items)
 
+_ai_key = f"{idx_name}|{expiry}"
+st.session_state["_cur_ai_key"] = _ai_key
 changed, reason = evaluate_market_state_change(m, vel, nhash)
 _last_try = st.session_state.get("last_ai_attempt")
 _retry_ok = _last_try is None or (datetime.now(IST) - _last_try).total_seconds() >= AI_RETRY_SEC
@@ -2055,9 +2127,10 @@ if force_run or (changed and _retry_ok):
     ai = run_council(m, vel, news_text, groq_key, groq_model)
     if "error" not in ai:
         st.session_state.last_ai_verdict = ai
+        st.session_state.last_ai_verdict_key = _ai_key
         st.session_state.last_ai_time = datetime.now(IST)
         st.session_state.last_ai_state = {
-            "spot": m["spot"], "pcr": m["pcr"], "call_wall": m["call_wall"],
+            "key": _ai_key, "spot": m["spot"], "pcr": m["pcr"], "call_wall": m["call_wall"],
             "put_wall": m["put_wall"], "gamma_strike": m["gamma_strike"], "status": m["status"],
             "gex_regime": m.get("gex_regime"),
             "trap_active": bool(m["ce_trap"] or m["pe_trap"]),
@@ -2067,11 +2140,11 @@ if force_run or (changed and _retry_ok):
         gate_label = f"FRESH ({'FORCED' if force_run else reason}) | {ai.get('_model', groq_model)}"
     else:
         err = ai["error"]
-        cached = st.session_state.get("last_ai_verdict")
+        cached = valid_cached_verdict(_ai_key)
         ai = cached if cached else ai
         gate_label = f"AI ERROR: {err}"
 else:
-    ai = st.session_state.get("last_ai_verdict", {"error": "No verdict yet."})
+    ai = valid_cached_verdict(_ai_key) or {"error": "No fresh AI verdict (none yet, expired, or different index/expiry)."}
     t = st.session_state.get("last_ai_time")
     gate_label = f"CACHED {t.strftime('%H:%M:%S') if t else ''}"
 
@@ -2089,14 +2162,18 @@ if "scorecard" not in st.session_state:
     st.session_state["scorecard"] = load_scorecard()
 card = st.session_state["scorecard"]
 tone_now = headline_tone(news_items) if news_items else 0
-new_recs = []
-if log_on and sig is not None:
-    _chg, _resolved = update_outcomes(card, idx_name, spot, now_ist, candles_pre)
-    new_recs = maybe_log_signal(card, idx_name, expiry, m, sig, ai, tone_now, now_ist)
+new_recs, _resolved, _touched = [], [], []
+if log_on:
+    sync_scorecard(card)
+    _chg, _resolved, _touched = update_outcomes(card, idx_name, spot, now_ist, candles_pre)
+    if sig is not None:
+        new_recs = maybe_log_signal(card, idx_name, expiry, m, sig, ai, tone_now, now_ist)
     if _chg or new_recs:
         save_scorecard(card)
     for _r in new_recs:
         post_webhook(log_hook, {"event": "signal_logged", **_r})
+    for _r in _touched:
+        post_webhook(log_hook, {"event": "signal_touched", **_r})
     for _r in _resolved:
         post_webhook(log_hook, {"event": "signal_resolved", **_r})
 
@@ -2111,21 +2188,16 @@ alert_results = []
 if alerts_on and tg_token and tg_chat:
     for _r in new_recs:
         alert_results += fire_alert(f"auto_sig_{_r['id']}", signal_alert_text(_r), 0, alert_cfg)
+    for _r in _touched:
+        alert_results += fire_alert(f"auto_touch_{_r['id']}", outcome_alert_text(_r), 0, alert_cfg)
     for _r in _resolved:
-        if _r.get("outcome") in ("TARGET", "STOP"):
+        if _r.get("outcome") in ("TARGET", "STOP") and not _r.get("touch_alerted"):
             alert_results += fire_alert(f"auto_res_{_r['id']}", outcome_alert_text(_r), 0, alert_cfg)
 
 # ============================================================
-# DASHBOARD HEADER — title left, brand logo top-right
+# DASHBOARD HEADER
 # ============================================================
-_header_title, _header_logo = st.columns([8, 2], vertical_alignment="center")
-with _header_title:
-    st.markdown(f"## {idx_name} // SPOT {spot:,.2f}" + (f"  ({spot - prev_close:+,.2f})" if prev_close > 0 else ""))
-with _header_logo:
-    # Keep logo asset in the same GitHub repository folder as app.py.
-    _logo_path = "logo.png" if os.path.exists("logo.png") else "logo.jpg" if os.path.exists("logo.jpg") else None
-    if _logo_path:
-        st.image(_logo_path, width=160, caption=None)
+st.markdown(f"## {idx_name} // SPOT {spot:,.2f}" + (f"  ({spot - prev_close:+,.2f})" if prev_close > 0 else ""))
 
 _mkt = "OPEN" if market_open_now(now_ist) else "CLOSED"
 st.caption(f"{now_ist.strftime('%a %d %b %Y %H:%M:%S')} IST | market {_mkt} | dealer gamma {m['gex_regime']}")
@@ -2237,6 +2309,9 @@ with tab5:
 
 with tab6:
     st.caption(f"1σ range to expiry: {m['lower_1sigma']:,.0f} to {m['upper_1sigma']:,.0f}  |  Updated {datetime.now(IST).strftime('%H:%M:%S')} IST")
+    _dq = data_quality(m)
+    if _dq:
+        st.warning(_dq)
     show_df(m["df"], hide_index=True)
 
 
@@ -2245,6 +2320,19 @@ with tab7:
     recs = st.session_state["scorecard"]
     if recs:
         show_df(scorecard_summary(recs), hide_index=True)
+        _ts = touch_stats(recs)
+        t1, t2, t3, t4, t5 = st.columns(5)
+        t1.metric("TARGET HITS", _ts["target"])
+        t2.metric("STOP HITS", _ts["stop"])
+        t3.metric("TIMEOUTS", _ts["timeout"])
+        t4.metric("OPEN", _ts["open"])
+        t5.metric("TARGET RATE", f"{_ts['target_rate']:.1f}%" if _ts["target_rate"] is not None else "—")
+        if len(recs) < MIN_SAMPLE_FOR_VERDICT:
+            st.caption(f"Only {len(recs)} record(s): need about {MIN_SAMPLE_FOR_VERDICT}+ before trusting any edge stat.")
+        _ce = check_edge_table(recs)
+        if not _ce.empty:
+            st.markdown("##### Check Edge (60 min)")
+            show_df(_ce, hide_index=True)
         st.markdown("##### Rejection Reason Breakdown")
         show_df(rejection_breakdown_table(recs), hide_index=True)
         st.markdown("##### Recent Records")
