@@ -2143,7 +2143,15 @@ with tab1:
     </div>""", unsafe_allow_html=True)
 
     g1, g2, g3, g4 = st.columns(4)
-    g1.metric("GAMMA FLIP", f"{m['gamma_flip']:,.0f}" if m["gamma_flip"] else "—", f"{m['spot'] - m['gamma_flip']:+,.0f} vs spot" if m["gamma_flip"] else "One-sided", delta_color="off")
+    # Compatibility fix: current metrics expose zero_gamma; older UI expected gamma_flip.
+    gamma_flip_value = m.get("gamma_flip", m.get("zero_gamma"))
+    gamma_flip_valid = gamma_flip_value is not None and pd.notna(gamma_flip_value) and float(gamma_flip_value) != 0.0
+    g1.metric(
+        "GAMMA FLIP",
+        f"{float(gamma_flip_value):,.0f}" if gamma_flip_valid else "—",
+        f"{m['spot'] - float(gamma_flip_value):+,.0f} vs spot" if gamma_flip_valid else "No zero-gamma level detected",
+        delta_color="off",
+    )
     g2.metric("SYNTHETIC FUTURE", f"{m['syn_fut']:,.1f}", f"Basis {m['basis']:+.1f}", delta_color="off")
     g3.metric("25Δ RISK REVERSAL", f"{m['rr_25']:+.2f}%", f"25Δ CE {m['iv_25c']:.1f}%", delta_color="off")
     g4.metric("NET GEX", f"{m['net_gex']:+,.0f}", f"VEX {m['net_vex']:+,.0f}", delta_color="off")
