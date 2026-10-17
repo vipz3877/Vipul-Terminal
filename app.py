@@ -2172,7 +2172,16 @@ with tab1:
     j1, j2, j3 = st.columns(3)
     j1.metric("LADDER IMBALANCE", f"{m['jobber']['ladder_imbalance']:+.3f}")
     j2.metric("POCKET SUPPORT", f"{m['jobber']['pocket_support']:,.0f}")
-    j3.metric("MICRO-TURN", m["jobber"]["micro_turn"])
+    # Custom responsive card: Streamlit's metric value is single-line and can
+    # truncate long micro-turn labels in narrower columns.
+    micro_turn_text = html.escape(str(m["jobber"].get("micro_turn", "—")))
+    j3.markdown(
+        f"""<div style=\"border:1px solid #333;border-radius:5px;padding:10px 12px;min-height:78px;box-sizing:border-box;width:100%;overflow:hidden;\">
+          <div style=\"font-size:0.75rem;line-height:1.25;color:#ff9800;letter-spacing:0.04em;margin-bottom:8px;\">MICRO-TURN</div>
+          <div style=\"font-family:'Courier New',monospace;font-size:clamp(0.82rem,1.15vw,1.18rem);line-height:1.3;color:#fff;white-space:normal;overflow-wrap:anywhere;word-break:normal;\">{micro_turn_text}</div>
+        </div>""",
+        unsafe_allow_html=True,
+    )
 
 
 with tab2:
