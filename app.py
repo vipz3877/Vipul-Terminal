@@ -1,5 +1,5 @@
 """
-VIPUL BLOOMBERG PROFESSIONAL TERMINAL v13.1 SECURE EDITION
+VIPUL BLOOMBERG PROFESSIONAL TERMINAL v13.2 SECURE EDITION
 Analysis terminal combining:
  - Dual-Force Engine & Jobber Microstructure (net-capitulation aware, scale-invariant)
  - Dealer Positioning Engine: Signed Net GEX, interpolated Zero-Gamma Flip, Net Vanna & Charm
@@ -39,7 +39,7 @@ try:
 except ImportError:
     Groq = None
 
-st.set_page_config(page_title="Vipul Bloomberg Terminal v13.1", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Vipul Bloomberg Terminal v13.2", layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
 # CSS
@@ -68,7 +68,7 @@ h1,h2,h3,h4 { color:#ff9800 !important; font-family:'Courier New',monospace; let
 
 
 # ============================================================
-# CONFIG (Pulls strictly from Streamlit Secrets / Environment)
+# CONFIG & GLOBAL INITIALIZATIONS
 # ============================================================
 def get_secret(name, default=""):
     try:
@@ -135,6 +135,22 @@ INDEX_MAP = {
     "NIFTY BANK": {"scrip": 25, "seg": "IDX_I", "step": 100},
     "FINNIFTY": {"scrip": 27, "seg": "IDX_I", "step": 50},
     "MIDCPNIFTY": {"scrip": 118, "seg": "IDX_I", "step": 25},
+}
+
+# Ensure Surface Check globals are safely initialized here to prevent NameErrors
+DIV_YIELD = 0.013
+GEX_BAND_PCT = 5.0
+GEX_WINDOWS = (4, 8, 16)
+BASIS_MIN_PTS = 8.0
+SURF_CHECK_NAME = "Synthetic basis vs fair carry"
+USE_SURFACE_CHECK = {"on": False}
+SURFACE_KEYS = ("syn_fut", "fair_fwd", "carry", "basis", "excess_basis", "surface_ok", "iv_25c", "iv_25p", "rr_25", "bf_25",
+                "net_gex", "gross_gex", "gex_regime", "gex_regime_label", "regime_stable", "regime_by_window", "crossover",
+                "zero_gamma", "total_gex_at_spot", "net_vex", "net_cex")
+REGIME_LABEL = {
+    "POSITIVE": "POSITIVE GAMMA (if dealers are long calls / short puts: mean-reverting)",
+    "NEGATIVE": "NEGATIVE GAMMA (if dealers are long calls / short puts: momentum / breakout)",
+    "NEUTRAL": "NEUTRAL GAMMA (net exposure near zero)",
 }
 
 
@@ -816,7 +832,7 @@ def update_oi_velocity(m, key):
         if stk not in snap["map"]:
             continue
         p_ce, p_pe = snap["map"][stk]
-        d_ce, d_pe = c_ce - p_ce, c_ce - p_pe
+        d_ce, d_pe = c_ce - p_ce, c_pe - p_pe
         if d_ce > 0:
             vel["ce_builds"] += d_ce
         elif d_ce < 0:
@@ -1525,10 +1541,10 @@ def fetch_today_ohlc(scrip, seg, token, client_id):
 
 
 # ============================================================
-# SCORECARD, ALERTS & DATA HEALTH (FULLY AUTOMATED v13.1)
+# SCORECARD, ALERTS & DATA HEALTH (FULLY AUTOMATED v13.2)
 # ============================================================
-SCORECARD_FILE = os.path.join(tempfile.gettempdir(), "bbg_scorecard_v13_1.json")
-ALERT_FILE = os.path.join(tempfile.gettempdir(), "bbg_alerts_sent_v13_1.json")
+SCORECARD_FILE = os.path.join(tempfile.gettempdir(), "bbg_scorecard_v13_2.json")
+ALERT_FILE = os.path.join(tempfile.gettempdir(), "bbg_alerts_sent_v13_2.json")
 SIGNAL_DEDUP_MIN = 30
 OUTCOME_HORIZONS = (15, 30, 60)
 HORIZON_TOL_MIN = 10
@@ -1930,13 +1946,12 @@ def esc(x):
 # SIDEBAR
 # ============================================================
 with st.sidebar:
-    # Embedded Quick Insights Logo
     if os.path.exists("logo.jpg"):
         st.image("logo.jpg", width=220)
     elif os.path.exists("logo.png"):
         st.image("logo.png", width=220)
     
-    st.markdown("### BBG // TERMINAL v13.1")
+    st.markdown("### BBG // TERMINAL v13.2")
     dhan_token = clean(get_secret("DHAN_ACCESS_TOKEN", DEFAULT_DHAN_TOKEN))
     client_id = clean(get_secret("DHAN_CLIENT_ID", DEFAULT_CLIENT_ID))
     groq_key = get_secret("GROQ_API_KEY", DEFAULT_GROQ_KEY).strip()
@@ -2091,7 +2106,6 @@ health_rows = data_health({
     "hist": hist, "news_items": news_items, "news_status": news_status, "live_news": live_news, "ai": ai,
     "groq_key": groq_key})
 
-# FULLY AUTOMATED TELEGRAM DISPATCHER (Validated, Rejected, Target-Hit, Stop-Loss)
 alert_cfg = {"enabled": alerts_on, "tg_token": tg_token, "tg_chat": tg_chat}
 alert_results = []
 if alerts_on and tg_token and tg_chat:
