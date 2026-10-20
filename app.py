@@ -1,5 +1,5 @@
 """
-VIPUL BLOOMBERG TERMINAL v13.3 - ERROR FREE COMPLETE EDITION
+VIPUL BLOOMBERG TERMINAL v13.3 - WITH INDEX SELECTOR
 """
 
 import os
@@ -19,7 +19,7 @@ import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-# Optional imports with graceful fallback
+# Optional imports
 try:
     from groq import Groq
 except ImportError:
@@ -31,7 +31,7 @@ except ImportError:
     go = None
 
 # ============================================================
-# PAGE CONFIGURATION
+# PAGE CONFIG
 # ============================================================
 st.set_page_config(page_title="Vipul Bloomberg Terminal v13.3", layout="wide", initial_sidebar_state="expanded")
 
@@ -48,21 +48,12 @@ h1,h2,h3,h4 { color:#ff9800 !important; font-family:'Courier New',monospace; let
 .bbg-panel { border:1px solid #333; background:#0f0f0f; padding:14px; border-radius:4px; margin-bottom:12px; }
 .bbg-title { font-size:12px; color:#888; letter-spacing:2px; text-transform:uppercase; }
 .bbg-big { font-size:26px; font-weight:800; }
-.agent { font-size:13px; color:#ddd; margin:4px 0; }
-.agent b { color:#ff9800; }
-@keyframes flashGreen { 0%,100% {box-shadow:0 0 0 rgba(0,230,118,0);} 50% {box-shadow:0 0 28px rgba(0,230,118,.9);} }
-@keyframes flashRed   { 0%,100% {box-shadow:0 0 0 rgba(255,23,68,0);} 50% {box-shadow:0 0 28px rgba(255,23,68,.9);} }
-@keyframes flashAmber { 0%,100% {box-shadow:0 0 0 rgba(255,171,0,0);} 50% {box-shadow:0 0 22px rgba(255,171,0,.8);} }
-.flash-green { animation: flashGreen 1s infinite; }
-.flash-red   { animation: flashRed 1s infinite; }
-.flash-amber { animation: flashAmber 1.4s infinite; }
 </style>
 """, unsafe_allow_html=True)
 
 # ============================================================
 # ⭐ CRITICAL: SESSION STATE INITIALIZATION
 # ============================================================
-# ALL keys MUST be initialized BEFORE any sidebar widgets reference them
 for key in ["time_basis", "skew_coef", "min_confirm", "dominance", "flow_edge_pct", 
             "min_rr", "sl_buffer", "noise_pct", "exh_context_sigma", "exh_alert",
             "min_flow_pct", "surface_check", "use_surface_check"]:
@@ -74,14 +65,13 @@ for key in ["time_basis", "skew_coef", "min_confirm", "dominance", "flow_edge_pc
         elif key == "flow_edge_pct": st.session_state[key] = 2.0
         elif key == "min_rr": st.session_state[key] = 1.0
         elif key == "sl_buffer": st.session_state[key] = 35
-        elif key == "noise_pct": st.session_state[key] = 0.5  # ✅ Fixed: direct value, no int()*100
+        elif key == "noise_pct": st.session_state[key] = 0.5
         elif key == "exh_context_sigma": st.session_state[key] = 0.4
         elif key == "exh_alert": st.session_state[key] = 60
         elif key == "min_flow_pct": st.session_state[key] = 2.0
         elif key == "surface_check": st.session_state[key] = False
         elif key == "use_surface_check": st.session_state[key] = False
 
-# Now safe to reference these
 TIME_BASIS = st.session_state["time_basis"]
 SKEW_COEF = st.session_state["skew_coef"]
 MIN_CONFIRM = st.session_state["min_confirm"]
@@ -96,30 +86,59 @@ MIN_FLOW_PCT = st.session_state["min_flow_pct"]
 USE_SURFACE_CHECK = st.session_state["surface_check"]
 
 # ============================================================
-# SAFE JSON PARSING (P0 CRITICAL FIX)
+# INDEX SELECTOR (ADDED - This is what you're looking for!)
+# ============================================================
+st.sidebar.title("📈 SELECT INDEX")
+INDEX_CHOICE = st.sidebar.selectbox(
+    "Choose NSE Index:",
+    options=["NIFTY 50", "NIFTY BANK", "FINNIFTY", "MIDCPNIFTY"],
+    index=0,  # Default to NIFTY 50
+    help="Select your desired index - step sizes auto-adjust below"
+)
+
+# Index mappings (matching your TOML credentials)
+INDEX_MAP = {
+    "NIFTY 50": {"scrip": 13, "seg": "IDX_I", "step": 50},
+    "NIFTY BANK": {"scrip": 25, "seg": "IDX_I", "step": 100},
+    "FINNIFTY": {"scrip": 27, "seg": "IDX_I", "step": 50},
+    "MIDCPNIFTY": {"scrip": 118, "seg": "IDX_I", "step": 25},
+}
+
+# Get selected index config
+if INDEX_CHOICE in INDEX_MAP:
+    selected_idx = INDEX_MAP[INDEX_CHOICE]
+    SCRIP = selected_idx["scrip"]
+    SEG = selected_idx["seg"]
+    STEP = selected_idx["step"]
+else:
+    # Fallback to Nifty 50
+    selected_idx = INDEX_MAP["NIFTY 50"]
+    SCRIP = selected_idx["scrip"]
+    SEG = selected_idx["seg"]
+    STEP = selected_idx["step"]
+    INDEX_CHOICE = "NIFTY 50"
+
+# ============================================================
+# SAFE JSON PARSING
 # ============================================================
 def safe_json_parse(txt: str) -> dict:
-    """Robust JSON parsing - never crashes on bad LLM output."""
     try:
         return json.loads(txt.strip())
     except json.JSONDecodeError:
         pass
     import re
-    # Try extracting from code blocks
     match = re.search(r'```(?:json)?\n(.*?)```', txt, re.DOTALL)
     if match:
         try: return json.loads(match.group(1).strip())
         except json.JSONDecodeError: pass
-    # Try finding first complete JSON object
     match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', txt.strip())
     if match:
         try: return json.loads(match.group())
         except json.JSONDecodeError: pass
-    # Return safe default instead of crashing
     return {"error": "LLM_JSON_PARSE_FAILED", "signal": "WAIT", "confidence": 0, "raw_preview": txt[:500]}
 
 # ============================================================
-# API FUNCTIONS (Dhan Integration)
+# API FUNCTIONS
 # ============================================================
 def auth_headers(token, client_id):
     return {"Content-Type": "application/json", "Accept": "application/json",
@@ -132,7 +151,6 @@ def check(r):
     elif r.status_code == 429: hint = " -> rate limited."
     raise RuntimeError(f"HTTP {r.status_code}")
 
-# Rate throttle (in-memory, good for single-user)
 _last_api_call = 0
 def api_throttle():
     global _last_api_call
@@ -201,149 +219,107 @@ def fetch_daily_candles(scrip, seg, token, client_id):
     raise RuntimeError("No candle data")
 
 # ============================================================
-# GREEKS & MATH FUNCTIONS
+# GREEKS & MATH
 # ============================================================
 def bs_price(S, K, T, iv_pct, is_call):
     sigma = iv_pct / 100.0
-    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
-        return max(0.0, (S - K) if is_call else (K - S))
-    sq = sigma * math.sqrt(T)
-    d1 = (math.log(S / K) + (RISK_FREE + 0.5 * sigma * sigma) * T) / sq
-    d2 = d1 - sq
-    disc = math.exp(-RISK_FREE * T)
-    return S * _ncdf(d1) - K * disc * _ncdf(d2) if is_call else K * disc * _ncdf(-d2) - S * _ncdf(-d2) if is_call else K * disc * _ncdf(-d2) - S * _ncdf(-d2)
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0: return max(0.0, (S - K) if is_call else (K - S))
+    sq = sigma * math.sqrt(T); d1 = (math.log(S / K) + (RISK_FREE + 0.5*sigma**2)*T)/sq
+    d2 = d1 - sq; disc = math.exp(-RISK_FREE*T)
+    return S * _ncdf(d1) - K * disc * _ncdf(d2) if is_call else K * disc * _ncdf(-d2) - S * _ncdf(-d2)
 
 def _ncdf(x): return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 def bs_delta(S, K, T, iv_pct, is_call):
     sigma = iv_pct / 100.0
-    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
-        return (1.0 if S > K else 0.0) if is_call else (-1.0 if S < K else 0.0)
-    sq = sigma * math.sqrt(T)
-    d1 = (math.log(S / K) + (RISK_FREE + 0.5 * sigma * sigma) * T) / sq
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0: return (1.0 if S > K else 0.0) if is_call else (-1.0 if S < K else 0.0)
+    sq = sigma * math.sqrt(T); d1 = (math.log(S / K) + (RISK_FREE + 0.5*sigma**2)*T)/sq
     return _ncdf(d1) if is_call else _ncdf(d1) - 1.0
 
-def bs_vega(S, K, T, iv_pct):  # ⭐ NEW: Explicit Vega Greek
+def bs_vega(S, K, T, iv_pct):
     sigma = iv_pct / 100.0
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0: return 0.0
-    sg = sigma * sigma; sq = sigma * math.sqrt(T)
-    d1 = (math.log(S / K) + (RISK_FREE + 0.5 * sg) * T) / sq
-    n_d1 = math.exp(-0.5 * d1 * d1) / math.sqrt(2.0 * math.pi)
+    sg = sigma * sigma; sq = sigma * math.sqrt(T); d1 = (math.log(S / K) + (RISK_FREE + 0.5*sg)*T)/sq
+    n_d1 = math.exp(-0.5*d1*d1) / math.sqrt(2.0*math.pi)
     return S * n_d1 * sq
 
 def calc_vega_exposure(m) -> dict:
-    """Calculate portfolio vega exposure from near-spot options."""
     df = m["near"]
-    if df.empty: return {"total_vega": 0, "ce_vega": 0, "pe_vega": 0, "vega_net": 0}
+    if df.empty: return {"total_vega":0,"ce_vega":0,"pe_vega":0,"vega_net":0}
     ce_v = pe_v = 0.0
-    for _, r in df.iterrows():
+    for _,r in df.iterrows():
         K = _n(r["Strike"]); T = m["t_years"]
-        if _n(r["CE_IV"]) > 0 and K > 0: ce_v += bs_vega(m["spot"], K, T, _n(r["CE_IV"])) * _n(r["CE_OI"]) / 100
-        if _n(r["PE_IV"]) > 0 and K > 0: pe_v += bs_vega(m["spot"], K, T, _n(r["PE_IV"])) * _n(r["PE_OI"]) / 100
-    return {"total_vega": round(ce_v + pe_v, 2),
-            "ce_vega": round(ce_v, 2),
-            "pe_vega": round(pe_v, 2),
-            "vega_net": round(ce_v - pe_v, 2)}
+        if _n(r["CE_IV"])>0 and K>0: ce_v += bs_vega(m["spot"],K,T,_n(r["CE_IV"])) * _n(r["CE_OI"])/100
+        if _n(r["PE_IV"])>0 and K>0: pe_v += bs_vega(m["spot"],K,T,_n(r["PE_IV"])) * _n(r["PE_OI"])/100
+    return {"total_vega":round(ce_v+pe_v,2),"ce_vega":round(ce_v,2),"pe_vega":round(pe_v,2),"vega_net":round(ce_v-pe_v,2)}
 
-# Core constants
-RISK_FREE = 0.065; MIN_PREMIUM = 5.0; IST = timezone(timedelta(hours=5, minutes=30))
+RISK_FREE = 0.065; MIN_PREMIUM = 5.0; IST = timezone(timedelta(hours=5,minutes=30))
 DATA_DIR = os.getenv("BBG_DATA_DIR") or tempfile.gettempdir()
 try: os.makedirs(DATA_DIR, exist_ok=True)
 except: pass
 
-INDEX_MAP = {"NIFTY 50": {"scrip": 13, "seg": "IDX_I", "step": 50},
-             "NIFTY BANK": {"scrip": 25, "seg": "IDX_I", "step": 100},
-             "FINNIFTY": {"scrip": 27, "seg": "IDX_I", "step": 50},
-             "MIDCPNIFTY": {"scrip": 118, "seg": "IDX_I", "step": 25}}
-
 # ============================================================
-# ⭐ ADAPTIVE STRATEGIES ENGINE
+# ADAPTIVE STRATEGIES ENGINE
 # ============================================================
 def select_adaptive_strategy(m) -> dict:
-    """P2: Auto-select optimal strategy based on current metrics."""
-    # ✅ CORRECT: Separate dictionary accesses (NO semicolons inside brackets)
     regime = m["gex_regime"]
-    iv_pct = m["atm_iv"]
-    dte = m["dte"]
-    ex = m["exh"]
+    iv_pct = m["atm_iv"]; dte = m["dte"]; ex = m["exh"]
     exhaustion = ex["buyer"]["status"] if ex["ready"] else "COLLECTING"
     flow_gap = abs(m["engine"]["pe_net_flow"] - m["engine"]["ce_net_flow"])
     
-    strat = {"name": "SIDELINES", "action": "WAIT", "position_size_pct": 0,
-             "expected_holding": "UNKNOWN", "rationale": []}
+    strat = {"name":"SIDELINES","action":"WAIT","position_size_pct":0,"expected_holding":"UNKNOWN","rationale":[]}
     
-    # Strategy 1: Negative gamma momentum
     if regime == "NEGATIVE" and exhaustion != "CONFIRMED" and flow_gap > 15000:
-        strat = {"name": "MOMENTUM BREAKOUT", "action": "BUY", "position_size_pct": 15,
-                 "expected_holding": "1-3 days",
-                 "rationale": ["Negative gamma = dealer short gamma = momentum favoring",
-                               "Strong OI flow confirms direction",
-                               "No exhaustion = trend intact"]}
-    # Strategy 2: Positive gamma mean reversion with exhaustion
+        strat = {"name":"MOMENTUM BREAKOUT","action":"BUY","position_size_pct":15,
+                 "expected_holding":"1-3 days",
+                 "rationale":["Negative gamma = momentum","Flow confirms direction","No exhaustion = trend intact"]}
     elif regime == "POSITIVE" and exhaustion == "CONFIRMED":
-        strat = {"name": "MEAN REVERSION PLAY", "action": "SELL", "position_size_pct": 10,
-                 "expected_holding": "Same day to expiry",
-                 "rationale": ["Positive gamma = dealer long gamma = mean reversion",
-                               "Exhaustion confirmed = trend spent",
-                               "Sell premium decaying to zero"]}
-    # Strategy 3: High IV near expiry = theta decay play
+        strat = {"name":"MEAN REVERSION PLAY","action":"SELL","position_size_pct":10,
+                 "expected_holding":"Same day to expiry",
+                 "rationale":["Positive gamma = mean reversion","Exhaustion confirmed = trend spent","Sell premium decaying to zero"]}
     elif iv_pct > 20 and dte < 21:
-        strat = {"name": "THETA DECAY ACCELERATION", "action": "SELL OTM", "position_size_pct": 12,
-                 "expected_holding": "Until 50% decay or 7 DTE",
-                 "rationale": ["Rich premium = favorable for sellers",
-                               "Time decay accelerates near expiry",
-                               "Limit risk with strict stops"]}
-    # Strategy 4: Low IV, far expiry = buy premium cheaply
+        strat = {"name":"THETA DECAY ACCELERATION","action":"SELL OTM","position_size_pct":12,
+                 "expected_holding":"Until 50% decay or 7 DTE",
+                 "rationale":["Rich premium = favorable for sellers","Time decay accelerates near expiry","Strict stops"]}
     elif iv_pct < 15 and dte > 45:
-        strat = {"name": "IV REVERSION LONG", "action": "BUY OTM", "position_size_pct": 8,
-                 "expected_holding": "Until IV expands or 50% move",
-                 "rationale": ["Cheap premium = favorable for buyers",
-                               "IV expansion potential",
-                               "Far expiry = room for thesis to play out"]}
-    # Default: sidelines
+        strat = {"name":"IV REVERSION LONG","action":"BUY OTM","position_size_pct":8,
+                 "expected_holding":"Until IV expands or 50% move",
+                 "rationale":["Cheap premium = favorable for buyers","IV expansion potential","Far expiry = room for thesis"]}
     return strat
 
 # ============================================================
-# ⭐ CONFLUENCE SCORING SYSTEM
+# CONFLUENCE SCORING
 # ============================================================
 def confluence_score(m, ai_signal: str) -> dict:
-    """P1: Calculate confluence score with component breakdown (0-100)."""
-    comp = {"gamma_regime": 0, "oi_flow": 0, "technical_levels": 0,
-            "sentiment": 0, "risk_reward": 0}
+    comp = {"gamma_regime":0,"oi_flow":0,"technical_levels":0,"sentiment":0,"risk_reward":0}
     
-    # Gamma regime contribution (0-20 points)
     if m["gex_regime"] == "NEGATIVE" and ai_signal == "BUY": comp["gamma_regime"] = 20
     elif m["gex_regime"] == "POSITIVE" and ai_signal == "SELL": comp["gamma_regime"] = 20
     elif m["gex_regime"] == "NEUTRAL": comp["gamma_regime"] = 10
     
-    # OI flow contribution (0-20 points)
     flow_gap = m["engine"]["pe_net_flow"] - m["engine"]["ce_net_flow"]
     comp["oi_flow"] = 20 if abs(flow_gap) > 20000 else (10 if abs(flow_gap) > 10000 else 0)
     
-    # Technical levels contribution (0-20 points)
     comp["technical_levels"] = 15 if m["struct"]["res"] and m["struct"]["sup"] else 5
     if m["zero_gamma"]: comp["technical_levels"] += 5
     
-    # Sentiment contribution (0-20 points)
-    comp["sentiment"] = 10 if (ai_signal == "BUY" and m.get("headline_tone", 0) > 0) or \
-                          (ai_signal == "SELL" and m.get("headline_tone", 0) < 0) else 0
+    comp["sentiment"] = 10 if (ai_signal == "BUY" and m.get("headline_tone",0) > 0) or \
+                          (ai_signal == "SELL" and m.get("headline_tone",0) < 0) else 0
     
-    # Risk-reward contribution (0-20 points)
-    rr = m.get("rr", 0)
+    rr = m.get("rr",0)
     comp["risk_reward"] = 20 if rr and rr >= 2.0 else (10 if rr and rr >= 1.0 else 0)
     
     total = sum(comp.values())
     grade = "A+" if total >= 80 else "A" if total >= 65 else "B" if total >= 50 else "C"
     rec = "HIGH CONFIDENCE" if total >= 80 else "MODERATE" if total >= 50 else "LOW - Stand Aside"
     
-    return {"total": total, "components": comp, "grade": grade,
-            "confidence": min(100, total), "recommendation": rec}
+    return {"total":total,"components":comp,"grade":grade,"confidence":min(100,total),"recommendation":rec}
 
 # ============================================================
-# ⭐ MAIN APPLICATION FUNCTION
+# MAIN APPLICATION
 # ============================================================
 def main():
-    # ⭐ ⭐ ⭐ DISCLAIMER INLINED DIRECTLY - prevents NameError from function call ordering
+    # Disclaimer inlined
     st.markdown("""
     <div style="border-left:4px solid #ff9800;background:#2a0a0a;padding:12px 16px;margin:12px 0;border-radius:4px;
                 color:#ff9800;font-family:'Courier New',monospace;font-size:0.85rem;margin-bottom:20px;">
@@ -354,18 +330,20 @@ def main():
     
     st.sidebar.title("🎛️ VIPUL TERMINAL PARAMETERS")
     
-    # ⭐ ⭐ ⭐ ALL SLIDERS USE SESSION STATE DIRECTLY - NO int()*100 ERRORS
+    # ✅ INDEX SELECTOR NOW AT TOP OF SIDEBAR
+    st.sidebar.caption(f"📊 Current: {INDEX_CHOICE} (Scrip: {SCRIP}, Step: {STEP})")
+    
+    # All sliders use session state directly - FIXED from earlier errors
     MIN_CONFIRM = st.sidebar.slider("Min signal confirmation", 1, 5, st.session_state["min_confirm"])
     DOMINANCE = st.sidebar.slider("Gamma dominance ratio", 1.0, 3.0, float(st.session_state["dominance"]))
     FLOW_EDGE_PCT = st.sidebar.slider("Near-spot flow edge %", 0.5, 5.0, float(st.session_state["flow_edge_pct"]))
     MIN_RR = st.sidebar.slider("Minimum risk:reward", 0.5, 3.0, float(st.session_state["min_rr"]))
     SL_BUFFER = st.sidebar.slider("Stop-loss buffer (pts)", 10, 100, int(st.session_state["sl_buffer"]))
     MIN_FLOW_PCT = st.sidebar.slider("Min flow percentage", 0.5, 5.0, float(st.session_state["min_flow_pct"]))
-    NOISE_PCT = st.sidebar.slider("Noise floor %", 0.1, 2.0, st.session_state["noise_pct"])  # ✅ FIXED: direct use
+    NOISE_PCT = st.sidebar.slider("Noise floor %", 0.1, 2.0, st.session_state["noise_pct"])
     EXH_CONTEXT_SIGMA = st.sidebar.slider("Exhaustion context σ", 0.1, 1.0, float(st.session_state["exh_context_sigma"]))
     EXH_ALERT = st.sidebar.slider("Exhaustion alert score", 30, 90, int(st.session_state["exh_alert"]))
     
-    # Save updated parameters back to session state
     st.session_state["min_confirm"] = MIN_CONFIRM
     st.session_state["dominance"] = DOMINANCE
     st.session_state["flow_edge_pct"] = FLOW_EDGE_PCT
@@ -376,107 +354,66 @@ def main():
     st.session_state["exh_context_sigma"] = EXH_CONTEXT_SIGMA
     st.session_state["exh_alert"] = EXH_ALERT
     
-    st.sidebar.success(f"✅ Parameters: MinConfirm={MIN_CONFIRM}, Dom={DOMINANCE:.1f}x, MinRR=1:{MIN_RR:.1f}, SL={SL_BUFFER}pts")
+    st.sidebar.success(f"✅ Parameters: {INDEX_CHOICE} | MinConfirm={MIN_CONFIRM}, Dom={DOMINANCE:.1f}x")
     
-    # ============================================================
-    # HEADER METRICS ROW
-    # ============================================================
+    # Header metrics
     st.title("📊 VIPUL BLOOMBERG TERMINAL v13.3")
-    
-    # Three columns for key metrics
     c1, c2, c3 = st.columns(3)
-    with c1:
-        st.metric("SPOT", "--", "--")
-    with c2:
-        st.metric("PCR", "--", "--")
-    with c3:
-        st.metric("GEX REGIME", "--", "--")
+    with c1: st.metric("SPOT", "--", "--")
+    with c2: st.metric("PCR", "--", "--")
+    with c3: st.metric("GEX REGIME", "--", "--")
     
-    # ⭐ STRATEGY RECOMMENDATION CARD
     st.markdown("### 🎯 STRATEGY RECOMMENDATION")
-    st.info("📈 Configure Dhan API credentials and select an index above to see adaptive strategy recommendations based on current gamma regime, IV, and exhaustion status.")
+    st.info(f"📈 {INDEX_CHOICE} adaptive strategy ready - configure Dhan API to load live data")
     
-    # ⭐ CONFLUENCE ANALYSIS DISPLAY
     st.markdown("### 📊 CONFLUENCE ANALYSIS")
-    st.caption("Multi-factor signal validation showing A+/A/B/C grade with component breakdown (0-100 scale)")
+    st.caption("Multi-factor signal validation - A+/A/B/C grade with component breakdown")
     
-    # ============================================================
-    # TABS FOR DIFFERENT ANALYSIS VIEWS
-    # ============================================================
+    # Tabs
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Dashboard", "📐 Option Chain", "🤖 AI Council", "📒 Scorecard", "🩺 Data Health"])
     
     with tab1:
         st.header("Dashboard Overview")
-        st.markdown("**Full terminal features available once API credentials are configured**")
-        st.markdown("""
-        - 📈 Real-time option chain data from Dhan API  
-        - 🎯 GEX/gamma exposure analysis with regime detection
-        - 📉 IV percentile & skew richness assessment
-        - ⏰ Theta budget & expiration analysis
-        - 📰 News sentiment integration (Groq AI council)
-        - 🧨 Exhaustion monitor (buyer/seller scores)
-        - 📊 Confluence analysis & strategy recommendations
-        """)
+        st.markdown(f"**Index: {INDEX_CHOICE}** - Configure Dhan API to load live data")
+        st.markdown("- Real-time option chain, GEX analysis, IV percentile")
+        st.markdown("- Theta budget, exhaustion monitor, news sentiment")
+        st.markdown("- Confluence analysis & strategy recommendations")
     
     with tab2:
         st.header("Option Chain Analysis")
-        st.markdown("Configure credentials to load live Nifty/Bank Nifty options data")
-        st.markdown("""
-        - 📋 Complete strike chain with OI, IV, Greeks
-        - 📊 Volume & price data for all strikes
-        - 💰 Bid/ask spreads & mids
-        - 📈 Support/resistance OI walls
-        - 🎯 Max pain & gamma strike levels
-        """)
+        st.markdown(f"Configure for {INDEX_CHOICE} - live strikes, OI, IV, Greeks")
+        st.markdown("- Complete strike chain with support/resistance levels")
+        st.markdown("- Max pain, gamma strike, OI walls detection")
     
     with tab3:
         st.header("AI Council & News")
-        st.markdown("""
-        - 🤖 5-agent Groq multi-agent analysis
-        - 📰 Live headline sentiment scoring
-        - 📊 Price action, order flow, volatility, sentiment, risk officer agents
-        - 🎯 Final signal with confidence score
-        - 📝 JSON output with detailed reasoning
-        """)
+        st.markdown("Groq 5-agent analysis with live headline sentiment for {INDEX_CHOICE}")
+        st.markdown("- Price action, order flow, volatility, sentiment, risk officer")
     
     with tab4:
         st.header("Signal Scorecard")
-        st.markdown("""
-        - 📈 Track signal performance by gamma regime
-        - 📊 Win/loss rates, target hits, stop hits
-        - 💾 Export/import scorecard backup (JSON/CSV)
-        - 🔄 Merge previous scorecards for backtesting
-        - 📅 Regime-specific edge analysis
-        """)
+        st.markdown(f"Track {INDEX_CHOICE} signals by gamma regime, IV, DTE")
+        st.markdown("- CSV/JSON export/import for backtesting")
     
     with tab5:
         st.header("Data Health & Metrics")
-        st.markdown("""
-        - 🩺 Data quality scoring across all metrics
-        - 🔌 API status and rate limit tracking
-        - ⚙️ Calculation diagnostics and sanity checks
-        - 📋 Data completeness indicators
-        - 🔄 Auto-save scorecard with hash integrity
-        """)
-    
-    # ============================================================
-    # FOOTER WITH PARAMETER GUIDE
-    # ============================================================
+        st.markdown("Data quality scoring, API status, calculation diagnostics")
+
     st.sidebar.divider()
-    st.sidebar.caption("""
-    ⚙️ PARAMETER GUIDE:
-    - **Min Confirm**: Signals need this many "votes" to trigger (1-5)
-    - **Dominance**: How strongly one gamma force must dominate (1.0-3.0x)
-    - **Flow Edge**: % of OI change to count as directional flow (0.5-5.0%)
-    - **Min RR**: Minimum risk:reward ratio for trade entry (0.5-3.0)
-    - **SL Buffer**: Stop-loss distance from OI walls in pts (10-100)
-    - **Noise Floor**: % threshold to filter random OI changes (0.1-2.0%)
-    - **Exhaustion σ**: How many std devs for trend exhaustion (0.1-1.0)
-    - **Exhaustion Alert**: Score threshold (30-90) to flag exhaustion
+    st.sidebar.caption(f"""
+    ⚙️ PARAMETERS for {INDEX_CHOICE}:
+    - Min Confirm: 1-5 (votes needed to trigger signal)
+    - Dominance: 1.0-3.0x gamma force dominance
+    - Flow Edge: 0.5-5.0% OI change threshold
+    - Min RR: 0.5-3.0 risk:reward ratio
+    - SL Buffer: 10-100 pts stop-loss distance
+    - Noise Floor: 0.1-2.0% random change filter
+    - Exhaustion σ: 0.1-1.0 std deviations
+    - Exhaustion Alert: 30-90 score threshold
     """)
 
 # ============================================================
-# RUN THE APPLICATION
+# RUN APP
 # ============================================================
 if __name__ == "__main__":
     main()
