@@ -1,6 +1,6 @@
 # VIPUL BLOOMBERG PROFESSIONAL TERMINAL v13.3 FIXED EDITION
 # All prior bugs fixed: session-state init loop, slider guards, inline disclaimer,
-# safe_json_parse, and the NameError from get_expiries/fetch_expiries mismatch.
+# safe_json_parse, and the SyntaxError on queries list.
 
 import streamlit as st
 import json
@@ -13,10 +13,19 @@ import pandas as pd
 import requests
 from datetime import datetime, date, timezone, timedelta
 from email.utils import parsedate_to_datetime
-import urllib.parse  # added for news query encoding
+import urllib.parse  # Added for news query encoding
+import xml.etree.ElementTree as ET
+
+# Must be the first Streamlit command in the script.
+st.set_page_config(layout="wide", page_title="VIPUL BLOOMBERG PRO v13.3 FIXED")
+
+try:
+    from groq import Groq
+except ImportError:
+    Groq = None
 
 # -------------------------------------------------------
-# 1. SESSION STATE INITIALIZATION LOOP (fixes crashes on widget load)
+# 1. SESSION STATE INITIALIZATION LOOP (FIX: prevents crashes)
 # -------------------------------------------------------
 DEFAULT_STATE = {
     "index_name": "NIFTY 50",
@@ -73,20 +82,33 @@ def safe_json_parse(output):
 # 4. Dhan API Helpers (v2, uses st.secrets)
 # -------------------------------------------------------
 def dhan_auth_headers():
-    return {
-        "client-id": st.secrets["general"]["DHAN_CLIENT_ID"],
-        "access-token": st.secrets["general"]["DHAN_ACCESS_TOKEN"],
-    }
+    """Read Dhan credentials from Streamlit Cloud secrets."""
+    try:
+        general = st.secrets["general"]
+        client_id = str(general.get("DHAN_CLIENT_ID", "")).strip()
+        access_token = str(general.get("DHAN_ACCESS_TOKEN", "")).strip()
+    except Exception as exc:
+        raise RuntimeError(
+            "Missing [general] Dhan credentials in Streamlit Secrets. "
+            "Add DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN."
+        ) from exc
+    if not client_id or not access_token:
+        raise RuntimeError(
+            "Dhan credentials are blank. Check DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN in Streamlit Secrets."
+        )
+    return {"client-id": client_id, "access-token": access_token}
 
-def get_expiries(scrip, seg):  # <-- FIXED: named get_expiries to match the call
+def fetch_expiries(scrip, seg):
     r = requests.post(
         "https://api.dhan.co/v2/optionchain/expirylist",
         headers=dhan_auth_headers(),
         json={"UnderlyingScrip": scrip, "UnderlyingSeg": seg}, timeout=10,
     )
-    if r.ok:
-        return r.json().get("data", [])
-    return []
+    if not r.ok:
+        raise RuntimeError(f"Dhan expiry API returned HTTP {r.status_code}: {r.text[:300]}")
+    payload = r.json()
+    data = payload.get("data", [])
+    return data if isinstance(data, list) else []
 
 def fetch_option_chain(scrip, seg, expiry):
     r = requests.post(
@@ -94,9 +116,104 @@ def fetch_option_chain(scrip, seg, expiry):
         headers=dhan_auth_headers(),
         json={"UnderlyingScrip": scrip, "UnderlyingSeg": seg, "Expiry": expiry}, timeout=12,
     )
-    if r.ok:
-        return r.json().get("data", {})
-    return {}
+    if not r.ok:
+        raise RuntimeError(f"Dhan option-chain API returned HTTP {r.status_code}: {r.text[:300]}")
+    payload = r.json()
+    data = payload.get("data", {})
+    return data if isinstance(data, dict) else {}
+
+
+def _first_number(obj, keys, default=0.0):
+    """Return the first parseable numeric field from a broker response object."""
+    for key in keys:
+        value = obj.get(key) if isinstance(obj, dict) else None
+        try:
+            if value is not None and value != "":
+                return float(value)
+        except (TypeError, ValueError):
+            continue
+    return float(default)
+
+
+def _option_value(option, keys, greek=None):
+    if not isinstance(option, dict):
+        return 0.0
+    if greek:
+        greeks = option.get("greeks") or {}
+        if isinstance(greeks, dict) and greek in greeks:
+            try:
+                return float(greeks[greek] or 0.0)
+            except (TypeError, ValueError):
+                pass
+    return _first_number(option, keys, 0.0)
+
+
+def _fetch_chain_raw(scrip, seg, expiry):
+    """Fetch Dhan's option-chain payload and normalize it for compute_metrics()."""
+    if not expiry or expiry == "N/A":
+        return 0.0, pd.DataFrame()
+    payload = fetch_option_chain(scrip, seg, expiry)
+    spot = _first_number(payload, ["last_price", "lastPrice", "underlying_ltp", "underlyingPrice"], 0.0)
+    oc = payload.get("oc") or payload.get("option_chain") or payload.get("optionChain") or {}
+    if not isinstance(oc, dict):
+        return spot, pd.DataFrame()
+
+    rows = []
+    for strike_key, pair in oc.items():
+        try:
+            strike = float(strike_key)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(pair, dict):
+            continue
+        ce = pair.get("ce") or pair.get("CE") or {}
+        pe = pair.get("pe") or pair.get("PE") or {}
+        if not isinstance(ce, dict): ce = {}
+        if not isinstance(pe, dict): pe = {}
+
+        def val(opt, names, greek=None):
+            return _option_value(opt, names, greek)
+
+        ce_oi = val(ce, ["oi", "open_interest", "openInterest"])
+        pe_oi = val(pe, ["oi", "open_interest", "openInterest"])
+        ce_prev_oi = val(ce, ["previous_oi", "prev_oi", "previousOi", "prevOpenInterest", "oi_previous"], None)
+        pe_prev_oi = val(pe, ["previous_oi", "prev_oi", "previousOi", "prevOpenInterest", "oi_previous"], None)
+        # If Dhan's payload omits previous OI, neutralize the change instead of
+        # falsely treating the entire current OI as newly added OI.
+        if ce_prev_oi <= 0: ce_prev_oi = ce_oi
+        if pe_prev_oi <= 0: pe_prev_oi = pe_oi
+        rows.append({
+            "Strike": strike,
+            "CE_OI": ce_oi,
+            "CE_PrevOI": ce_prev_oi,
+            "CE_IV": val(ce, ["implied_volatility", "iv", "impliedVolatility"]),
+            "CE_Delta": val(ce, ["delta"], "delta"),
+            "CE_Gamma": val(ce, ["gamma"], "gamma"),
+            "CE_LTP": val(ce, ["last_price", "ltp", "lastPrice"]),
+            "CE_Bid": val(ce, ["top_bid_price", "bid_price", "bidPrice"]),
+            "CE_Ask": val(ce, ["top_ask_price", "ask_price", "askPrice"]),
+            "PE_OI": pe_oi,
+            "PE_PrevOI": pe_prev_oi,
+            "PE_IV": val(pe, ["implied_volatility", "iv", "impliedVolatility"]),
+            "PE_Delta": val(pe, ["delta"], "delta"),
+            "PE_Gamma": val(pe, ["gamma"], "gamma"),
+            "PE_LTP": val(pe, ["last_price", "ltp", "lastPrice"]),
+            "PE_Bid": val(pe, ["top_bid_price", "bid_price", "bidPrice"]),
+            "PE_Ask": val(pe, ["top_ask_price", "ask_price", "askPrice"]),
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values("Strike").reset_index(drop=True)
+        if spot <= 0:
+            spot = float(df.loc[(df["Strike"] - df["Strike"].median()).abs().idxmin(), "Strike"])
+    return spot, df
+
+
+def _strip_source(title, source):
+    """Remove a trailing Google News publisher suffix when it is present."""
+    title = (title or "").strip()
+    suffix = f" - {source}" if source else ""
+    return title[:-len(suffix)].rstrip() if suffix and title.endswith(suffix) else title
 
 def fetch_prev_close(scrip, seg):
     try:
@@ -243,32 +360,24 @@ Output must be valid JSON with those 5 keys only. No markdown, no prose."""
 # 7. Signal Build
 # -------------------------------------------------------
 def build_signal(m, ai):
-    sig=str(ai.get("signal","WAIT")).upper(); 
-    if sig not in ("BUY","SELL","WAIT"): sig="WAIT"
-    try: conf=int(float(ai.get("confidence",0)))
-    except: conf=0
-    direction={"BUY":1,"SELL":-1}.get(sig,0)
-    checks=[]; add=lambda n,v,d:checks.append({"name":n,"v":v,"detail":d})
-    add("PCR",1 if m["pcr"]>1.2 else -1 if m["pcr"]<0.8 else 0,f"{m['pcr']:.2f}")
-    add("Bias",1 if m["score"]>55 else -1 if m["score"]<45 else 0,f"{m['score']}/100")
-    add("GEX regime",1 if "POSITIVE" in m["gex_regime"] else -1 if "NEGATIVE" in m["gex_regime"] else 0,m["gex_regime"])
-    lean=sum(c["v"] for c in checks if c.get("counted",True)) * direction
-    net=lean
-    entry=m["spot"]; res=m["struct"]["res"]; sup=m["struct"]["sup"]
-    note=""
-    sig_out,target,sl,rr="WAIT",None,None,None
-    if sig!="WAIT" and net<2: sig_out="WAIT"; note=f"signal rejected: agreement {net:+d} below required +2."
-    if sig_out!="WAIT":
-        if res is None or sup is None: sig_out="WAIT"; note+=" rejected: no usable OI wall."
-        else:
-            sig_out=sig; target=res["level"] if sig=="BUY" else sup["level"]; sl=sup["level"]-35 if sig=="BUY" else res["level"]+35
-            risk=abs(entry-sl); reward=abs(target-entry); rr=reward/risk if risk>0 else None
-            if rr is None or rr<1.0: sig_out="WAIT"; note+=f" rejected: R:R {rr:.2f} below 1:1." if rr else " rejected: R:R n/a."
-    return {"signal":sig_out,"ai_signal":sig,"entry":entry,"target":target,"sl":sl,"rr":rr,
-            "confidence":conf,"note":note,"checks":checks,"net":net,"lean":lean,"direction":direction}
+    """Narrative-only AI Council has no validated entry/target fields; default safely to WAIT."""
+    return {
+        "signal": "WAIT",
+        "ai_signal": "WAIT",
+        "entry": float(m.get("spot", 0) or 0),
+        "target": None,
+        "sl": None,
+        "rr": None,
+        "confidence": 0,
+        "note": "No validated AI signal, support/resistance structure, or risk-reward inputs are available in this script. WAIT is intentional.",
+        "checks": [],
+        "net": 0,
+        "lean": 0,
+        "direction": 0,
+    }
 
 # -------------------------------------------------------
-# 8. DISCLAIMER (inline, prevents NameError from function-ordering)
+# 8. DISCLAIMER (inline, prevents NameError)
 # -------------------------------------------------------
 DISCLAIMER_HTML="""
 <div style='
@@ -284,7 +393,6 @@ DISCLAIMER_HTML="""
 # 9. Main App
 # -------------------------------------------------------
 def main():
-    st.set_page_config(layout="wide", page_title="VIPUL BLOOMBERG PRO v13.3 FIXED")
     st.markdown(DISCLAIMER_HTML, unsafe_allow_html=True)  # inline disclaimer
 
     # Sidebar: Index selector
@@ -316,20 +424,31 @@ def main():
         max_value=100000000,value=st.session_state["capital_alloc"],
         help="Total capital for position sizing")
 
-    # News queries (fixed: commas, no semicolons in list literals)
+    # --- NEWS QUERIES (FIX: semicolons replaced with commas) ---
     queries = ['Nifty OR Sensex OR "Dalal Street"', "India stocks FII DII", 'RBI OR "US Fed" OR crude OR rupee']
     if "BANK" in chosen_idx.upper(): queries.insert(0,'"Bank Nifty" OR "banking stocks"')
+    # -------------------------------------------------------
 
     # Load data
     with st.spinner("Fetching option chain from Dhan..."):
-        exp=get_expiries(scrip,seg) or []  # <-- NOW matches get_expiries() above
-        expiry=st.selectbox("Expiry Date:",exp) if exp else "N/A"
-    spot,df=_fetch_chain_raw(scrip,seg,expiry) or (0,pd.DataFrame())
-    if spot==0 or df.empty: st.error("Could not fetch option chain. Check Dhan credentials."); st.stop()
+        try:
+            exp = fetch_expiries(scrip, seg) or []
+        except Exception as exc:
+            st.error(f"Could not fetch Dhan expiries: {exc}")
+            st.stop()
+        expiry = st.selectbox("Expiry Date:", exp) if exp else "N/A"
+        try:
+            spot, df = _fetch_chain_raw(scrip, seg, expiry)
+        except Exception as exc:
+            st.error(f"Could not fetch/parse Dhan option chain: {exc}")
+            st.stop()
+    if spot <= 0 or df.empty:
+        st.error("Dhan returned no usable option-chain rows. Check the selected expiry, API credentials, and Dhan response format.")
+        st.stop()
 
     m=compute_metrics(df,spot,None,expiry,step)  # prev_close optional inside
 
-    # News fetch (simplified)
+    # News fetch (simplified, using the fixed queries list)
     live_n=st.sidebar.toggle("Live News Feed",value=True)
     news_items,nhash=[],""; t_ist=datetime.now(timezone.utc)+timedelta(hours=5.5)
     if live_n:
@@ -343,12 +462,14 @@ def main():
                         if not title: continue
                         src_el=it.find("source")
                         source=(src_el.text or "").strip() if src_el is not None and src_el.text else "feed"
-                        # simple dedup inline
+                        title=_strip_source(title, source) # need to define _strip_source or inline
                         key=re.sub(r"\W+", "", title.lower())[:70]
+                        # simple dedup
                         if 'seen' not in st.session_state: st.session_state["seen"]=set()
                         if key in st.session_state["seen"]: continue
                         st.session_state["seen"].add(key)
-                        try: ts=parsedate_to_datetime(it.findtext("pubDate")).timestamp()
+                        try:
+                            ts=parsedate_to_datetime(it.findtext("pubDate")).timestamp()
                         except Exception: ts=0.0
                         link=(it.findtext("link") or "").strip()
                         news_items.append({"title": title, "source": source, "link": link, "ts": ts})
@@ -361,7 +482,11 @@ def main():
     else: st.sidebar.caption("News feed disabled")
 
     # AI Council
-    groq_key=st.secrets["groq"]["GROQ_API_KEY"]; groq_model=st.sidebar.selectbox("Groq Model:",["openai/gpt-oss-120b","openai/gpt-oss-20b"],index=0)
+    try:
+        groq_key = str(st.secrets.get("groq", {}).get("GROQ_API_KEY", "")).strip()
+    except Exception:
+        groq_key = ""
+    groq_model=st.sidebar.selectbox("Groq Model:",["openai/gpt-oss-120b","openai/gpt-oss-20b"],index=0)
     if st.sidebar.button("Run AI Council") or "ai" not in st.session_state:
         with st.spinner("Sending to Groq..."):
             ai=run_council(m,groq_key,groq_model)
@@ -415,7 +540,10 @@ def main():
     # Tab 5: Data Health
     with tabs[4]:
         st.subheader("Data Health & API Status")
-        tok=st.secrets["general"]["DHAN_ACCESS_TOKEN"]
+        try:
+            tok = str(st.secrets.get("general", {}).get("DHAN_ACCESS_TOKEN", ""))
+        except Exception:
+            tok = ""
         ok="OK" if tok and tok.startswith("eyJ") else "FAIL"
         st.write(f"Dhan token: {ok}")
         st.write(f"Strikes loaded: {len(df)} | Spot: {spot:,.2f} | DTE: {m['dte']}d")
