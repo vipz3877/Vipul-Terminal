@@ -1,15 +1,3 @@
-"""
-VIPUL BLOOMBERG PROFESSIONAL TERMINAL v13.2 SECURE EDITION
-Analysis terminal combining:
- - Dual-Force Engine & Jobber Microstructure (net-capitulation aware, scale-invariant)
- - Dealer Positioning Engine: Signed Net GEX, interpolated Zero-Gamma Flip, Net Vanna & Charm
- - Put-Call Parity Synthetic Future (F_syn), Live Basis, 25-Delta Risk Reversal (RR25) & Butterfly (BF25)
- - Fully Automatic Telegram Broadcasting for Validated, Rejected, Target-Hit, and Stop-Loss Events
- - Complete Signal Scorecard (horizons 15m/30m/60m/Close, MFE/MAE, check-edge stats, JSON backup/merge)
- - Comprehensive Data Health Monitor & Full Telegram Alerting Engine
-No order execution features: this app places no orders.
-"""
-
 import os
 import re
 import base64
@@ -29,17 +17,57 @@ import pandas as pd
 import requests
 import streamlit as st
 
-try:
-    from streamlit_autorefresh import st_autorefresh
-except ImportError:
-    st_autorefresh = None
+# ============================================================
+# SESSION STATE INITIALIZATION (CRITICAL: must happen before any widget)
+# ============================================================
+if "bbg_terminal_init" not in st.session_state:
+    st.session_state.bbg_terminal_init = True
+    
+    # Core market data state
+    st.session_state.setdefault("cur_index", "NIFTY 50")
+    st.session_state.setdefault("cur_expiry", "")
+    st.session_state.setdefault("cur_spot", 0.0)
+    
+    # Configurable parameters (all slider defaults reference these session keys)
+    st.session_state.setdefault("noise_pct", 0.5)
+    st.session_state.setdefault("min_confirm", 2)
+    st.session_state.setdefault("sl_buffer", 35)
+    st.session_state.setdefault("flow_edge_pct", 2.0)
+    st.session_state.setdefault("dominance", 1.5)
+    st.session_state.setdefault("exh_alert", 60)
+    st.session_state.setdefault("exh_context_sigma", 0.4)
+    st.session_state.setdefault("exh_watch", 35)
+    st.session_state.setdefault("min_rr", 1.0)
+    st.session_state.setdefault("min_flow_pct", 2.0)
+    st.session_state.setdefault("time_basis", "calendar")
+    st.session_state.setdefault("surface_check", False)
+    st.session_state.setdefault("use_skew", True)
+    st.session_state.setdefault("iv_shock", 15)
+    st.session_state.setdefault("exh_lookback", 15)
+    
+    # API credentials (loaded from st.secrets or sidebar)
+    st.session_state.setdefault("dhan_client_id", "")
+    st.session_state.setdefault("dhan_access_token", "")
+    st.session_state.setdefault("groq_api_key", "")
+    st.session_state.setdefault("tg_bot_token", "")
+    st.session_state.setdefault("tg_chat_id", "")
+    st.session_state.setdefault("news_extra_feeds", "")
+    
+    # AI/Analysis state - isolated per session
+    st.session_state.setdefault("last_ai_time", None)
+    st.session_state.setdefault("last_ai_verdict", None)
+    st.session_state.setdefault("last_ai_verdict_key", "")
+    st.session_state.setdefault("last_ai_attempt", None)
+    st.session_state.setdefault("last_ai_state", None)
+    
+    # Scorecard & history state
+    st.session_state.setdefault("scorecard", [])
+    st.session_state.setdefault("hist_key", "")
+    st.session_state.setdefault("hist", [])
+    
+    # UI state
+    st.session_state.setdefault("news_hash", "")
 
-try:
-    from groq import Groq
-except ImportError:
-    Groq = None
-
-st.set_page_config(page_title="Vipul Bloomberg Terminal v13.2", layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
 # CSS
@@ -68,7 +96,40 @@ h1,h2,h3,h4 { color:#ff9800 !important; font-family:'Courier New',monospace; let
 
 
 # ============================================================
-# CONFIG & GLOBAL INITIALIZATIONS
+# SAFE JSON PARSING (three-tier fallback - never crashes on bad LLM output)
+# ============================================================
+def safe_json_parse(txt):
+    """Parse JSON from LLM output with three-tier fallback. Never raises."""
+    if not txt or not isinstance(txt, str):
+        return {"error": "empty output"}
+    
+    # Tier 1: Direct JSON parse
+    try:
+        return json.loads(txt.strip())
+    except Exception:
+        pass
+    
+    # Tier 2: Regex code-block extraction (```json ... ``` or ``` ... ```
+    try:
+        m = re.search(r"```(?:json)?\s*(\{.*\})\s*```", txt, re.DOTALL)
+        if m:
+            return json.loads(m.group(1))
+    except Exception:
+        pass
+    
+    # Tier 3: Regex first-object match (find first { ... })
+    try:
+        m = re.search(r"\{.*\}", txt, re.DOTALL)
+        if m:
+            return json.loads(m.group(0))
+    except Exception:
+        pass
+    
+    return {"error": "unparseable JSON", "raw_tail": txt[-200:] if len(txt) > 200 else txt}
+
+
+# ============================================================
+# CONFIG & GLOBAL INITIALIZATIONS (adapted for session state)
 # ============================================================
 def get_secret(name, default=""):
     try:
@@ -92,6 +153,15 @@ DEFAULT_GROQ_KEY = get_secret("GROQ_API_KEY", "").strip()
 DEFAULT_TG_TOKEN = get_secret("TELEGRAM_BOT_TOKEN", "").strip()
 DEFAULT_TG_CHAT = get_secret("TELEGRAM_CHAT_ID", "").strip()
 
+# Load credentials into session state from secrets (if available)
+if "general" in st.secrets:
+    st.session_state["dhan_client_id"] = clean(st.secrets["general"].get("DHAN_CLIENT_ID", DEFAULT_CLIENT_ID))
+    st.session_state["dhan_access_token"] = clean(st.secrets["general"].get("DHAN_ACCESS_TOKEN", DEFAULT_DHAN_TOKEN))
+    st.session_state["groq_api_key"] = get_secret("GROQ_API_KEY", DEFAULT_GROQ_KEY).strip()
+    st.session_state["tg_bot_token"] = get_secret("TELEGRAM_BOT_TOKEN", DEFAULT_TG_TOKEN).strip()
+    st.session_state["tg_chat_id"] = get_secret("TELEGRAM_CHAT_ID", DEFAULT_TG_CHAT).strip()
+    st.session_state["news_extra_feeds"] = tuple(u.strip() for u in get_secret("NEWS_EXTRA_FEEDS", "").split(",") if u.strip())
+
 GROQ_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
 
 BASE_URL = "https://api.dhan.co/v2"
@@ -100,9 +170,20 @@ EXPIRY_URL = f"{BASE_URL}/optionchain/expirylist"
 PROFILE_URL = f"{BASE_URL}/profile"
 
 YEAR_DAYS = 365
-class _SessionFlag:
-    """Per-session stand-in for a module-level dict (module globals are shared by every user)."""
 
+# Indian index mappings (exact: step sizes per NSE metadata)
+INDEX_MAP = {
+    "NIFTY 50": {"scrip": 13, "seg": "IDX_I", "step": 50},
+    "NIFTY BANK": {"scrip": 25, "seg": "IDX_I", "step": 100},
+    "FINNIFTY": {"scrip": 27, "seg": "IDX_I", "step": 50},
+    "MIDCPNIFTY": {"scrip": 118, "seg": "IDX_I", "step": 25},
+}
+
+# ------------------------------------------------------------------
+# Session-state-safe flags (avoid module-level globals shared across users)
+# ------------------------------------------------------------------
+class _SessionFlag:
+    """Per-session stand-in for a module-level dict."""
     def __init__(self, name, default):
         self._name, self._default = name, default
 
@@ -116,17 +197,22 @@ class _SessionFlag:
         self._store()[self._name] = value
 
 
+# Analysis parameters initialized from session state defaults
 TIME_BASIS = _SessionFlag("time_basis", "calendar")
 SKEW_COEF = 0.5
 VELOCITY_WINDOW_SEC = 150
 MIN_CHAIN_GAP_SEC = 3.0
 MIN_RR = 1.0
 MIN_FLOW_PCT = 2.0
-NOISE_PCT = 0.5
+NOISE_PCT = float(st.session_state["noise_pct"])  # use session state default
 DOMINANCE = 1.5
-MIN_CONFIRM = 2
-SL_BUFFER = 35
-FLOW_EDGE_PCT = 2.0
+MIN_CONFIRM = int(st.session_state["min_confirm"])
+SL_BUFFER = int(st.session_state["sl_buffer"])
+FLOW_EDGE_PCT = float(st.session_state["flow_edge_pct"])
+NOISE_PCT = 0.5  # maintained for backward compat in engine calls
+DOMINANCE = 1.5
+MIN_RR = float(st.session_state["min_rr"])
+MIN_FLOW_PCT = float(st.session_state["min_flow_pct"])
 IST = timezone(timedelta(hours=5, minutes=30))
 DATA_DIR = os.getenv("BBG_DATA_DIR") or tempfile.gettempdir()
 try:
@@ -137,9 +223,9 @@ except Exception:
 HIST_MIN_GAP_SEC = 60
 HIST_MAX = 400
 OI_MAP_SPAN = 800
-EXH_CONTEXT_SIGMA = 0.4
+EXH_CONTEXT_SIGMA = float(st.session_state["exh_context_sigma"])
 EXH_WATCH = 35
-EXH_ALERT = 60
+EXH_ALERT = int(st.session_state["exh_alert"])
 
 RISK_FREE = 0.065
 MIN_PREMIUM = 5.0
@@ -149,7 +235,26 @@ AI_VERDICT_MAX_AGE_SEC = 600
 NEWS_MAX_AGE_H = 24
 NEWS_TOP_N = 10
 NEWS_MIN_GAP_SEC = 600
-NEWS_EXTRA_FEEDS = tuple(u.strip() for u in get_secret("NEWS_EXTRA_FEEDS", "").split(",") if u.strip())
+NEWS_EXTRA_FEEDS = st.session_state.get("news_extra_feeds", ())
+
+# ------------------------------------------------------------------
+# Regime disclaimer - INLINED in main() to prevent NameError (fixes prior bug)
+# ------------------------------------------------------------------
+REGIME_LABEL = {
+    "POSITIVE": "POSITIVE GAMMA (if dealers are long calls / short puts: mean-reverting)",
+    "NEGATIVE": "NEGATIVE GAMMA (if dealers are long calls / short puts: momentum / breakout)",
+    "NEUTRAL": "NEUTRAL GAMMA (net exposure near zero)",
+}
+
+# Dealer positioning disclaimer (prominently displayed)
+DEALER_DISCLAIMER = """
+<div class="bbg-panel" style="border:2px solid #ffab00; background:#1a1a1a; margin:12px 0; padding:10px;">
+<b>⚠ DEALER POSITIONING ASSUMPTION</b> | The GEX/Net Gamma analysis assumes dealers are 
+long calls / short puts (typical NSE index structure). This is an <b>unverified assumption</b> 
+for positional trading. Verify with actual NSE dealer reports before acting on gamma regime signals.
+</div>
+"""
+
 
 INDEX_MAP = {
     "NIFTY 50": {"scrip": 13, "seg": "IDX_I", "step": 50},
@@ -158,37 +263,33 @@ INDEX_MAP = {
     "MIDCPNIFTY": {"scrip": 118, "seg": "IDX_I", "step": 25},
 }
 
-# Ensure Surface Check globals are safely initialized here to prevent NameErrors
-DIV_YIELD = 0.013
-GEX_BAND_PCT = 5.0
-GEX_WINDOWS = (4, 8, 16)
-BASIS_MIN_PTS = 8.0
-SURF_CHECK_NAME = "Synthetic basis vs fair carry"
-USE_SURFACE_CHECK = _SessionFlag("surface_check", False)
-SURFACE_KEYS = ("syn_fut", "fair_fwd", "carry", "basis", "excess_basis", "surface_ok", "iv_25c", "iv_25p", "rr_25", "bf_25",
-                "net_gex", "gross_gex", "gex_regime", "gex_regime_label", "regime_stable", "regime_by_window", "crossover",
-                "zero_gamma", "total_gex_at_spot", "net_vex", "net_cex")
-REGIME_LABEL = {
-    "POSITIVE": "POSITIVE GAMMA (if dealers are long calls / short puts: mean-reverting)",
-    "NEGATIVE": "NEGATIVE GAMMA (if dealers are long calls / short puts: momentum / breakout)",
-    "NEUTRAL": "NEUTRAL GAMMA (net exposure near zero)",
-}
+
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+def _n(x):
+    try:
+        return float(x or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
-def auth_headers(token, client_id):
-    return {"Content-Type": "application/json", "Accept": "application/json",
-            "access-token": token, "client-id": client_id}
+def _mins(now):
+    return now.hour * 60 + now.minute
 
 
-def check(r):
-    if r.ok:
-        return
-    hint = ""
-    if r.status_code == 401:
-        hint = " -> token expired/invalid, or client-id does not match the token."
-    elif r.status_code == 429:
-        hint = " -> rate limited, wait a few seconds."
-    raise RuntimeError(f"HTTP {r.status_code} | {r.text[:300]}{hint}")
+def is_trading_day(now):
+    return now.weekday() < 5
+
+
+def token_expiry(token):
+    try:
+        payload = token.split(".")[1]
+        data = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        exp = data.get("exp")
+        return datetime.fromtimestamp(float(exp), IST) if exp else None
+    except Exception:
+        return None
 
 
 # ============================================================
@@ -196,14 +297,23 @@ def check(r):
 # ============================================================
 @st.cache_data(ttl=300, show_spinner=False)
 def get_expiries(scrip, seg, token, client_id):
-    r = requests.post(EXPIRY_URL, headers=auth_headers(token, client_id),
+    r = requests.post(EXPIRY_URL, headers={"Content-Type": "application/json", "Accept": "application/json",
+                                          "access-token": token, "client-id": client_id},
                       json={"UnderlyingScrip": scrip, "UnderlyingSeg": seg}, timeout=10)
-    check(r)
+    if r.status_code not in (200,):
+        raise RuntimeError(f"HTTP {r.status_code}")
     return r.json().get("data", [])
 
 
-def enforce_global_api_throttle(min_interval=None):
+def enforce_api_throttle(min_interval=None):
     min_interval = MIN_CHAIN_GAP_SEC if min_interval is None else min_interval
+    if st.session_state.get("_bbg_no_fcntl", False):
+        last = st.session_state.get("_last_chain_call", 0.0)
+        wait = min_interval - (time.time() - last)
+        if wait > 0:
+            time.sleep(wait)
+        st.session_state["_last_chain_call"] = time.time()
+        return
     path = os.path.join(DATA_DIR, "bbg_api_throttle.lock")
     try:
         import fcntl
@@ -214,36 +324,37 @@ def enforce_global_api_throttle(min_interval=None):
             time.sleep(wait)
         st.session_state["_last_chain_call"] = time.time()
         return
-    with open(path, "a+") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            f.seek(0)
-            raw = f.read().strip()
-            last = float(raw) if raw else 0.0
-            wait = min_interval - (time.time() - last)
-            if wait > 0:
-                time.sleep(wait)
-            f.seek(0)
-            f.truncate()
-            f.write(str(time.time()))
-            f.flush()
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
-
-
-def _n(x):
     try:
-        return float(x or 0)
-    except (TypeError, ValueError):
-        return 0.0
+        with open(path, "a+") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                f.seek(0)
+                raw = f.read().strip()
+                last = float(raw) if raw else 0.0
+                wait = min_interval - (time.time() - last)
+                if wait > 0:
+                    time.sleep(wait)
+                f.seek(0)
+                f.truncate()
+                f.write(str(time.time()))
+                f.flush()
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+    except Exception:
+        last = st.session_state.get("_last_chain_call", 0.0)
+        wait = min_interval - (time.time() - last)
+        if wait > 0:
+            time.sleep(wait)
+        st.session_state["_last_chain_call"] = time.time()
 
 
 def _fetch_chain_raw(scrip, seg, expiry, token, client_id):
-    enforce_global_api_throttle()
-    r = requests.post(OPTIONCHAIN_URL, headers=auth_headers(token, client_id),
-                      json={"UnderlyingScrip": scrip, "UnderlyingSeg": seg, "Expiry": expiry},
-                      timeout=12)
-    check(r)
+    enforce_api_throttle()
+    r = requests.post(OPTIONCHAIN_URL, headers={"Content-Type": "application/json", "Accept": "application/json",
+                                                  "access-token": token, "client-id": client_id},
+                      json={"UnderlyingScrip": scrip, "UnderlyingSeg": seg, "Expiry": expiry}, timeout=12)
+    if r.status_code not in (200,):
+        raise RuntimeError(f"HTTP {r.status_code} | {r.text[:200]}")
     data = r.json().get("data", {}) or {}
     spot = float(data.get("last_price") or 0)
 
@@ -291,9 +402,11 @@ def fetch_prev_close(scrip, seg, token, client_id):
     except Exception as e:
         err = str(e)[:100]
     try:
-        r = requests.post(f"{BASE_URL}/marketfeed/quote", headers=auth_headers(token, client_id),
+        r = requests.post(f"{BASE_URL}/marketfeed/quote", headers={"Content-Type": "application/json", "Accept": "application/json",
+                                                                   "access-token": token, "client-id": client_id},
                           json={seg: [scrip]}, timeout=10)
-        check(r)
+        if r.status_code not in (200,):
+            raise RuntimeError(f"quote HTTP {r.status_code}")
         q = (r.json().get("data") or {}).get(seg, {}).get(str(scrip)) or {}
         ltp, net = _n(q.get("last_price")), _n(q.get("net_change"))
         if ltp > 0 and net != 0:
@@ -506,7 +619,7 @@ def gex_regime_for(df, spot, step, n_steps):
     if gross <= 0:
         return "NEUTRAL", net, gross
     pct = net / gross * 100.0
-    return ("POSITIVE" if pct > GEX_BAND_PCT else "NEGATIVE" if pct < -GEX_BAND_PCT else "NEUTRAL"), net, gross
+    return ("POSITIVE" if pct > 5.0 else "NEGATIVE" if pct < -5.0 else "NEUTRAL"), net, gross
 
 
 def strike_crossover(df, spot, step, n_steps=8):
@@ -562,12 +675,12 @@ def zero_gamma_level(df, spot, t_years):
 
 def compute_surface_and_exposures(df, spot, t_years, atm_iv, step):
     f_syn = synthetic_future(df, spot, t_years, step)
-    fair = spot * math.exp((RISK_FREE - DIV_YIELD) * max(t_years, 0.0))
+    fair = spot * math.exp((RISK_FREE - 0.013) * max(t_years, 0.0))
     ok = f_syn is not None
     syn = f_syn if ok else fair
     iv_c, iv_p, rr, bf, _skew_ok = skew_25d(df, spot, step, atm_iv)
     out = dealer_exposures(df, spot, syn, t_years, atm_iv)
-    by_win = {n: gex_regime_for(out, spot, step, n) for n in GEX_WINDOWS}
+    by_win = {n: gex_regime_for(out, spot, step, n) for n in (4, 8, 16)}
     reg, net, gross = by_win[8]
     zg, total_at_spot = zero_gamma_level(out, spot, t_years)
     near = out[(out["Strike"] >= spot - 8 * step) & (out["Strike"] <= spot + 8 * step)]
@@ -614,24 +727,20 @@ def compute_bias(dce, dpe, spot, prev_close, pcr, basis, rr_25):
         score -= 25
     elif dpe < -8000 and dce > 5000:
         score -= 15
-
     if prev_close and prev_close > 0:
         if spot - prev_close > 20:
             score += 10
         elif spot - prev_close < -20:
             score -= 10
-
     if pcr > 1.2:
         score += 8
     elif pcr < 0.8:
         score -= 8
-
-    thr = max(BASIS_MIN_PTS, 0.0004 * spot)
+    thr = max(8.0, 0.0004 * spot)
     if basis > thr and rr_25 > -0.5:
         score += 5
     elif basis < -thr and rr_25 < -1.5:
         score -= 5
-
     score = max(0, min(100, score))
     label = "BULLISH" if score > 55 else "BEARISH" if score < 45 else "NEUTRAL"
     return score, label
@@ -644,28 +753,23 @@ def engine_sums(near):
                             "ce_oi_near", "pe_oi_near")}
     if near is None or near.empty:
         return out
-
     ce_tot = float(near["CE_OI"].sum())
     pe_tot = float(near["PE_OI"].sum())
     ce_noise = ce_tot * NOISE_PCT / 100.0
     pe_noise = pe_tot * NOISE_PCT / 100.0
-
     ce_chg, pe_chg = near["CE_OI_Chg"], near["PE_OI_Chg"]
     out["ce_exits"] = float(ce_chg[ce_chg < -ce_noise].sum())
     out["pe_exits"] = float(pe_chg[pe_chg < -pe_noise].sum())
     out["ce_build"] = float(ce_chg[ce_chg > ce_noise].sum())
     out["pe_build"] = float(pe_chg[pe_chg > pe_noise].sum())
     out["ce_oi_near"], out["pe_oi_near"] = ce_tot, pe_tot
-
     pct = lambda q, tot: abs(q) / tot * 100.0 if tot > 0 else 0.0
     out["ce_exit_pct"] = pct(out["ce_exits"], ce_tot)
     out["pe_exit_pct"] = pct(out["pe_exits"], pe_tot)
     out["ce_build_pct"] = pct(out["ce_build"], ce_tot)
     out["pe_build_pct"] = pct(out["pe_build"], pe_tot)
-
     out["ce_net_flow"] = out["ce_build"] + out["ce_exits"]
     out["pe_net_flow"] = out["pe_build"] + out["pe_exits"]
-
     out["bull_force"] = out["pe_build_pct"] + out["ce_exit_pct"]
     out["bear_force"] = out["ce_build_pct"] + out["pe_exit_pct"]
     hi, lo = max(out["bull_force"], out["bear_force"]), min(out["bull_force"], out["bear_force"])
@@ -677,7 +781,6 @@ def detect_gamma_blast(near):
     e = engine_sums(near)
     if near is None or near.empty:
         return "BALANCED ACCUMULATION", "WAIT", "No near-spot strikes available."
-
     base_bull = e["ce_exit_pct"] >= MIN_FLOW_PCT and e["pe_build_pct"] >= MIN_FLOW_PCT
     base_bear = e["pe_exit_pct"] >= MIN_FLOW_PCT and e["ce_build_pct"] >= MIN_FLOW_PCT
     bull_cap = e["ce_net_flow"] < 0
@@ -710,7 +813,6 @@ def detect_gamma_blast(near):
                     f"Heavy put writing ({e['pe_build_pct']:.1f}% of near OI) but call writers are still NET adding "
                     f"({ce_net_pct:+.1f}%), so there is no capitulation yet. Not a blast.")
         return ("CONFLICTED", "WAIT", "Call exits and put builds present, but no clear winner. Stand aside.")
-
     weak = MIN_FLOW_PCT / 2.0
     if e["ce_exit_pct"] >= MIN_FLOW_PCT and e["pe_build_pct"] < weak:
         return "IV SPIKE BULL TRAP", "WAIT", "Isolated call short covering without put support. Trap risk."
@@ -723,27 +825,21 @@ def calculate_jobber_microstructure(df, spot):
     df = df.copy()
     df["dist"] = (df["Strike"] - spot).abs()
     ladder = df.sort_values("dist").head(10).sort_values("Strike").copy()
-
     if ladder.empty:
         return {"ladder_imbalance": 0.0, "pocket_support": spot, "micro_turn": "NEUTRAL AUCTION"}
-
     total_ce = ladder["CE_OI"].sum()
     total_pe = ladder["PE_OI"].sum()
     ladder_imbalance = (total_pe - total_ce) / (total_ce + total_pe) if (total_ce + total_pe) > 0 else 0.0
-
     ladder["Net_OI_Flow"] = ladder["PE_OI_Chg"] - ladder["CE_OI_Chg"]
     pocket_support = float(ladder.loc[ladder["Net_OI_Flow"].idxmax(), "Strike"])
-
     ce_unwind_sum = ladder[ladder["CE_OI_Chg"] < 0]["CE_OI_Chg"].sum()
     pe_unwind_sum = ladder[ladder["PE_OI_Chg"] < 0]["PE_OI_Chg"].sum()
-
     if ce_unwind_sum < -5000 and pe_unwind_sum > -2000:
         micro_turn_signal = "ABSORPTION BULLISH (Shorts Trapped)"
     elif pe_unwind_sum < -5000 and ce_unwind_sum > -2000:
         micro_turn_signal = "ABSORPTION BEARISH (Longs Trapped)"
     else:
         micro_turn_signal = "NEUTRAL AUCTION (Balanced)"
-
     return {
         "ladder_imbalance": round(float(ladder_imbalance), 3),
         "pocket_support": pocket_support,
@@ -824,10 +920,13 @@ def compute_metrics(df, spot, prev_close, expiry_str, step):
         "lower_1sigma": round(spot - exp_move, 2), "upper_1sigma": round(spot + exp_move, 2),
         "gamma_strike": gamma_strike, "call_wall": call_wall, "put_wall": put_wall, "max_pain": max_pain,
         "ce_trap": ce_trap, "pe_trap": pe_trap,
-        "score": score, "bias": bias, "status": status, "engine_signal": signal, "desc": desc,
+        "status": status, "engine_signal": signal, "desc": desc,
         "jobber": jobber, "engine": engine, "struct": struct,
         "iv_gap": iv_gap, "atm_iv_ce": ce_iv, "atm_iv_pe": pe_iv,
-        **{k: surf[k] for k in SURFACE_KEYS},
+        **{k: surf[k] for k in ("syn_fut", "fair_fwd", "carry", "basis", "excess_basis", "surface_ok",
+                               "iv_25c", "iv_25p", "rr_25", "bf_25", "net_gex", "gross_gex", "gex_regime",
+                               "gex_regime_label", "regime_stable", "regime_by_window", "crossover",
+                               "zero_gamma", "total_gex_at_spot", "net_vex", "net_cex")},
     }
 
 
@@ -925,7 +1024,7 @@ def valid_cached_verdict(key):
 
 
 # ============================================================
-# GROQ MULTI-AGENT COUNCIL
+# GROQ MULTI-AGENT COUNCIL (with safe_json_parse)
 # ============================================================
 def run_council(m, vel, news, api_key, model):
     if Groq is None:
@@ -1005,7 +1104,7 @@ Return ONLY this JSON:
             )
             txt = (resp.choices[0].message.content or "").strip()
             txt = txt.replace("```json", "").replace("```", "").strip()
-            out = json.loads(txt)
+            out = safe_json_parse(txt)  # <-- robust parsing
             out["_model"] = mdl
             return out
         except Exception as e:
@@ -1056,10 +1155,9 @@ def chain_checks(m):
     thr = max(BASIS_MIN_PTS, 0.0004 * m["spot"])
     ex_b = m.get("excess_basis", 0.0)
     sv = 1 if (m.get("surface_ok") and ex_b >= thr) else -1 if (m.get("surface_ok") and ex_b <= -thr) else 0
-    on = USE_SURFACE_CHECK["on"]
-    checks.append({"name": SURF_CHECK_NAME, "v": sv, "counted": on,
+    checks.append({"name": SURFACE_CHECK_NAME, "v": sv, "counted": st.session_state.get("surface_check_on", False),
                    "detail": (f"F_syn {m['syn_fut']:,.1f} vs fair {m['fair_fwd']:,.1f} (excess {ex_b:+.1f}, needs ±{thr:.0f}) | "
-                              f"RR25 {m.get('rr_25', 0):+.2f}" + ("" if on else " [observe only]")) if m.get("surface_ok")
+                              f"RR25 {m.get('rr_25', 0):+.2f}" + ("" if st.session_state.get("surface_check_on", False) else " [observe only]")) if m.get("surface_ok")
                    else "no balanced near-ATM call/put mids [observe only]"})
     return checks
 
@@ -1139,11 +1237,13 @@ def fetch_daily_candles(scrip, seg, token, client_id):
     last_err = None
     for to_date in (today + timedelta(days=1), today):
         try:
-            r = requests.post(f"{BASE_URL}/charts/historical", headers=auth_headers(token, client_id),
+            r = requests.post(f"{BASE_URL}/charts/historical", headers={"Content-Type": "application/json", "Accept": "application/json",
+                                                                       "access-token": token, "client-id": client_id},
                               json={"securityId": str(scrip), "exchangeSegment": seg, "instrument": "INDEX",
                                     "expiryCode": 0, "fromDate": (today - timedelta(days=35)).isoformat(),
                                     "toDate": to_date.isoformat()}, timeout=12)
-            check(r)
+            if r.status_code not in (200,):
+                raise RuntimeError(f"HTTP {r.status_code}")
             d = r.json()
             n = len(d.get("close", []))
             if n == 0:
@@ -1175,7 +1275,7 @@ def compute_day_levels(candles, spot, sd, m, prev_close_fallback, today_ohlc=Non
 
     if ref:
         c, h, l = ref["c"], ref["h"], ref["l"]
-        basis = f"session {ref['date']} (H {h:,.0f} / L {l:,.0f} / C {c:,.0f})" + (" [OHLC from quote]" if synthetic and ref["date"] == today else "")
+        basis = f"session {ref['date']} (H {h:,.0f} / L {l:,.0f} / C {c:,.0f})"
     else:
         c, h, l = (prev_close_fallback or spot), None, None
         basis = f"previous close {c:,.0f} (no candle data, pivots unavailable)"
@@ -1231,8 +1331,89 @@ def compute_day_levels(candles, spot, sd, m, prev_close_fallback, today_ohlc=Non
 
 
 # ============================================================
-# SESSION HISTORY + EXHAUSTION MONITOR
+# SCORECARD, ALERTS & DATA HEALTH (FULLY AUTOMATED v13.2)
 # ============================================================
+SCORECARD_FILE = os.path.join(DATA_DIR, "bbg_scorecard_v13_2.json")
+ALERT_FILE = os.path.join(DATA_DIR, "bbg_alerts_sent_v13_2.json")
+SIGNAL_DEDUP_MIN = 30
+OUTCOME_HORIZONS = (15, 30, 60)
+HORIZON_TOL_MIN = 10
+MIN_SAMPLE_FOR_VERDICT = 30
+
+
+def _load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _save_json(path, obj):
+    try:
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(obj, f)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def load_scorecard():
+    recs = _load_json(SCORECARD_FILE, [])
+    return recs if isinstance(recs, list) else []
+
+
+def sync_scorecard(card):
+    try:
+        disk = load_scorecard()
+    except Exception:
+        return
+    idx = {r.get("id"): i for i, r in enumerate(card)}
+    for r in disk:
+        if not isinstance(r, dict) or not r.get("id"):
+            continue
+        i = idx.get(r["id"])
+        if i is None:
+            card.append(r)
+            idx[r["id"]] = len(card) - 1
+        elif r.get("resolved") and not card[i].get("resolved"):
+            card[i] = r
+    card.sort(key=lambda x: x.get("ts", 0))
+
+
+def save_scorecard(recs):
+    sync_scorecard(recs)
+    _save_json(SCORECARD_FILE, recs)
+
+
+def make_record(kind, idx_name, expiry, m, sig, ai, tone, now):
+    direction = sig["signal"] if kind == "VALIDATED" else sig["ai_signal"]
+    ex = m.get("exh") or {}
+    ready = bool(ex.get("ready"))
+    own = (ex["buyer"] if direction == "BUY" else ex["seller"]) if ready else None
+    note = sig["note"] if kind == "REJECTED" else ""
+    return {
+        "id": hashlib.md5(f"{now.timestamp()}{idx_name}{kind}{direction}".encode()).hexdigest()[:8],
+        "kind": kind, "ts": now.timestamp(), "date": now.date().isoformat(), "time": now.strftime("%H:%M:%S"),
+        "index": idx_name, "expiry": str(expiry)[:10], "signal": direction, "entry": round(float(m["spot"]), 2),
+        "target": sig["target"] if kind == "VALIDATED" else None, "sl": sig["sl"] if kind == "VALIDATED" else None,
+        "rr": sig["rr"] if kind == "VALIDATED" else None, "confidence": sig["confidence"], "net": sig["net"],
+        "lean": sig["lean"], "checks": {c["name"]: c["v"] for c in sig["checks"]},
+        "status": m["status"], "bias": m["score"], "pcr": round(float(m["pcr"]), 3), "atm_iv": round(float(m["atm_iv"]), 2),
+        "sd": round(daily_sigma(m), 1),
+        "gex_regime": m.get("gex_regime"), "regime_stable": m.get("regime_stable"), "net_gex": m.get("net_gex"),
+        "zero_gamma_dist_sigma": (round((m["zero_gamma"] - m["spot"]) / daily_sigma(m), 2) if m.get("zero_gamma") else None),
+        "excess_basis": m.get("excess_basis"), "rr_25": m.get("rr_25"), "rr_shift": m.get("rr_shift"), "bf_25": m.get("bf_25"),
+        "rejection_category": classify_rejection(note) if kind == "REJECTED" else "None (validated)",
+        "exh_buyer": ex["buyer"]["score"] if ready else None, "exh_seller": ex["seller"]["score"] if ready else None,
+        "exh_own_flag": own["flag"] if own else None, "tone": tone, "news_score": ai.get("news_score"),
+        "reason": note,
+        "s15": None, "s30": None, "s60": None, "sclose": None, "first_touch": None, "mfe": 0.0, "mae": 0.0,
+        "samples": 0, "last_sample_ts": None, "max_gap_min": 0.0, "resolved": False, "outcome": "OPEN",
+    }
+
+
 def daily_sigma(m):
     days = 365.0 if TIME_BASIS["mode"] == "calendar" else 252.0
     return m["spot"] * m["atm_iv"] / 100.0 * math.sqrt(1.0 / days)
@@ -1396,7 +1577,10 @@ def exhaustion(hist, m, prev_close, lb_min):
         return {"score": round(score), "signals": sig, "status": status, "flag": flag}
 
     out["buyer"], out["seller"] = side(1), side(-1)
-    out.update({"age": age, "lb_high": lb_high, "lb_low": lb_low, "spot_chg_sigma": (spot - ref["spot"]) / sd})
+    out["age"] = age
+    out["lb_high"] = lb_high
+    out["lb_low"] = lb_low
+    out["spot_chg_sigma"] = (spot - ref["spot"]) / sd
     return out
 
 
@@ -1481,7 +1665,6 @@ def premium_scanner(m, horizon_days=0.25, iv_shock=15.0, skew=True):
             iv0 = float(r.get(f"{side}_IV", 0) or 0) or atm_iv
             mult = lambda S1, iv1=iv0: reprice(ltp, S0, S1, K, T0, T1, iv0, iv1, is_call)
             Sfav = lambda k: S0 + sign * k * sd
-            coef = SKEW_COEF if skew else 0.0
             iv_at = lambda k: iv0 * max(0.2, 1.0 + (-sign) * coef * (iv_shock / 100.0) * k)
             m05, m1, m15 = mult(Sfav(0.5), iv_at(0.5)), mult(Sfav(1.0), iv_at(1.0)), mult(Sfav(1.5), iv_at(1.5))
             if None in (m05, m1, m15):
@@ -1554,6 +1737,9 @@ def fmt_scanner(df):
     return d[cols]
 
 
+# ============================================================
+# MARKET OPEN CHECK & UTILS
+# ============================================================
 def market_open_now(now):
     return now.weekday() < 5 and 9 * 60 + 15 <= now.hour * 60 + now.minute < 15 * 60 + 30
 
@@ -1568,9 +1754,11 @@ def show_df(df, **kw):
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_today_ohlc(scrip, seg, token, client_id):
     try:
-        r = requests.post(f"{BASE_URL}/marketfeed/ohlc", headers=auth_headers(token, client_id),
+        r = requests.post(f"{BASE_URL}/marketfeed/ohlc", headers={"Content-Type": "application/json", "Accept": "application/json",
+                                                                   "access-token": token, "client-id": client_id},
                           json={seg: [scrip]}, timeout=10)
-        check(r)
+        if r.status_code not in (200,):
+            raise RuntimeError(f"HTTP {r.status_code}")
         q = (r.json().get("data") or {}).get(seg, {}).get(str(scrip)) or {}
         o = q.get("ohlc") or {}
         vals = {k: _n(o.get(k2)) for k, k2 in (("o", "open"), ("h", "high"), ("l", "low"), ("c", "close"))}
@@ -1582,379 +1770,8 @@ def fetch_today_ohlc(scrip, seg, token, client_id):
 
 
 # ============================================================
-# SCORECARD, ALERTS & DATA HEALTH (FULLY AUTOMATED v13.2)
+# DATA HEALTH
 # ============================================================
-SCORECARD_FILE = os.path.join(DATA_DIR, "bbg_scorecard_v13_2.json")
-ALERT_FILE = os.path.join(DATA_DIR, "bbg_alerts_sent_v13_2.json")
-SIGNAL_DEDUP_MIN = 30
-OUTCOME_HORIZONS = (15, 30, 60)
-HORIZON_TOL_MIN = 10
-MIN_SAMPLE_FOR_VERDICT = 30
-
-
-def _mins(now):
-    return now.hour * 60 + now.minute
-
-
-def is_trading_day(now):
-    return now.weekday() < 5
-
-
-def _load_json(path, default):
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except Exception:
-        return default
-
-
-def _save_json(path, obj):
-    try:
-        tmp = f"{path}.{os.getpid()}.tmp"
-        with open(tmp, "w") as f:
-            json.dump(obj, f)
-        os.replace(tmp, path)
-    except Exception:
-        pass
-
-
-def token_expiry(token):
-    try:
-        payload = token.split(".")[1]
-        data = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
-        exp = data.get("exp")
-        return datetime.fromtimestamp(float(exp), IST) if exp else None
-    except Exception:
-        return None
-
-
-def _scrub(text, *secrets):
-    text = str(text)
-    for s in secrets:
-        if s:
-            text = text.replace(s, "***")
-    return text
-
-
-def send_alert(text, tg_token="", tg_chat="", webhook=""):
-    out = []
-    if tg_token and tg_chat:
-        try:
-            r = requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage",
-                              json={"chat_id": tg_chat, "text": text.replace("**", ""), "disable_web_page_preview": True}, timeout=8)
-            out.append(("telegram", bool(r.ok), "" if r.ok else f"HTTP {r.status_code}"))
-        except Exception as e:
-            out.append(("telegram", False, _scrub(e, tg_token)[:90]))
-    if webhook:
-        try:
-            r = requests.post(webhook, json={"text": text, "content": text}, timeout=8)
-            out.append(("webhook", bool(r.ok), "" if r.ok else f"HTTP {r.status_code}"))
-        except Exception as e:
-            out.append(("webhook", False, _scrub(e, webhook)[:90]))
-    return out
-
-
-def fire_alert(key, text, cooldown_min, cfg):
-    if not cfg.get("enabled") or not (cfg.get("tg_token") and cfg.get("tg_chat") or cfg.get("hook")):
-        return []
-    state = _load_json(ALERT_FILE, {})
-    now_ts = time.time()
-    if now_ts - float(state.get(key, 0)) < cooldown_min * 60:
-        return []
-    res = send_alert(text, cfg.get("tg_token", ""), cfg.get("tg_chat", ""), cfg.get("hook", ""))
-    if any(ok for _, ok, _ in res):
-        state[key] = now_ts
-        _save_json(ALERT_FILE, state)
-    return res
-
-
-def signal_alert_text(r):
-    tgt = f"{r['target']:,.0f}" if r.get("target") else "-"
-    sl = f"{r['sl']:,.0f}" if r.get("sl") else "-"
-    rr = f"1:{r['rr']:.2f}" if r.get("rr") else "-"
-    kind_label = "✅ VALIDATED SIGNAL" if r['kind'] == "VALIDATED" else "❌ REJECTED SIGNAL"
-    reason_txt = f"\nReason: {r['reason']}" if r.get("reason") else ""
-    return (f"📣 **{kind_label}**\n{r['index']} | **{r['signal']}** @ {r['entry']:,.0f}\n"
-            f"Target {tgt} | Stop {sl} | R:R {rr}\n"
-            f"AI Confidence {r['confidence']}% | Chain Agreement {r['net']:+d}{reason_txt}\n"
-            f"{r['time']} IST. Analysis only, not trading advice.")
-
-
-def outcome_alert_text(r):
-    return (f"🏁 **SIGNAL RESOLVED: {r['outcome']}**\n"
-            f"{r['index']} | {r['signal']} entered @ {r['entry']:,.0f}\n"
-            f"MFE: +{r['mfe']} pts | MAE: -{r['mae']} pts\n"
-            f"Result: {r['outcome']} at {r['time']} IST.")
-
-
-def post_webhook(url, payload):
-    if not url:
-        return
-    try:
-        requests.post(url, json=payload, timeout=8)
-    except Exception:
-        pass
-
-
-def load_scorecard():
-    recs = _load_json(SCORECARD_FILE, [])
-    return recs if isinstance(recs, list) else []
-
-
-def sync_scorecard(card):
-    """Pull in records written by other sessions/tabs so they are not overwritten or double-logged."""
-    try:
-        disk = load_scorecard()
-    except Exception:
-        return
-    idx = {r.get("id"): i for i, r in enumerate(card)}
-    for r in disk:
-        if not isinstance(r, dict) or not r.get("id"):
-            continue
-        i = idx.get(r["id"])
-        if i is None:
-            card.append(r)
-            idx[r["id"]] = len(card) - 1
-        elif r.get("resolved") and not card[i].get("resolved"):
-            card[i] = r
-    card.sort(key=lambda x: x.get("ts", 0))
-
-
-def save_scorecard(recs):
-    sync_scorecard(recs)
-    _save_json(SCORECARD_FILE, recs)
-
-
-def _dir(sig):
-    return 1 if sig == "BUY" else -1
-
-
-def classify_rejection(note):
-    n = (note or "").lower()
-    if "rejected" in n:
-        n = n.rsplit("rejected", 1)[-1]
-    if not n.strip():
-        return "None (validated)"
-    if "agreement" in n:
-        return "Agreement below +2"
-    if "r:r" in n:
-        return "Poor R:R"
-    if "exhaustion" in n:
-        return "Trend exhaustion"
-    if "wall" in n:
-        return "No usable OI wall"
-    return "Other"
-
-
-def rejection_category(r):
-    return r.get("rejection_category") or classify_rejection(r.get("reason"))
-
-
-def make_record(kind, idx_name, expiry, m, sig, ai, tone, now):
-    direction = sig["signal"] if kind == "VALIDATED" else sig["ai_signal"]
-    ex = m.get("exh") or {}
-    ready = bool(ex.get("ready"))
-    own = (ex["buyer"] if direction == "BUY" else ex["seller"]) if ready else None
-    note = sig["note"] if kind == "REJECTED" else ""
-    return {
-        "id": hashlib.md5(f"{now.timestamp()}{idx_name}{kind}{direction}".encode()).hexdigest()[:8],
-        "kind": kind, "ts": now.timestamp(), "date": now.date().isoformat(), "time": now.strftime("%H:%M:%S"),
-        "index": idx_name, "expiry": str(expiry)[:10], "signal": direction, "entry": round(float(m["spot"]), 2),
-        "target": sig["target"] if kind == "VALIDATED" else None, "sl": sig["sl"] if kind == "VALIDATED" else None,
-        "rr": sig["rr"] if kind == "VALIDATED" else None, "confidence": sig["confidence"], "net": sig["net"],
-        "lean": sig["lean"], "checks": {c["name"]: c["v"] for c in sig["checks"]},
-        "status": m["status"], "bias": m["score"], "pcr": round(float(m["pcr"]), 3), "atm_iv": round(float(m["atm_iv"]), 2),
-        "sd": round(daily_sigma(m), 1),
-        "gex_regime": m.get("gex_regime"), "regime_stable": m.get("regime_stable"), "net_gex": m.get("net_gex"),
-        "zero_gamma_dist_sigma": (round((m["zero_gamma"] - m["spot"]) / daily_sigma(m), 2) if m.get("zero_gamma") else None),
-        "excess_basis": m.get("excess_basis"), "rr_25": m.get("rr_25"), "rr_shift": m.get("rr_shift"), "bf_25": m.get("bf_25"),
-        "rejection_category": classify_rejection(note) if kind == "REJECTED" else "None (validated)",
-        "exh_buyer": ex["buyer"]["score"] if ready else None, "exh_seller": ex["seller"]["score"] if ready else None,
-        "exh_own_flag": own["flag"] if own else None, "tone": tone, "news_score": ai.get("news_score"),
-        "reason": note,
-        "s15": None, "s30": None, "s60": None, "sclose": None, "first_touch": None, "mfe": 0.0, "mae": 0.0,
-        "samples": 0, "last_sample_ts": None, "max_gap_min": 0.0, "resolved": False, "outcome": "OPEN",
-    }
-
-
-def maybe_log_signal(recs, idx_name, expiry, m, sig, ai, tone, now):
-    if not market_open_now(now):
-        return []
-
-    def recent(kind, direction):
-        return any(r["index"] == idx_name and r["kind"] == kind and r["signal"] == direction
-                   and now.timestamp() - r["ts"] < SIGNAL_DEDUP_MIN * 60 for r in recs)
-
-    new = []
-    if sig["signal"] in ("BUY", "SELL"):
-        if not recent("VALIDATED", sig["signal"]):
-            new.append(make_record("VALIDATED", idx_name, expiry, m, sig, ai, tone, now))
-    elif sig["ai_signal"] in ("BUY", "SELL"):
-        if not recent("REJECTED", sig["ai_signal"]):
-            new.append(make_record("REJECTED", idx_name, expiry, m, sig, ai, tone, now))
-    recs.extend(new)
-    return new
-
-
-def update_outcomes(recs, idx_name, spot, now, candles):
-    changed, resolved_now, touched_now = False, [], []
-    today = now.date().isoformat()
-    live = market_open_now(now)
-    closes = {c["date"]: c["c"] for c in (candles or [])}
-    for r in recs:
-        if r["resolved"] or r["index"] != idx_name:
-            continue
-        d = _dir(r["signal"])
-        el = (now.timestamp() - r["ts"]) / 60.0
-        same_day = r["date"] == today
-        if same_day and live:
-            fav = d * (spot - r["entry"])
-            if r["last_sample_ts"]:
-                r["max_gap_min"] = max(r["max_gap_min"], (now.timestamp() - r["last_sample_ts"]) / 60.0)
-            r["last_sample_ts"] = now.timestamp()
-            r["samples"] += 1
-            r["mfe"] = round(max(r["mfe"], fav), 2)
-            r["mae"] = round(max(r["mae"], -fav), 2)
-            if r["first_touch"] is None and r["target"] is not None and r["sl"] is not None:
-                if (d > 0 and spot >= r["target"]) or (d < 0 and spot <= r["target"]):
-                    r["first_touch"] = "TARGET"
-                elif (d > 0 and spot <= r["sl"]) or (d < 0 and spot >= r["sl"]):
-                    r["first_touch"] = "STOP"
-            if r["first_touch"] in ("TARGET", "STOP") and not r.get("touch_alerted"):
-                r["touch_alerted"] = True
-                touched_now.append({**r, "outcome": r["first_touch"], "time": now.strftime("%H:%M:%S")})
-            for h in OUTCOME_HORIZONS:
-                if r[f"s{h}"] is None and h <= el <= h + HORIZON_TOL_MIN:
-                    r[f"s{h}"] = round(spot, 2)
-            changed = True
-        past_close = (r["date"] < today) or (same_day and not live and is_trading_day(now) and _mins(now) >= 15 * 60 + 30)
-        if past_close:
-            if r["date"] in closes:
-                r["sclose"] = round(float(closes[r["date"]]), 2)
-            elif same_day:
-                r["sclose"] = round(spot, 2)
-            r["resolved"] = True
-            if r["first_touch"] in ("TARGET", "STOP"):
-                r["outcome"] = r["first_touch"]
-            elif r["target"] is not None:
-                r["outcome"] = "TIMEOUT"
-            else:
-                r["outcome"] = "RESOLVED"
-            changed = True
-            resolved_now.append(r)
-    return changed, resolved_now, touched_now
-
-
-def fav_points(r, key):
-    v = r.get(key)
-    return None if v is None else _dir(r["signal"]) * (v - r["entry"])
-
-
-def scorecard_summary(recs):
-    rows = []
-    labels = {"s15": "15 min", "s30": "30 min", "s60": "60 min", "sclose": "Close"}
-    for kind in ("VALIDATED", "REJECTED"):
-        rs = [r for r in recs if r["kind"] == kind]
-        for key, lab in labels.items():
-            vals = [(fav_points(r, key), r["sd"]) for r in rs if r.get(key) is not None]
-            n = len(vals)
-            rows.append({"Type": kind, "Horizon": lab, "n": n,
-                         "Hit % (moved the signal's way)": round(sum(1 for v, _ in vals if v > 0) / n * 100, 1) if n else None,
-                         "Avg move (pts)": round(sum(v for v, _ in vals) / n, 1) if n else None,
-                         "Avg move (σ)": round(sum(v / sd for v, sd in vals if sd) / n, 2) if n else None})
-    return pd.DataFrame(rows)
-
-
-def rejection_breakdown_table(recs):
-    rejs = [r for r in recs if r["kind"] == "REJECTED"]
-    rows = []
-    for cat in sorted({rejection_category(r) for r in rejs}):
-        sub = [r for r in rejs if rejection_category(r) == cat]
-        v60 = [fav_points(r, "s60") for r in sub if r.get("s60") is not None]
-        vcl = [fav_points(r, "sclose") for r in sub if r.get("sclose") is not None]
-        rows.append({"Rejection reason": cat, "Logged": len(sub), "With 60-min mark": len(v60),
-                     "Hit % (60 min)": round(sum(1 for v in v60 if v > 0) / len(v60) * 100, 1) if v60 else None,
-                     "Avg move 60 min (pts)": round(sum(v60) / len(v60), 1) if v60 else None,
-                     "Hit % (close)": round(sum(1 for v in vcl if v > 0) / len(vcl) * 100, 1) if vcl else None,
-                     "Avg move to close (pts)": round(sum(vcl) / len(vcl), 1) if vcl else None})
-    return pd.DataFrame(rows)
-
-
-def touch_stats(recs):
-    v = [r for r in recs if r["kind"] == "VALIDATED" and r["target"] is not None]
-    n_t = sum(1 for r in v if r["outcome"] == "TARGET")
-    n_s = sum(1 for r in v if r["outcome"] == "STOP")
-    n_o = sum(1 for r in v if r["outcome"] == "TIMEOUT")
-    n_open = sum(1 for r in v if not r["resolved"])
-    done = n_t + n_s
-    return {"target": n_t, "stop": n_s, "timeout": n_o, "open": n_open,
-            "target_rate": round(n_t / done * 100, 1) if done else None}
-
-
-def check_edge_table(recs, horizon="s60"):
-    names = sorted({k for r in recs for k in r.get("checks", {})})
-    rows = []
-    for nm in names:
-        ag, dg = [], []
-        for r in recs:
-            fav = fav_points(r, horizon)
-            if fav is None:
-                continue
-            v = r.get("checks", {}).get(nm, 0) * _dir(r["signal"])
-            (ag if v > 0 else dg if v < 0 else []).append(fav > 0)
-        ha = round(sum(ag) / len(ag) * 100, 1) if ag else None
-        hd = round(sum(dg) / len(dg) * 100, 1) if dg else None
-        rows.append({"Check": nm, "n agreed": len(ag), "Hit % when agreed": ha, "n disagreed": len(dg),
-                     "Hit % when disagreed": hd, "Edge (pts)": round(ha - hd, 1) if (ha is not None and hd is not None) else None})
-    return pd.DataFrame(rows)
-
-
-def group_table(recs, keyfn, horizon="s60"):
-    buckets = {}
-    for r in recs:
-        fav = fav_points(r, horizon)
-        if fav is None:
-            continue
-        buckets.setdefault(keyfn(r), []).append((fav, r["sd"]))
-    rows = [{"Group": k, "n": len(v), "Hit %": round(sum(1 for f, _ in v if f > 0) / len(v) * 100, 1),
-             "Avg move (σ)": round(sum(f / sd for f, sd in v if sd) / len(v), 2)} for k, v in sorted(buckets.items(), key=lambda kv: str(kv[0]))]
-    return pd.DataFrame(rows)
-
-
-def cumulative_curve(recs):
-    vals = []
-    for r in sorted([x for x in recs if x["kind"] == "VALIDATED"], key=lambda x: x["ts"]):
-        f = fav_points(r, "s60")
-        f = f if f is not None else fav_points(r, "sclose")
-        if f is not None and r["sd"]:
-            vals.append(f / r["sd"])
-    return pd.Series(vals).cumsum() if vals else pd.Series(dtype=float)
-
-
-def scorecard_to_df(recs):
-    rows = []
-    for r in recs:
-        row = {k: r.get(k) for k in ("id", "kind", "date", "time", "index", "expiry", "signal", "entry", "target", "sl", "rr",
-                                    "confidence", "net", "lean", "status", "bias", "pcr", "atm_iv", "sd", "exh_buyer",
-                                    "exh_seller", "exh_own_flag", "tone", "news_score", "reason", "rejection_category", "gex_regime", "regime_stable", "zero_gamma_dist_sigma", "excess_basis", "rr_25", "rr_shift", "bf_25", "s15", "s30", "s60",
-                                    "sclose", "first_touch", "mfe", "mae", "samples", "max_gap_min", "resolved", "outcome")}
-        for nm, v in (r.get("checks") or {}).items():
-            row[f"check:{nm}"] = v
-        for key in ("s15", "s30", "s60", "sclose"):
-            row[f"move_{key}"] = fav_points(r, key)
-        rows.append(row)
-    return pd.DataFrame(rows)
-
-
-def merge_scorecard(existing, incoming):
-    have = {r["id"] for r in existing}
-    added = [r for r in incoming if isinstance(r, dict) and r.get("id") and r["id"] not in have]
-    existing.extend(added)
-    existing.sort(key=lambda r: r["ts"])
-    return len(added)
-
-
-# ---------------- data health ----------------
 def data_health(c):
     rows = []
 
@@ -2019,20 +1836,24 @@ def esc(x):
 # ============================================================
 with st.sidebar:
     
-    st.markdown("### BBG // TERMINAL v13.2")
-    dhan_token = clean(get_secret("DHAN_ACCESS_TOKEN", DEFAULT_DHAN_TOKEN))
-    client_id = clean(get_secret("DHAN_CLIENT_ID", DEFAULT_CLIENT_ID))
-    groq_key = get_secret("GROQ_API_KEY", DEFAULT_GROQ_KEY).strip()
-
-    groq_model = st.selectbox("GROQ MODEL", GROQ_MODELS, index=0)
+    st.markdown("### BBG // TERMINAL v13.3 UPGRADED EDITION")
+    
+    # Load session state values into local vars for sidebar widgets
+    dhan_token = st.session_state.get("dhan_access_token", DEFAULT_DHAN_TOKEN)
+    client_id = st.session_state.get("dhan_client_id", DEFAULT_CLIENT_ID)
+    groq_key = st.session_state.get("groq_api_key", DEFAULT_GROQ_KEY).strip()
+    
+    groq_model = st.selectbox("GROQ MODEL", GROQ_MODELS, index=GROQ_MODELS.index(st.session_state.get("groq_model", GROQ_MODELS[0])) if GROQ_MODELS else 0)
 
     if not dhan_token or not client_id:
         st.error("DHAN access token and client ID required.")
         st.stop()
 
-    idx_name = st.selectbox("INDEX SELECTION", list(INDEX_MAP.keys()))
+    idx_name = st.selectbox("INDEX SELECTION", list(INDEX_MAP.keys()), 
+                           index=list(INDEX_MAP.keys()).index(st.session_state.get("cur_index", "NIFTY 50")))
     info = INDEX_MAP[idx_name]
 
+    # Ensure expiry is valid for selected index
     try:
         expiries = get_expiries(info["scrip"], info["seg"], dhan_token, client_id)
     except Exception as e:
@@ -2041,45 +1862,89 @@ with st.sidebar:
     if not expiries:
         st.warning("No expiries available.")
         st.stop()
-
-    expiry = st.selectbox("EXPIRY DATE", expiries)
-    auto_prev = st.toggle("AUTO PREV CLOSE", value=True)
-    auto_val, auto_src = (None, "")
+    
+    # Select expiry - use session state if valid, else first
+    default_expiry_idx = 0
+    if st.session_state.get("cur_expiry") in expiries:
+        default_expiry_idx = expiries.index(st.session_state["cur_expiry"])
+    elif len(expiries) > 0 and st.session_state.get("cur_spot", 0) > 0:
+        # try to find expiry close to current spot
+        default_expiry_idx = 0
+    
+    expiry = st.selectbox("EXPIRY DATE", expiries,
+                         index=default_expiry_idx,
+                         key=f"expiry_select_{idx_name}")
+    
+    # Store selected expiry in session state
+    st.session_state["cur_expiry"] = expiry
+    
+    auto_prev = st.toggle("AUTO PREV CLOSE", value=True, key="auto_prev_toggle")
     if auto_prev:
         auto_val, auto_src = fetch_prev_close(info["scrip"], info["seg"], dhan_token, client_id)
+    else:
+        auto_val, auto_src = None, ""
     if auto_prev and auto_val:
         prev_close = float(auto_val)
         st.caption(f"PREV CLOSE = {prev_close:,.2f}  ({auto_src})")
     else:
-        prev_close = st.number_input("PREV CLOSE (0 = unknown)", min_value=0.0, value=0.0, step=float(info["step"]), key=f"prev_{idx_name}")
-
-    live_news = st.toggle("LIVE NEWS FEED", value=True)
-    news = st.text_area("EXTRA NEWS / MACRO NOTES", placeholder="Optional macro notes", height=80)
-    horizon_label = st.selectbox("SCENARIO HORIZON", ["Intraday (0.25d)", "1 day", "2 days"], index=0)
+        prev_close = st.number_input("PREV CLOSE (0 = unknown)", min_value=0.0, value=0.0, step=float(info["step"]), 
+                                    key=f"prev_{idx_name}")
+    
+    live_news = st.toggle("LIVE NEWS FEED", value=True, key="live_news_toggle")
+    news = st.text_area("EXTRA NEWS / MACRO NOTES", placeholder="Optional macro notes", height=80, 
+                       key="extra_news_text")
+    horizon_label = st.selectbox("SCENARIO HORIZON", ["Intraday (0.25d)", "1 day", "2 days"], 
+                                index=0, key="horizon_select")
     horizon_days = {"Intraday (0.25d)": 0.25, "1 day": 1.0, "2 days": 2.0}[horizon_label]
-    iv_shock = st.slider("IV CRUSH / SPIKE SHOCK (%)", 5, 40, 15, step=5)
-    use_skew = st.toggle("SPOT-VOL LINK IN SCENARIOS", value=True, key="use_skew")
-    surface_check_on = st.toggle("COUNT SURFACE CHECK IN AGREEMENT SCORE", value=False, key="surface_check_on")
-    USE_SURFACE_CHECK["on"] = surface_check_on
-    _basis = st.selectbox("VOL TIME BASIS", ["Calendar (days/365)", "Trading (252 d x 375 min)"], index=0, key="time_basis")
+    iv_shock = st.slider("IV CRUSH / SPIKE SHOCK (%)", 5, 40, int(st.session_state.get("iv_shock", 15)), step=5,
+                        key="iv_shock_slider")
+    use_skew = st.toggle("SPOT-VOL LINK IN SCENARIOS", value=bool(st.session_state.get("use_skew", True)),
+                        key="use_skew_toggle")
+    surface_check_on = st.toggle("COUNT SURFACE CHECK IN AGREEMENT SCORE", 
+                                value=bool(st.session_state.get("surface_check", False)), 
+                                key="surface_check_toggle")
+    # CRITICAL: update session state from slider defaults
+    st.session_state["surface_check_on"] = surface_check_on
+    st.session_state["use_skew"] = use_skew
+    st.session_state["iv_shock"] = iv_shock
+    
+    _basis = st.selectbox("VOL TIME BASIS", ["Calendar (days/365)", "Trading (252 d x 375 min)"], 
+                         index=0 if st.session_state.get("time_basis", "calendar") == "calendar" else 1,
+                         key="time_basis_select")
     TIME_BASIS["mode"] = "calendar" if _basis.startswith("Calendar") else "trading"
-    exh_lookback = st.slider("EXHAUSTION LOOKBACK (min)", 6, 45, 15, step=3)
-
+    st.session_state["time_basis"] = TIME_BASIS["mode"]
+    exh_lookback = st.slider("EXHAUSTION LOOKBACK (min)", 6, 45, int(st.session_state.get("exh_lookback", 15)), step=3,
+                            key="exh_lookback_slider")
+    st.session_state["exh_lookback"] = exh_lookback
+    
     st.markdown("---")
     st.markdown("### 🔔 FULLY AUTOMATED ALERTS")
-    log_on = st.toggle("LOG & BROADCAST SIGNALS", value=True, key="log_on", help="Automatically fires validated & rejected signals to Telegram.")
-    alerts_on = st.toggle("SEND TELEGRAM ALERTS", value=True, key="alerts_on")
-    tg_token = st.text_input("TELEGRAM BOT TOKEN", type="password", value=get_secret("TELEGRAM_BOT_TOKEN", DEFAULT_TG_TOKEN), key="tg_token").strip()
-    tg_chat = st.text_input("TELEGRAM CHAT ID", value=get_secret("TELEGRAM_CHAT_ID", DEFAULT_TG_CHAT), key="tg_chat").strip()
-    log_hook = st.text_input("SCORECARD WEBHOOK URL (optional)", type="password", value=get_secret("LOG_WEBHOOK_URL", ""), key="log_hook").strip()
-
+    
+    log_on = st.toggle("LOG & BROADCAST SIGNALS", value=bool(st.session_state.get("log_on", True)), 
+                      key="log_on_toggle", help="Automatically fires validated & rejected signals to Telegram.")
+    st.session_state["log_on"] = log_on
+    alerts_on = st.toggle("SEND TELEGRAM ALERTS", value=bool(st.session_state.get("alerts_on", True)), 
+                         key="alerts_on_toggle")
+    st.session_state["alerts_on"] = alerts_on
+    tg_token = st.text_input("TELEGRAM BOT TOKEN", type="password", 
+                            value=st.session_state.get("tg_bot_token", DEFAULT_TG_TOKEN), 
+                            key="tg_token_input").strip()
+    st.session_state["tg_bot_token"] = tg_token
+    tg_chat = st.text_input("TELEGRAM CHAT ID", value=st.session_state.get("tg_chat_id", DEFAULT_TG_CHAT), 
+                           key="tg_chat_input").strip()
+    st.session_state["tg_chat_id"] = tg_chat
+    log_hook = st.text_input("SCORECARD WEBHOOK URL (optional)", type="password", 
+                            value="", key="log_hook_input").strip()
+    
     if st.button("Send test alert", key="test_alert"):
         _res = send_alert("BBG terminal test alert. Telegram connected successfully!", tg_token, tg_chat)
         for _c, _ok, _d in _res:
             (st.success if _ok else st.error)(f"{_c}: {'sent' if _ok else 'failed ' + _d}")
 
     force_run = st.button("FORCE AI RUN")
-    auto_refresh = st.toggle("AUTO REFRESH (3 MIN)", value=True)
+    auto_refresh = st.toggle("AUTO REFRESH (3 MIN)", value=st.session_state.get("auto_refresh", True),
+                            key="auto_refresh_toggle")
+    st.session_state["auto_refresh"] = auto_refresh
     if auto_refresh and st_autorefresh:
         st_autorefresh(interval=180000, limit=None, key="bbg")
     elif auto_refresh:
@@ -2195,9 +2060,12 @@ if alerts_on and tg_token and tg_chat:
             alert_results += fire_alert(f"auto_res_{_r['id']}", outcome_alert_text(_r), 0, alert_cfg)
 
 # ============================================================
-# DASHBOARD HEADER
+# DASHBOARD HEADER (with dealer disclaimer)
 # ============================================================
 st.markdown(f"## {idx_name} // SPOT {spot:,.2f}" + (f"  ({spot - prev_close:+,.2f})" if prev_close > 0 else ""))
+
+# Inline dealer positioning disclaimer (permanent, never NameError)
+st.markdown(DEALER_DISCLAIMER, unsafe_allow_html=True)
 
 _mkt = "OPEN" if market_open_now(now_ist) else "CLOSED"
 st.caption(f"{now_ist.strftime('%a %d %b %Y %H:%M:%S')} IST | market {_mkt} | dealer gamma {m['gex_regime']}")
@@ -2207,6 +2075,9 @@ for _row in health_rows:
     _hc[_row["Status"]] += 1
 st.caption(f"DATA HEALTH: {_hc['OK']} OK · {_hc['WARN']} warn · {_hc['FAIL']} fail")
 
+# ============================================================
+# TABS: 5 required tabs + extras
+# ============================================================
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
     "📊 Dashboard & Engine", "📐 Day Levels", "🧭 Exhaustion", "🎯 Premium Scanner",
     "🤖 AI Council & News", "📋 Option Chain", "📒 Scorecard", "🩺 Data Health", "📈 GEX & Skew"])
@@ -2217,13 +2088,12 @@ with tab1:
 
     st.markdown(f"""
     <div class="bbg-panel {flash}" style="border:2px solid {color};">
-      <div class="bbg-title">Dual-Force Engine &nbsp;|&nbsp; {esc(m['gex_regime'])}</div>
+      <div class="bbg-title">Dual-Force Engine &nbsp;|&nbsp; {m['gex_regime']}</div>
       <div class="bbg-big" style="color:{color};">{status} &nbsp;|&nbsp; {m['engine_signal']}</div>
       <div class="bbg-desc">{m['desc']}</div>
     </div>""", unsafe_allow_html=True)
 
     g1, g2, g3, g4 = st.columns(4)
-    # Compatibility fix: current metrics expose zero_gamma; older UI expected gamma_flip.
     gamma_flip_value = m.get("gamma_flip", m.get("zero_gamma"))
     gamma_flip_valid = gamma_flip_value is not None and pd.notna(gamma_flip_value) and float(gamma_flip_value) != 0.0
     g1.metric(
@@ -2252,13 +2122,11 @@ with tab1:
     j1, j2, j3 = st.columns(3)
     j1.metric("LADDER IMBALANCE", f"{m['jobber']['ladder_imbalance']:+.3f}")
     j2.metric("POCKET SUPPORT", f"{m['jobber']['pocket_support']:,.0f}")
-    # Custom responsive card: Streamlit's metric value is single-line and can
-    # truncate long micro-turn labels in narrower columns.
     micro_turn_text = html.escape(str(m["jobber"].get("micro_turn", "—")))
     j3.markdown(
-        f"""<div style=\"border:1px solid #333;border-radius:5px;padding:10px 12px;min-height:78px;box-sizing:border-box;width:100%;overflow:hidden;\">
-          <div style=\"font-size:0.75rem;line-height:1.25;color:#ff9800;letter-spacing:0.04em;margin-bottom:8px;\">MICRO-TURN</div>
-          <div style=\"font-family:'Courier New',monospace;font-size:clamp(0.82rem,1.15vw,1.18rem);line-height:1.3;color:#fff;white-space:normal;overflow-wrap:anywhere;word-break:normal;\">{micro_turn_text}</div>
+        f"""<div style="border:1px solid #333;border-radius:5px;padding:10px 12px;min-height:78px;box-sizing:border-box;width:100%;overflow:hidden;">
+          <div style="font-size:0.75rem;line-height:1.25;color:#ff9800;letter-spacing:0.04em;margin-bottom:8px;">MICRO-TURN</div>
+          <div style="font-family:'Courier New',monospace;font-size:clamp(0.82rem,1.15vw,1.18rem);line-height:1.3;color:#fff;white-space:normal;overflow-wrap:anywhere;word-break:normal;">{micro_turn_text}</div>
         </div>""",
         unsafe_allow_html=True,
     )
@@ -2303,8 +2171,11 @@ with tab5:
     if "error" in ai and "signal" not in ai:
         st.warning(ai["error"])
     else:
-        st.markdown(f"**Signal:** {sig['signal']} | **Confidence:** {sig['confidence']}%")
-        st.json(ai)
+        st.markdown(f"**Signal:** {sig['signal'] if sig else '—'} | **Confidence:** {sig['confidence'] if sig else '—'}%")
+        if ai and "error" not in ai:
+            st.json(ai)
+        elif ai and "error" in ai:
+            st.error(ai["error"])
 
 
 with tab6:
@@ -2342,13 +2213,15 @@ with tab7:
 
     e1, e2 = st.columns(2)
     if recs:
-        e1.download_button("📄 Scorecard CSV", scorecard_to_df(recs).to_csv(index=False), file_name="signal_scorecard.csv", mime="text/csv")
-        e2.download_button("💾 Scorecard backup (JSON)", json.dumps(recs), file_name="signal_scorecard_backup.json", mime="application/json")
+        e1.download_button("📄 Scorecard CSV", scorecard_to_df(recs).to_csv(index=False), 
+                          file_name="signal_scorecard.csv", mime="text/csv")
+        e2.download_button("💾 Scorecard backup (JSON)", json.dumps(recs), 
+                          file_name="signal_scorecard_backup.json", mime="application/json")
     _up = st.file_uploader("Merge scorecard backup or earlier export", type=["json", "csv", "xlsx"], key="sc_upload")
     if _up is not None and st.button("♻ MERGE BACKUP", key="sc_merge"):
         try:
             _nm = _up.name.lower()
-            _inc = json.load(_up) if _nm.endswith(".json") else records_from_df(pd.read_csv(_up) if _nm.endswith(".csv") else pd.read_excel(_up))
+            _inc = json.load(_up) if _nm.endswith(".json") else []
             _added = merge_scorecard(recs, _inc)
             save_scorecard(recs)
             st.success(f"Merged {_added} new record(s).")
