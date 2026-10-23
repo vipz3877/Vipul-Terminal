@@ -36,23 +36,27 @@ import streamlit as st
 # CRITICAL: SESSION STATE INITIALIZATION (BEFORE ANY WIDGETS)
 # ============================================================
 # Initialize ALL 14 required session state keys to prevent crashes
-SESSION_KEYS = [
-    "_bbg_flags", "_cur_ai_key", "_last_ai_time", "_last_ai_attempt",
-    "_last_api_call", "oi_snap", "velocity", "last_ai_verdict",
-    "last_ai_verdict_key", "last_ai_state", "scorecard", "hist_key",
-    "hist", "last_surface_check"
-]
+SESSION_DEFAULTS = {
+    "_bbg_flags": {},
+    "_cur_ai_key": None,
+    "_last_ai_time": None,
+    "_last_ai_attempt": None,
+    "_last_api_call": 0.0,
+    "oi_snap": None,
+    "velocity": {"ce_builds": 0.0, "ce_unwinds": 0.0, "pe_builds": 0.0, "pe_unwinds": 0.0},
+    "last_ai_verdict": {},
+    "last_ai_verdict_key": None,
+    "last_ai_state": None,
+    "scorecard": [],
+    "hist_key": None,
+    "hist": [],
+    "last_surface_check": False,
+}
 
-for key in SESSION_KEYS:
-    if key not in st.session_state:
-        if key == "scorecard":
-            st.session_state[key] = []
-        elif key in ["oi_snap", "last_ai_verdict", "last_ai_state"]:
-            st.session_state[key] = {} if key != "velocity" else {"ce_builds": 0.0, "ce_unwinds": 0.0, "pe_builds": 0.0, "pe_unwinds": 0.0}
-        elif key == "hist":
-            st.session_state[key] = []
-        else:
-            st.session_state[key] = None
+for key, default_value in SESSION_DEFAULTS.items():
+    if key not in st.session_state or st.session_state[key] is None and key == "_bbg_flags":
+        # Use a fresh dict/list for mutable defaults so sessions don't share state.
+        st.session_state[key] = default_value.copy() if isinstance(default_value, (dict, list)) else default_value
 
 # ============================================================
 # CONFIG & GLOBAL CONSTANTS
