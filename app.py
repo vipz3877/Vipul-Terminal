@@ -1925,7 +1925,7 @@ def main():
         pow2 = power_of_two_levels(m["df"], spot)
         for l in pow2[:5]:
             sig_color = "🔴" if l["significance"] == "HIGH" else "🟡" if l["significance"] == "MODERATE" else "🟢"
-            st.write(f"{sig_color} **{l['level']:,.0f}**: OI {l['oi_concentration':,.0f} ({l['significance']})")
+            st.write(f"{sig_color} **{l['level']:,.0f}**: OI {l['oi_concentration']:,.0f} ({l['significance']})")
         
         # NEW: Theta Acceleration
         theta = theta_acceleration(m)
