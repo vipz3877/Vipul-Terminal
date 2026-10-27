@@ -1,5 +1,5 @@
 """
-VIPUL OPTIONS BUYER SIGNAL TERMINAL v16.0
+VIPUL OPTIONS BUYER SIGNAL TERMINAL v15.0
 Built on v14.0. Changes in this version:
  - Market-regime context from recent spot snapshots (advisory only, not a proven filter)
  - Manual trade lifecycle: confirm actual fill before premium stop/target monitoring; record actual exits and net P&L
@@ -21,7 +21,7 @@ Built on v14.0. Changes in this version:
  - Telegram: validated signals + outcomes by default (rejected optional), correct resolve time, alert state pruned
  - NET GEX shown in Rs crore, cross-index view cached 5 min
  - NSE holiday list via secret NSE_HOLIDAYS (comma separated YYYY-MM-DD); OI velocity normalized to 180-second equivalent; missing close data marked DATA_GAP
-BUYER-ONLY: signals are BUY CALL / BUY PUT / WAIT; no writing/selling options and no order execution. v16 adds testable strategy playbooks, research tools, quote-age checks, and a separate monitor_service.py process.
+BUYER-ONLY: signals are BUY CALL / BUY PUT / WAIT; no writing/selling options and no order execution. Telegram is best-effort while Streamlit is running; this is not a 24/7 background monitor.
 """
 
 import os
@@ -42,9 +42,6 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-from strategy_engine import (trend_pullback_signal, opening_range_breakout_signal, classify_regime,
-    option_analytics, quote_freshness, backtest_option_playbook, calibration_table,
-    fit_probability_calibrator, apply_probability_calibrator, probability_metrics, chronological_calibration_report)
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -56,7 +53,7 @@ try:
 except ImportError:
     Groq = None
 
-st.set_page_config(page_title="Vipul Options Buyer Terminal v16.0", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Vipul Options Buyer Terminal v15.0", layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
 # CSS
@@ -333,10 +330,6 @@ def _fetch_chain_raw(scrip, seg, expiry, token, client_id):
     check(r)
     data = r.json().get("data", {}) or {}
     spot = float(data.get("last_price") or 0)
-    # Dhan option-chain response commonly has no per-quote exchange timestamp. This is a local
-    # receive timestamp, useful for detecting cached/stale snapshots but not proof of exchange age.
-    chain_received_ts = time.time()
-    provider_timestamp = data.get("timestamp") or r.json().get("timestamp")
 
     rows = []
     for strike_str, item in (data.get("oc") or {}).items():
@@ -358,7 +351,6 @@ def _fetch_chain_raw(scrip, seg, expiry, token, client_id):
             "PE_Bid": _n(pe.get("top_bid_price")), "PE_Ask": _n(pe.get("top_ask_price")),
             "CE_Vol": _n(ce.get("volume")), "PE_Vol": _n(pe.get("volume")),
             "CE_Delta": _n(ce_g.get("delta")), "PE_Delta": _n(pe_g.get("delta")),
-            "QuoteReceivedTS": chain_received_ts, "ProviderTimestamp": provider_timestamp,
         })
     df = pd.DataFrame(rows)
     if df.empty:
@@ -2323,41 +2315,9 @@ def sync_scorecard(card):
     card.sort(key=lambda x: x.get("ts", 0))
 
 
-def _sync_active_trades_file(recs):
-    """Publish manually confirmed open positions for the independent monitor process."""
-    active = []
-    for r in recs:
-        if not isinstance(r, dict) or r.get("kind") != "VALIDATED":
-            continue
-        if r.get("manual_entry_confirmed") is not True or r.get("trade_state") != "POSITION_OPEN":
-            continue
-        if not r.get("option_strike") or not r.get("option_expiry") or not r.get("option_type"):
-            continue
-        active.append({k: r.get(k) for k in (
-            "id", "index", "option_expiry", "option_strike", "option_type", "option_side",
-            "manual_entry_confirmed", "trade_state", "actual_entry_price", "actual_entry_qty",
-            "actual_entry_ts", "actual_fees", "option_stop", "option_target1", "option_target2")})
-    path = os.getenv("BBG_ACTIVE_TRADES_FILE") or os.path.join(DATA_DIR, "active_trades.json")
-    tmp = path + ".tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(active, f, ensure_ascii=False)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    except Exception as e:
-        # Do not break the dashboard save if a deployment filesystem is read-only.
-        try:
-            if os.path.exists(tmp): os.remove(tmp)
-        except Exception:
-            pass
-        st.warning(f"Could not sync independent monitor trade file: {str(e)[:160]}")
-
-
 def save_scorecard(recs):
     sync_scorecard(recs)
     _save_json(SCORECARD_FILE, recs)
-    _sync_active_trades_file(recs)
 
 
 def _dir(sig):
@@ -2790,7 +2750,7 @@ def esc(x):
 # SIDEBAR
 # ============================================================
 with st.sidebar:
-    st.markdown("### BBG // BUYER TERMINAL v16.0")
+    st.markdown("### BBG // BUYER TERMINAL v15.0")
     dhan_token = clean(get_secret("DHAN_ACCESS_TOKEN", DEFAULT_DHAN_TOKEN))
     client_id = clean(get_secret("DHAN_CLIENT_ID", DEFAULT_CLIENT_ID))
     groq_key = get_secret("GROQ_API_KEY", DEFAULT_GROQ_KEY).strip()
@@ -2868,14 +2828,6 @@ if df.empty or spot == 0:
 m = compute_metrics(df, spot, prev_close, expiry, info["step"])
 now_ist = datetime.now(IST)
 data_ok, gate_reason = data_gate(now_ist, m)
-# Cached chain snapshots carry the timestamp from the actual fetch. Fail closed when stale.
-chain_received_ts = None
-if "QuoteReceivedTS" in df.columns and df["QuoteReceivedTS"].notna().any():
-    chain_received_ts = float(df["QuoteReceivedTS"].dropna().max())
-chain_freshness = quote_freshness(chain_received_ts, now_ts=time.time(), max_age_seconds=45)
-if not chain_freshness["ok"]:
-    data_ok = False
-    gate_reason = f"Option-chain quote stale/unverifiable: {chain_freshness['reason']}"
 
 vel = update_oi_velocity(m, key=f"{idx_name}|{expiry}")
 hist = record_snapshot(m, f"{idx_name}|{expiry}", store=data_ok)
@@ -2952,8 +2904,6 @@ if log_on and is_trading_day(now_ist):
 if "scorecard" not in st.session_state:
     st.session_state["scorecard"] = load_scorecard()
 card = st.session_state["scorecard"]
-# Refresh the independent monitor's durable active-trade manifest even after app restart.
-_sync_active_trades_file(card)
 _tone_val, _tone_hits = headline_tone(news_items) if news_items else (0, 0)
 tone_now = _tone_val if _tone_hits >= NEWS_MIN_TONE_HITS else None
 new_recs, _resolved, _touched = [], [], []
@@ -3011,7 +2961,6 @@ st.info("OPTION-BUYER MODE: BUY CALL / BUY PUT / WAIT only. Manual execution onl
 if not data_ok:
     st.warning(f"DATA GATE CLOSED: {gate_reason}. Figures below may be stale or off-hours; the AI council, history snapshots "
                "and signal validation are paused (signals stay WAIT).")
-st.caption(f"OPTION CHAIN AGE: {chain_freshness.get('age_seconds')}s | basis: {chain_freshness.get('basis')} | {chain_freshness.get('reason')}. Provider exchange timestamp may be unavailable.")
 
 if move and move["triggered"]:
     st.warning(f"Large move: {idx_name} is {move['pct']:+.2f}% vs previous close (alert threshold ±{P('move_alert_pct')}%). "
@@ -3022,9 +2971,9 @@ for _row in health_rows:
     _hc[_row["Status"]] += 1
 st.caption(f"DATA HEALTH: {_hc['OK']} OK · {_hc['WARN']} warn · {_hc['FAIL']} fail")
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
     "📊 Dashboard & Engine", "📐 Day Levels", "🧭 Exhaustion", "🎯 Premium Scanner",
-    "🤖 AI Council & News", "📋 Option Chain", "📒 Scorecard", "🩺 Data Health", "📈 GEX & Skew", "🧾 Manual Trades", "🧪 Playbooks & Research"])
+    "🤖 AI Council & News", "📋 Option Chain", "📒 Scorecard", "🩺 Data Health", "📈 GEX & Skew", "🧾 Manual Trades"])
 
 with tab1:
     status = m["status"]
@@ -3328,7 +3277,7 @@ with tab9:
 
 with tab10:
     st.markdown("#### 🧾 MANUAL OPTION TRADE JOURNAL")
-    st.caption("A validated signal is not a position. Confirm only after your manual order actually fills. The separate monitor_service.py process can monitor confirmed open positions independently when running.")
+    st.caption("A validated signal is not a position. Confirm only after your manual order actually fills. Monitoring remains best-effort and depends on the app refreshing.")
     _records = st.session_state.get("scorecard", [])
     _eligible = [r for r in _records if r.get("kind") == "VALIDATED" and r.get("option_strike") is not None
                  and not r.get("manual_entry_confirmed") and r.get("trade_state", "SIGNAL_ONLY") not in ("EXITED", "CANCELLED")
@@ -3377,7 +3326,7 @@ with tab10:
     _open_positions = [r for r in _records if r.get("trade_state") == "POSITION_OPEN" and r.get("manual_entry_confirmed")]
     st.markdown("##### Open positions")
     if _open_positions:
-        st.info("Open positions are also written to active_trades.json for monitor_service.py. Start that separate process and keep it running on a persistent host for index-independent monitoring.")
+        st.warning("This dashboard refreshes one selected index/expiry at a time. For reliable quote updates, keep the currently monitored position's index and expiry selected. Switching away can pause its premium monitoring; this is not an independent background monitor.")
         for _r in _open_positions[::-1]:
             if _r.get("index") != idx_name or str(_r.get("option_expiry")) != str(expiry)[:10]:
                 st.warning(f"Monitoring paused for {_r.get('index')} {_r.get('option_strike')} {_r.get('option_type')} exp {_r.get('option_expiry')}: select that index and expiry to refresh its option quote.")
@@ -3414,144 +3363,3 @@ with tab10:
         show_df(_closed_df, hide_index=True)
         st.metric("REALIZED NET P&L (RECORDED TRADES)", f"₹{sum(float(r.get('actual_net_pnl') or 0) for r in _closed):+,.2f}")
         st.caption("This is only as accurate as the entry, exit and fee values you record. It is not a backtest or a forecast.")
-
-
-with tab11:
-    st.markdown("#### 🧪 STRATEGY PLAYBOOKS & OPTION RESEARCH LAB")
-    st.caption("These are separate experimental playbooks. They do not override the main engine and are not proven profitable. Signals are only displayed when recent candle data passes the freshness check.")
-    _candles_df = pd.DataFrame(intraday or [])
-    if not _candles_df.empty and "ts" in _candles_df.columns:
-        _last_ts = float(pd.to_numeric(_candles_df["ts"], errors="coerce").dropna().max())
-        _candle_age = max(0.0, time.time() - _last_ts)
-        _candle_fresh = _candle_age <= 120
-    else:
-        _last_ts, _candle_age, _candle_fresh = None, None, False
-    st.write(f"Live candle source: {'available' if not _candles_df.empty else 'unavailable'} | last candle age: {round(_candle_age,1) if _candle_age is not None else 'n/a'}s | freshness limit: 120s")
-    if not _candles_df.empty:
-        try:
-            _regime = classify_regime(_candles_df)
-            _tp = trend_pullback_signal(_candles_df)
-            _orb = opening_range_breakout_signal(_candles_df)
-            if not _candle_fresh:
-                _tp = {**_tp, "signal": "WAIT", "reason": f"STALE CANDLES ({_candle_age:.1f}s); no actionable playbook signal"}
-                _orb = {**_orb, "signal": "WAIT", "reason": f"STALE CANDLES ({_candle_age:.1f}s); no actionable playbook signal"}
-            # Playbook alerts are explicitly marked experimental and require fresh underlying candles,
-            # fresh option-chain gate, an eligible buyer contract, and Telegram configuration.
-            if _candle_fresh and data_ok and market_open_now(now_ist) and alerts_on and tg_token and tg_chat:
-                for _pb in (_tp, _orb):
-                    if _pb.get("signal") not in ("BUY_CALL", "BUY_PUT"):
-                        continue
-                    _pb_dir = "BUY" if _pb["signal"] == "BUY_CALL" else "SELL"
-                    _pb_plan = select_buyer_contract(m, _pb_dir)
-                    if not _pb_plan:
-                        continue
-                    _pb_ts = str(_pb.get("timestamp") or "unknown-time")
-                    _pb_key = f"playbook_{idx_name}_{str(expiry)[:10]}_{_pb.get('strategy')}_{_pb['signal']}_{_pb_ts}"
-                    _pb_text = (f"🧪 EXPERIMENTAL PLAYBOOK SIGNAL — MANUAL REVIEW ONLY\n"
-                        f"Strategy: {_pb.get('strategy')} | {idx_name} | {expiry}\n"
-                        f"Signal: {_pb['signal']} | underlying close ₹{float(_pb.get('spot') or spot):,.2f} | candle {_pb_ts}\n"
-                        f"Candidate: {idx_name} {_pb_plan['strike']:g} {_pb_plan['option_type']} | bid/ask ₹{_pb_plan['bid']:.2f}/₹{_pb_plan['ask']:.2f} | Δ {_pb_plan['delta']:+.2f} | IV {_pb_plan['iv']:.1f}%\n"
-                        f"Ask reference ₹{_pb_plan['entry_ref']:.2f} | planning SL ₹{_pb_plan['stop_premium']:.2f} | T1 ₹{_pb_plan['target1_premium']:.2f} | T2 ₹{_pb_plan['target2_premium']:.2f}\n"
-                        f"Reason: {_pb.get('reason')}\nNot a fill or guaranteed forecast. Verify the live quote and main terminal checks before acting.")
-                    fire_alert(_pb_key, _pb_text, 24*60, alert_cfg)
-            c1, c2, c3 = st.columns(3)
-            c1.metric("MARKET REGIME", _regime.get("regime", "n/a"))
-            c2.metric("TREND PULLBACK", _tp.get("signal", "WAIT"))
-            c3.metric("OPENING RANGE BREAKOUT", _orb.get("signal", "WAIT"))
-            with st.expander("Trend-pullback details", expanded=True): st.json(_tp)
-            with st.expander("Opening-range breakout details", expanded=True): st.json(_orb)
-        except Exception as _e:
-            st.error(f"Could not evaluate playbooks: {str(_e)[:240]}")
-    else:
-        st.warning("Live intraday candles unavailable. Use the CSV backtest below; no playbook signal is inferred.")
-
-    st.markdown("##### Option pricing diagnostics")
-    _pr1, _pr2, _pr3, _pr4 = st.columns(4)
-    _pr_spot = _pr1.number_input("Underlying spot", min_value=0.01, value=float(spot), key="research_spot")
-    _pr_strike = _pr2.number_input("Option strike", min_value=0.01, value=float(round(spot / info["step"]) * info["step"]), key="research_strike")
-    _pr_iv = _pr3.number_input("IV (%)", min_value=0.1, max_value=500.0, value=float(max(1.0, m.get("atm_iv", 15.0))), key="research_iv")
-    _pr_prem = _pr4.number_input("Observed premium ₹", min_value=0.05, value=float(max(0.05, m.get("atm_straddle", 50.0) / 2)), key="research_prem")
-    _pr5, _pr6, _pr7, _pr8 = st.columns(4)
-    _pr_type = _pr5.selectbox("Contract side", ["CALL", "PUT"], key="research_type")
-    _pr_days = _pr6.number_input("Days to expiry", min_value=0.01, max_value=365.0, value=3.0, key="research_dte")
-    _pr_horizon = _pr7.number_input("Expected holding minutes", min_value=1, max_value=375, value=30, key="research_horizon")
-    _pr_cost = _pr8.number_input("Estimated round-trip cost per unit ₹", min_value=0.0, value=2.0, key="research_cost")
-    _pr9, _pr10, _pr11 = st.columns(3)
-    _pr_bid = _pr9.number_input("Observed bid ₹ (0 = omit)", min_value=0.0, value=0.0, key="research_bid")
-    _pr_ask = _pr10.number_input("Observed ask ₹ (0 = omit)", min_value=0.0, value=0.0, key="research_ask")
-    _pr_ivshock = _pr11.number_input("IV shock scenario (vol points)", min_value=-50.0, max_value=50.0, value=0.0, key="research_ivshock")
-    _iv_upload = st.file_uploader("Optional IV history CSV (column named iv or IV)", type=["csv"], key="iv_history_upload")
-    _iv_hist = []
-    if _iv_upload is not None:
-        try:
-            _ivdf = pd.read_csv(_iv_upload)
-            _ivcol = "iv" if "iv" in _ivdf.columns else "IV" if "IV" in _ivdf.columns else None
-            if _ivcol: _iv_hist = pd.to_numeric(_ivdf[_ivcol], errors="coerce").dropna().tolist()
-        except Exception as _e: st.warning(f"Could not read IV history: {_e}")
-    try:
-        _pa = option_analytics(_pr_spot, _pr_strike, _pr_iv, _pr_days / 365.0, _pr_type == "CALL", _pr_prem,
-            bid=(_pr_bid if _pr_bid > 0 else None), ask=(_pr_ask if _pr_ask > 0 else None),
-            iv_history=_iv_hist, horizon_minutes=int(_pr_horizon), iv_shock_points=float(_pr_ivshock), cost_per_unit=float(_pr_cost))
-        st.json(_pa)
-        if _pa["iv_percentile"]["status"] != "OK": st.caption("IV percentile not available: provide at least 20 valid historical IV observations. The Black–Scholes values are scenario estimates, not predictions.")
-    except Exception as _e: st.error(f"Pricing diagnostics unavailable: {str(_e)[:200]}")
-
-    st.markdown("##### Historical option-level backtest (CSV upload)")
-    st.caption("Underlying CSV: timestamp, open, high, low, close (volume optional). Option quotes CSV: timestamp, expiry, strike, option_type (CALL/PUT or CE/PE), bid, ask; IV/delta optional. Quotes are snapshots, not tick history.")
-    _bt1, _bt2 = st.columns(2)
-    _underlying_upload = _bt1.file_uploader("Underlying candles CSV", type=["csv"], key="bt_underlying")
-    _options_upload = _bt2.file_uploader("Historical option quotes CSV", type=["csv"], key="bt_options")
-    _bt3, _bt4, _bt5 = st.columns(3)
-    _bt_strategy = _bt3.selectbox("Playbook", ["TREND_PULLBACK", "OPENING_RANGE_BREAKOUT"], key="bt_strategy")
-    _bt_hold = _bt4.number_input("Max hold (minutes)", min_value=1, max_value=375, value=30, key="bt_hold")
-    _bt_cost = _bt5.number_input("Round-trip cost per option unit ₹", min_value=0.0, value=2.0, key="bt_cost")
-    if _underlying_upload is not None and _options_upload is not None and st.button("RUN SNAPSHOT BACKTEST", key="run_option_bt"):
-        try:
-            _udf = pd.read_csv(_underlying_upload)
-            _qdf = pd.read_csv(_options_upload)
-            _trades = backtest_option_playbook(_udf, _qdf, strategy=_bt_strategy, max_hold_minutes=int(_bt_hold), costs_per_unit=float(_bt_cost))
-            st.session_state["research_backtest_trades"] = _trades
-            st.success(f"Backtest completed: {_trades.shape[0]} trade(s). This is a research result, not proof of future profitability.")
-        except Exception as _e: st.error(f"Backtest failed: {str(_e)[:300]}")
-    _trades = st.session_state.get("research_backtest_trades")
-    if isinstance(_trades, pd.DataFrame) and not _trades.empty:
-        _wins = float((_trades["net_pnl_per_unit"] > 0).mean() * 100)
-        _avg = float(_trades["net_pnl_per_unit"].mean())
-        _sum = float(_trades["net_pnl_per_unit"].sum())
-        _m1, _m2, _m3 = st.columns(3)
-        _m1.metric("TRADES", len(_trades)); _m2.metric("WIN RATE", f"{_wins:.1f}%"); _m3.metric("MEAN NET P&L / UNIT", f"₹{_avg:+.2f}")
-        st.metric("SUM NET P&L / UNIT (not multiplied by lots)", f"₹{_sum:+.2f}")
-        st.dataframe(_trades, use_container_width=True, hide_index=True)
-        st.download_button("Download backtest trades CSV", _trades.to_csv(index=False), file_name="option_backtest_trades.csv", mime="text/csv")
-        st.caption("Backtest limitations: no guaranteed fills, snapshot-only stop/target ordering, no brokerage schedule inference, and no walk-forward guarantee. Inspect the data before trusting results.")
-    st.markdown("##### Probability calibration (historical predictions only)")
-    _cal_upload = st.file_uploader("CSV with predicted_probability (0–1) and net_pnl_per_unit or win (0/1)", type=["csv"], key="calibration_upload")
-    if _cal_upload is not None:
-        try:
-            _cdf = pd.read_csv(_cal_upload)
-            if "predicted_probability" in _cdf.columns:
-                if "win" in _cdf.columns:
-                    _outcomes = pd.to_numeric(_cdf["win"], errors="coerce")
-                elif "net_pnl_per_unit" in _cdf.columns:
-                    _outcomes = (pd.to_numeric(_cdf["net_pnl_per_unit"], errors="coerce") > 0).astype(float)
-                else: _outcomes = None
-                if _outcomes is None:
-                    st.warning("CSV must include win (0/1) or net_pnl_per_unit.")
-                else:
-                    _probs = pd.to_numeric(_cdf["predicted_probability"], errors="coerce")
-                    _metrics = probability_metrics(_probs, _outcomes)
-                    st.write("Probability quality metrics", _metrics)
-                    _cal_data = _cdf.copy(); _cal_data["win"] = _outcomes
-                    if "net_pnl_per_unit" in _cal_data.columns:
-                        st.dataframe(calibration_table(_cal_data, outcome_col="net_pnl_per_unit"), use_container_width=True, hide_index=True)
-                    else:
-                        st.dataframe(calibration_table(_cal_data, outcome_col="win"), use_container_width=True, hide_index=True)
-                    _fit = chronological_calibration_report(_probs, _outcomes, train_fraction=0.7, min_train_samples=100, min_test_samples=30)
-                    st.write("Chronological train / holdout calibration report", _fit)
-                    if _fit.get("status") == "INSUFFICIENT_DATA": st.caption("Need at least 100 valid training observations and 30 later holdout observations, with both outcomes in the training segment. The tool will not manufacture probabilities when data is insufficient.")
-        except Exception as _e: st.error(f"Calibration analysis failed: {str(_e)[:240]}")
-
-    st.markdown("##### Independent monitor service")
-    _active_file = os.getenv("BBG_ACTIVE_TRADES_FILE") or os.path.join(DATA_DIR, "active_trades.json")
-    st.code(f"python monitor_service.py\nActive trade file: {_active_file}\nPoll interval: {os.getenv('BBG_MONITOR_POLL_SECONDS', '15')} seconds", language="bash")
-    st.caption("Run monitor_service.py as a separate persistent process on the same host/storage. It reads confirmed open positions and sends best-effort Telegram alerts. It does not place orders; provider exchange timestamps may not be available, and polling can miss fast moves.")
