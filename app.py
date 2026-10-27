@@ -1,5 +1,5 @@
 """
-VIPUL BLOOMBERG PROFESSIONAL TERMINAL v13.5 (REVIEWED EDITION)
+VIPUL BLOOMBERG PROFESSIONAL TERMINAL v13.6 (MINIMAL-SIDEBAR EDITION)
 Built on v13.4. Changes in this version:
  - AI Council & News tab now renders headlines and each agent's verdict as readable text (no raw JSON dump)
  - DATA GATE: AI runs, snapshots and signals are paused when the market is closed / holiday / IV is unusable
@@ -49,7 +49,7 @@ try:
 except ImportError:
     Groq = None
 
-st.set_page_config(page_title="Vipul Bloomberg Terminal v13.5", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Vipul Bloomberg Terminal v13.6", layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
 # CSS
@@ -431,15 +431,24 @@ def recent_news(items, max_age_h=NEWS_MAX_AGE_H, top_n=NEWS_TOP_N):
     fresh = [i for i in items if i["ts"] and (now - i["ts"]) <= max_age_h * 3600]
     if len(fresh) < 3:
         fresh = [i for i in items if i["ts"] and (now - i["ts"]) <= 72 * 3600]
+    if not fresh:
+        fresh = list(items)  # last resort: show whatever the feeds returned, with its age
     out = []
     for i in fresh[:top_n]:
         d = dict(i)
-        d["age_min"] = int((now - i["ts"]) / 60)
+        d["age_min"] = int((now - i["ts"]) / 60) if i["ts"] else None
         out.append(d)
     return out
 
 
+def md_escape(s):
+    """Escape characters that Streamlit markdown would otherwise interpret (e.g. $...$ turns into math)."""
+    return re.sub(r"([\\`*_{}\[\]()#+!|$~<>])", r"\\\1", str(s))
+
+
 def age_label(mins):
+    if mins is None:
+        return "age n/a"
     if mins < 60:
         return f"{mins}m ago"
     if mins < 1440:
@@ -2479,18 +2488,18 @@ def esc(x):
 # SIDEBAR
 # ============================================================
 with st.sidebar:
-    st.markdown("### BBG // TERMINAL v13.5")
+    st.markdown("### BBG // TERMINAL v13.6")
     dhan_token = clean(get_secret("DHAN_ACCESS_TOKEN", DEFAULT_DHAN_TOKEN))
     client_id = clean(get_secret("DHAN_CLIENT_ID", DEFAULT_CLIENT_ID))
     groq_key = get_secret("GROQ_API_KEY", DEFAULT_GROQ_KEY).strip()
-
-    groq_model = st.selectbox("GROQ MODEL", GROQ_MODELS, index=0)
+    tg_token = get_secret("TELEGRAM_BOT_TOKEN", DEFAULT_TG_TOKEN).strip()
+    tg_chat = get_secret("TELEGRAM_CHAT_ID", DEFAULT_TG_CHAT).strip()
 
     if not dhan_token or not client_id:
-        st.error("DHAN access token and client ID required.")
+        st.error("DHAN access token and client ID required (set DHAN_ACCESS_TOKEN / DHAN_CLIENT_ID in secrets).")
         st.stop()
 
-    idx_name = st.selectbox("INDEX SELECTION", list(INDEX_MAP.keys()))
+    idx_name = st.selectbox("INDEX", list(INDEX_MAP.keys()))
     info = INDEX_MAP[idx_name]
 
     try:
@@ -2501,78 +2510,44 @@ with st.sidebar:
     if not expiries:
         st.warning("No expiries available.")
         st.stop()
+    expiry = st.selectbox("EXPIRY", expiries)
 
-    expiry = st.selectbox("EXPIRY DATE", expiries)
-    auto_prev = st.toggle("AUTO PREV CLOSE", value=True)
-    auto_val, auto_src = (None, "")
-    if auto_prev:
-        auto_val, auto_src = fetch_prev_close(info["scrip"], info["seg"], dhan_token, client_id)
-    if auto_prev and auto_val:
+    auto_val, auto_src = fetch_prev_close(info["scrip"], info["seg"], dhan_token, client_id)
+    if auto_val:
         prev_close = float(auto_val)
-        st.caption(f"PREV CLOSE = {prev_close:,.2f}  ({auto_src})")
+        st.caption(f"Prev close {prev_close:,.2f} ({auto_src})")
     else:
-        prev_close = st.number_input("PREV CLOSE (0 = unknown)", min_value=0.0, value=0.0, step=float(info["step"]), key=f"prev_{idx_name}")
+        st.warning("Prev close could not be fetched automatically.")
+        prev_close = st.number_input("PREV CLOSE", min_value=0.0, value=0.0, step=float(info["step"]), key=f"prev_{idx_name}")
 
-    st.markdown("##### Engine tuning")
-    st.slider("NOISE FILTER %", 0.1, 2.0, PARAM_DEFAULTS["noise_pct"], 0.1, key="p_noise_pct",
-              help="OI changes smaller than this % of near-spot OI are ignored.")
-    st.slider("DOMINANCE THRESHOLD", 1.0, 5.0, PARAM_DEFAULTS["dominance"], 0.1, key="p_dominance",
-              help="Winning side's force must be at least this multiple of the other side.")
-    st.slider("MIN FAMILY AGREEMENT (1-3)", 1, 3, PARAM_DEFAULTS["min_confirm"], 1, key="p_min_confirm",
-              help="Checks are grouped into 3 families (flow / positioning / volatility), one vote each. "
-                   "A BUY/SELL needs this many net agreeing families.")
-    st.slider("MIN AI CONFIDENCE %", 0, 90, PARAM_DEFAULTS["min_conf"], 5, key="p_min_conf",
-              help="Signals with lower AI confidence are rejected.")
-    st.toggle("REQUIRE NEAR-SPOT FLOW CONCENTRATION", value=PARAM_DEFAULTS["flow_conc_on"], key="p_flow_conc_on",
-              help="Reject signals when too little of the chain's OI activity is near spot. This is not FII/DII data.")
-    st.slider("MIN FLOW CONCENTRATION %", 10, 90, PARAM_DEFAULTS["flow_conc_min"], 5, key="p_flow_conc_min")
-    st.toggle("EXHAUSTION CAN VETO SIGNALS", value=PARAM_DEFAULTS["exh_veto"], key="p_exh_veto",
-              help="Off by default: the exhaustion score is an untested heuristic. Check it on your scorecard first.")
+    r1, r2 = st.columns(2)
+    r1.number_input("CAPITAL ₹", min_value=1000, value=PARAM_DEFAULTS["capital"], step=10000, key="p_capital")
+    r2.number_input("MAX RISK %", min_value=0.5, max_value=5.0, value=float(PARAM_DEFAULTS["max_risk"]), step=0.5, key="p_max_risk")
 
-    st.markdown("##### Risk")
-    st.number_input("CAPITAL (₹)", min_value=1000, value=PARAM_DEFAULTS["capital"], step=10000, key="p_capital")
-    st.slider("MAX RISK PER SIGNAL %", 0.5, 5.0, PARAM_DEFAULTS["max_risk"], 0.5, key="p_max_risk")
-    st.slider("LARGE-MOVE ALERT % (vs prev close)", 0.5, 5.0, PARAM_DEFAULTS["move_alert_pct"], 0.5, key="p_move_alert_pct")
-
-    st.markdown("##### Analysis")
-    live_news = st.toggle("LIVE NEWS FEED", value=True)
-    news = st.text_area("EXTRA NEWS / MACRO NOTES", placeholder="Optional macro notes", height=80)
-    horizon_label = st.selectbox("SCENARIO HORIZON", ["Intraday (0.25d)", "1 day", "2 days"], index=0)
-    horizon_days = {"Intraday (0.25d)": 0.25, "1 day": 1.0, "2 days": 2.0}[horizon_label]
-    iv_shock = st.slider("IV CRUSH / SPIKE SHOCK (%)", 5, 40, 15, step=5)
-    use_skew = st.toggle("SPOT-VOL LINK IN SCENARIOS", value=True, key="use_skew")
-    surface_check_on = st.toggle("COUNT SURFACE CHECK IN AGREEMENT SCORE", value=False, key="surface_check_on")
-    USE_SURFACE_CHECK["on"] = surface_check_on
-    _basis = st.selectbox("VOL TIME BASIS", ["Calendar (days/365)", "Trading (252 d x 375 min)"], index=0, key="time_basis")
-    TIME_BASIS["mode"] = "calendar" if _basis.startswith("Calendar") else "trading"
-    exh_lookback = st.slider("EXHAUSTION LOOKBACK (min)", 6, 45, 15, step=3)
-    weekly_alert = st.toggle("WEEKLY-EXPIRY RISK PANEL", value=True, help="Shows extra warnings when days-to-expiry is 7 or less.")
-    calendar_on = st.toggle("CALENDAR TERM-STRUCTURE (next expiry)", value=False, help="Fetches one extra option chain.")
-    cross_on = st.toggle("CROSS-INDEX COMPARISON", value=False, help="Fetches the nearest-expiry chain of every index (cached 5 min).")
-
-    st.markdown("---")
-    st.markdown("### 🔔 FULLY AUTOMATED ALERTS")
-    log_on = st.toggle("LOG & BROADCAST SIGNALS", value=True, key="log_on", help="Automatically logs signals and sends alerts to Telegram.")
-    alerts_on = st.toggle("SEND TELEGRAM ALERTS", value=True, key="alerts_on")
-    st.toggle("ALSO ALERT ON REJECTED SIGNALS", value=PARAM_DEFAULTS["alert_rejected"], key="p_alert_rejected",
-              help="Off by default to avoid noise: only validated signals and outcomes are sent.")
-    tg_token = st.text_input("TELEGRAM BOT TOKEN", type="password", value=get_secret("TELEGRAM_BOT_TOKEN", DEFAULT_TG_TOKEN), key="tg_token").strip()
-    tg_chat = st.text_input("TELEGRAM CHAT ID", value=get_secret("TELEGRAM_CHAT_ID", DEFAULT_TG_CHAT), key="tg_chat").strip()
-    log_hook = st.text_input("SCORECARD WEBHOOK URL (optional)", type="password", value=get_secret("LOG_WEBHOOK_URL", ""), key="log_hook").strip()
-
-    if st.button("Send test alert", key="test_alert"):
-        _res = send_alert("BBG terminal test alert. Telegram connected successfully!", tg_token, tg_chat)
-        if not _res:
-            st.warning("Enter a Telegram bot token and chat ID first.")
-        for _c, _ok, _d in _res:
-            (st.success if _ok else st.error)(f"{_c}: {'sent' if _ok else 'failed ' + _d}")
-
-    force_run = st.button("FORCE AI RUN")
+    alerts_on = st.toggle("TELEGRAM ALERTS", value=bool(tg_token and tg_chat), key="alerts_on",
+                          help="Token and chat id are read from secrets (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID).")
+    if alerts_on and not (tg_token and tg_chat):
+        st.caption("Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to secrets.")
     auto_refresh = st.toggle("AUTO REFRESH (3 MIN)", value=True)
+    force_run = st.button("FORCE AI RUN", use_container_width=True)
     if auto_refresh and st_autorefresh:
         st_autorefresh(interval=180000, limit=None, key="bbg")
     elif auto_refresh:
         st.caption("Auto refresh needs: pip install streamlit-autorefresh")
+
+# ------------------------------------------------------------
+# Fixed settings. Edit PARAM_DEFAULTS (top of file) or these lines instead of adding sidebar controls.
+# ------------------------------------------------------------
+groq_model = GROQ_MODELS[0]
+live_news = True
+news = st.session_state.get("macro_note", "")      # optional note typed in the AI Council tab
+horizon_days, iv_shock, use_skew = 0.25, 15, True  # premium-scanner scenario settings
+USE_SURFACE_CHECK["on"] = False                    # synthetic-basis check is observe-only
+TIME_BASIS["mode"] = "calendar"
+exh_lookback = 15
+weekly_alert = True
+log_on = True
+log_hook = get_secret("LOG_WEBHOOK_URL", "").strip()
 
 
 # ============================================================
@@ -2599,13 +2574,17 @@ m["rr_shift"] = round(m["rr_25"] - _rr0, 2) if _rr0 is not None else 0.0
 m["exh"] = exhaustion(hist, m, prev_close, exh_lookback)
 m["exh_flag"] = exh_flag(m["exh"])
 
-news_items, news_status = ([], ["LIVE NEWS: off"])
+news_items, news_status, news_stale = [], ["LIVE NEWS: off"], False
 if live_news:
     try:
         raw_items, news_status = fetch_news(idx_name, NEWS_EXTRA_FEEDS)
         news_items = recent_news(raw_items)
     except Exception as e:
         news_status = [f"fetch_news crashed: {e}"]
+    if news_items:
+        st.session_state["_last_news"] = news_items
+    elif st.session_state.get("_last_news"):
+        news_items, news_stale = st.session_state["_last_news"], True
 news_text = news_for_ai(news_items, news)
 nhash = news_hash(news_items)
 
@@ -2681,7 +2660,7 @@ if log_on:
 
 health_rows = data_health({
     "now": now_ist, "m": m, "df": m["df"], "spot": spot, "token": dhan_token, "prev_close": prev_close,
-    "prev_src": auto_src if (auto_prev and auto_val) else "manual entry", "candles": candles_pre, "candle_err": candle_err,
+    "prev_src": auto_src if auto_val else "manual entry", "candles": candles_pre, "candle_err": candle_err,
     "intraday": intraday, "intraday_err": intraday_err, "data_ok": data_ok, "gate_reason": gate_reason,
     "hist": hist, "news_items": news_items, "news_status": news_status, "live_news": live_news, "ai": ai,
     "groq_key": groq_key})
@@ -2819,27 +2798,40 @@ with tab4:
 with tab5:
     st.markdown("#### 🤖 AI COUNCIL & NEWS")
 
+    # ---------- news scores (always visible) ----------
+    _ai_have = not ("error" in ai and "signal" not in ai)
+    try:
+        _ai_ns = int(float(ai.get("news_score"))) if _ai_have else None
+    except (TypeError, ValueError):
+        _ai_ns = None
+    _lab = lambda v: "BULLISH" if v >= 20 else "BEARISH" if v <= -20 else "NEUTRAL"
+    n1, n2, n3 = st.columns(3)
+    n1.metric("AI NEWS SCORE (-100 to +100)", f"{_ai_ns:+d}" if _ai_ns is not None else "—",
+              _lab(_ai_ns) if _ai_ns is not None else "waiting for AI verdict", delta_color="off")
+    n2.metric("HEADLINE KEYWORD TONE", f"{_tone_val:+d}" if news_items else "—",
+              (f"{_tone_hits} keyword hits" + ("" if _tone_hits >= NEWS_MIN_TONE_HITS else " (low sample)")) if news_items else "no headlines",
+              delta_color="off")
+    n3.metric("HEADLINES USED", len(news_items), "cached from earlier fetch" if news_stale else None, delta_color="off")
+
     # ---------- headlines ----------
     st.markdown("##### 📰 Live headlines")
-    if not live_news:
-        st.info("LIVE NEWS FEED toggle is off in the sidebar.")
-    elif news_items:
-        st.caption(
-            (f"Keyword tone {_tone_val:+d} from {_tone_hits} keyword hits (crude word count, display only). "
-             if _tone_hits >= NEWS_MIN_TONE_HITS else
-             f"Keyword tone n/a: only {_tone_hits} keyword hit(s), too few to score. ")
-            + f"{len(news_items)} headline(s) sent to the AI.")
+    if news_items:
         for it in news_items:
-            title = it["title"].replace("[", "(").replace("]", ")")
+            title = md_escape(it["title"])
             link = it["link"] if it["link"].startswith("http") else ""
             line = f"[{title}]({link})" if link else title
-            st.markdown(f"- `{age_label(it['age_min'])}` **{it['source']}** — {line}")
+            st.markdown(f"- `{age_label(it['age_min'])}` **{md_escape(it['source'])}** — {line}")
     else:
-        st.warning("No fresh headlines were returned (see feed status below).")
+        st.warning("No headlines were returned by any feed this cycle.")
+        for s_ in news_status:
+            st.write(s_)
     with st.expander("Feed status / exact news text sent to AI"):
-        for s in news_status:
-            st.write(s)
+        for s_ in news_status:
+            st.write(s_)
         st.code(news_text)
+    with st.expander("Add a macro note for the AI (optional)"):
+        st.text_area("Note", key="macro_note", height=70, label_visibility="collapsed",
+                     placeholder="e.g. RBI policy at 10:00, US CPI tonight")
 
     # ---------- council ----------
     st.markdown("##### 🧠 Council verdict")
@@ -2853,7 +2845,7 @@ with tab5:
                            ("Volatility", "volatility_agent"), ("News", "news_agent"),
                            ("Risk officer", "final_approval")):
             st.markdown(f"**{label}:** {ai.get(key, '-')}")
-        st.caption(f"AI news score: {ai.get('news_score', '-')}  |  model: {ai.get('_model', '-')}")
+        st.caption(f"model: {ai.get('_model', '-')}")
         fam = sig["families"]
         st.caption("Family votes (one per family): " + " | ".join(f"{k} {v:+d}" for k, v in fam.items())
                    + f" → net {sig['net']:+d} (needs +{int(P('min_confirm'))})")
@@ -2932,6 +2924,12 @@ with tab7:
 with tab8:
     st.markdown("#### 🩺 DATA HEALTH")
     show_df(pd.DataFrame(health_rows), hide_index=True)
+    if st.button("Send Telegram test alert", key="test_alert"):
+        _res = send_alert("BBG terminal test alert. Telegram connected successfully!", tg_token, tg_chat)
+        if not _res:
+            st.warning("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in secrets first.")
+        for _c, _ok, _d in _res:
+            (st.success if _ok else st.error)(f"{_c}: {'sent' if _ok else 'failed ' + _d}")
 
 
 with tab9:
@@ -2972,12 +2970,20 @@ with tab9:
             _fn = st.error if _wk["risk_level"] == "HIGH" else st.warning if _wk["risk_level"] == "MODERATE" else st.info
             _fn(f"Expiry risk {_wk['risk_level']} (DTE {_wk['dte']})" + ("".join(f"\n- {w}" for w in _wk["warnings"])))
 
-    if calendar_on:
-        st.markdown("##### Calendar term-structure")
+    st.markdown("##### Term structure and cross-index (load on demand)")
+    b1, b2 = st.columns(2)
+    _ckey = f"{idx_name}|{expiry}"
+    if b1.button("Load calendar term-structure (next expiry)", key="btn_cal"):
         try:
-            _cv, _cerr = calendar_view(m, info, expiries, expiry, dhan_token, client_id, prev_close)
+            st.session_state["_cal"] = (_ckey,) + tuple(calendar_view(m, info, expiries, expiry, dhan_token, client_id, prev_close))
         except Exception as e:
-            _cv, _cerr = None, str(e)[:120]
+            st.session_state["_cal"] = (_ckey, None, str(e)[:120])
+    if b2.button("Load cross-index comparison", key="btn_cx"):
+        st.session_state["_cx"] = cross_index_cached(dhan_token, client_id)
+
+    _cal = st.session_state.get("_cal")
+    if _cal and _cal[0] == _ckey:
+        _cv, _cerr = _cal[1], _cal[2]
         if _cv is None:
             st.info(_cerr)
         else:
@@ -2988,10 +2994,8 @@ with tab9:
             k4.metric("FORWARD IV BETWEEN", f"{_cv['fwd_iv']:.1f}%" if _cv["fwd_iv"] else "n/a")
             st.caption(f"{_cv['structure']} | gamma {_cv['gex1']} vs {_cv['gex2']} (assumed) | PCR {_cv['pcr1']:.2f} vs {_cv['pcr2']:.2f}. "
                        "Descriptive only; it is not a trade recommendation.")
-
-    if cross_on:
-        st.markdown("##### Cross-index comparison (nearest expiry of each index, cached 5 min)")
-        _cx = cross_index_cached(dhan_token, client_id)
+    _cx = st.session_state.get("_cx")
+    if _cx is not None:
         show_df(_cx, hide_index=True)
         if "Bias" in _cx.columns:
             _b = _cx["Bias"].dropna()
