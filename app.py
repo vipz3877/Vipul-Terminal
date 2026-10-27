@@ -1,6 +1,10 @@
 """
-VIPUL OPTIONS BUYER SIGNAL TERMINAL v14.0
-Built on v13.4. Changes in this version:
+VIPUL OPTIONS BUYER SIGNAL TERMINAL v16.0
+Built on v14.0. Changes in this version:
+ - Market-regime context from recent spot snapshots (advisory only, not a proven filter)
+ - Manual trade lifecycle: confirm actual fill before premium stop/target monitoring; record actual exits and net P&L
+ - Failed alert deliveries are persisted and retried on subsequent app reruns
+ - Nonzero traded-volume requirement for selected option contracts
  - AI Council & News tab now renders headlines and each agent's verdict as readable text (no raw JSON dump)
  - DATA GATE: AI runs, snapshots and signals are paused when the market is closed / holiday / IV is unusable
  - Risk Officer veto (final_approval) and minimum AI confidence are now real gates
@@ -17,7 +21,7 @@ Built on v13.4. Changes in this version:
  - Telegram: validated signals + outcomes by default (rejected optional), correct resolve time, alert state pruned
  - NET GEX shown in Rs crore, cross-index view cached 5 min
  - NSE holiday list via secret NSE_HOLIDAYS (comma separated YYYY-MM-DD); OI velocity normalized to 180-second equivalent; missing close data marked DATA_GAP
-BUYER-ONLY: signals are BUY CALL / BUY PUT / WAIT; no writing/selling options and no order execution. Telegram is best-effort while Streamlit is running; this is not a 24/7 background monitor.
+BUYER-ONLY: signals are BUY CALL / BUY PUT / WAIT; no writing/selling options and no order execution. v16 adds testable strategy playbooks, research tools, quote-age checks, and a separate monitor_service.py process.
 """
 
 import os
@@ -38,6 +42,9 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+from strategy_engine import (trend_pullback_signal, opening_range_breakout_signal, classify_regime,
+    option_analytics, quote_freshness, backtest_option_playbook, calibration_table,
+    fit_probability_calibrator, apply_probability_calibrator, probability_metrics, chronological_calibration_report)
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -49,7 +56,7 @@ try:
 except ImportError:
     Groq = None
 
-st.set_page_config(page_title="Vipul Options Buyer Terminal v14.0", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Vipul Options Buyer Terminal v16.0", layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
 # CSS
@@ -326,6 +333,10 @@ def _fetch_chain_raw(scrip, seg, expiry, token, client_id):
     check(r)
     data = r.json().get("data", {}) or {}
     spot = float(data.get("last_price") or 0)
+    # Dhan option-chain response commonly has no per-quote exchange timestamp. This is a local
+    # receive timestamp, useful for detecting cached/stale snapshots but not proof of exchange age.
+    chain_received_ts = time.time()
+    provider_timestamp = data.get("timestamp") or r.json().get("timestamp")
 
     rows = []
     for strike_str, item in (data.get("oc") or {}).items():
@@ -347,6 +358,7 @@ def _fetch_chain_raw(scrip, seg, expiry, token, client_id):
             "PE_Bid": _n(pe.get("top_bid_price")), "PE_Ask": _n(pe.get("top_ask_price")),
             "CE_Vol": _n(ce.get("volume")), "PE_Vol": _n(pe.get("volume")),
             "CE_Delta": _n(ce_g.get("delta")), "PE_Delta": _n(pe_g.get("delta")),
+            "QuoteReceivedTS": chain_received_ts, "ProviderTimestamp": provider_timestamp,
         })
     df = pd.DataFrame(rows)
     if df.empty:
@@ -1279,7 +1291,7 @@ def select_buyer_contract(m, direction):
         spread_pct = (ask - bid) / mid * 100.0 if mid > 0 else 999.0
         abs_delta = abs(delta)
         # Favor 0.45-0.60 absolute delta, allow 0.30-0.70; reject very wide/illiquid quotes.
-        if not (0.30 <= abs_delta <= 0.70) or spread_pct > MAX_OPTION_SPREAD_PCT:
+        if not (0.30 <= abs_delta <= 0.70) or spread_pct > MAX_OPTION_SPREAD_PCT or vol <= 0:
             continue
         # Spread dominates score; then delta proximity to 0.50 and distance to spot.
         score = abs(abs_delta - 0.50) * 3.0 + spread_pct / 100.0 + abs(strike - m["spot"]) / max(m["step"], 1) * 0.025
@@ -1397,7 +1409,7 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
 
     buyer_plan = select_buyer_contract(m, sig) if sig in ("BUY", "SELL") else None
     if sig in ("BUY", "SELL") and buyer_plan is None:
-        notes.append(f"{sig} rejected: no near-ATM option passed premium, bid/ask, spread (≤{MAX_OPTION_SPREAD_PCT:.0f}%), OI and delta filters. Do not chase an illiquid contract.")
+        notes.append(f"{sig} rejected: no near-ATM option passed premium, bid/ask, spread (≤{MAX_OPTION_SPREAD_PCT:.0f}%), OI, nonzero traded volume and delta filters. Do not chase an illiquid contract.")
         sig, target, sl, rr = "WAIT", None, None, None
     return {"signal": sig, "ai_signal": ai_sig, "entry": entry, "target": target, "sl": sl, "rr": rr,
             "confidence": conf, "note": " ".join(notes), "checks": checks, "net": net, "lean": lean,
@@ -1569,6 +1581,34 @@ def build_snapshot(m):
             "rr_25": m.get("rr_25"), "excess_basis": m.get("excess_basis"), "net_gex": m.get("net_gex"),
             "max_pain": m["max_pain"], "dte": m["dte"], "status": m["status"],
             "res": res["level"] if res else None, "sup": sup["level"] if sup else None, "oi": oi_map}
+
+
+def classify_market_regime(hist, spot, step, sigma):
+    """Conservative descriptive regime label from recent spot snapshots; advisory until backtested."""
+    try:
+        rows = [x for x in (hist or []) if x.get("spot") is not None and x.get("ts") is not None]
+        rows = rows[-12:]
+        if len(rows) < 5:
+            return {"label": "INSUFFICIENT HISTORY", "efficiency": None, "move_sigma": None,
+                    "note": "Need at least five recent snapshots; regime is not classified."}
+        prices = [float(x["spot"]) for x in rows]
+        diffs = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+        path = sum(abs(x) for x in diffs)
+        net_move = prices[-1] - prices[0]
+        efficiency = abs(net_move) / path if path > 0 else 0.0
+        sigma_pts = max(float(sigma or 0), float(step or 1), 1.0)
+        move_sigma = abs(net_move) / sigma_pts
+        if efficiency >= 0.55 and move_sigma >= 0.20:
+            label = "TRENDING UP" if net_move > 0 else "TRENDING DOWN"
+        elif efficiency <= 0.25 and move_sigma < 0.35:
+            label = "RANGE / CHOP"
+        else:
+            label = "TRANSITION / MIXED"
+        return {"label": label, "efficiency": round(efficiency, 3), "move_sigma": round(move_sigma, 3),
+                "note": "Descriptive spot-history heuristic; advisory only until validated out of sample."}
+    except Exception:
+        return {"label": "UNAVAILABLE", "efficiency": None, "move_sigma": None,
+                "note": "Regime calculation unavailable; do not infer a direction."}
 
 
 def record_snapshot(m, key, store=True):
@@ -2045,7 +2085,7 @@ def kelly_sizing(sig, card, capital, max_risk_pct):
 # SCORECARD, ALERTS & DATA HEALTH
 # ============================================================
 SCORECARD_FILE = os.path.join(DATA_DIR, "bbg_scorecard_v14.json")
-ALERT_FILE = os.path.join(DATA_DIR, "bbg_alerts_sent_v14.json")
+ALERT_FILE = os.path.join(DATA_DIR, "bbg_alerts_sent_v15.json")
 SIGNAL_DEDUP_MIN = 30
 OUTCOME_HORIZONS = (15, 30, 60)
 HORIZON_TOL_MIN = 10
@@ -2123,19 +2163,71 @@ def send_alert(text, tg_token="", tg_chat="", webhook=""):
     return out
 
 
+ALERT_QUEUE_FILE = os.path.join(DATA_DIR, "bbg_alert_queue_v15.json")
+
+
+def queue_failed_alert(key, text, error="delivery failed"):
+    """Persist failed alert delivery so a later Streamlit rerun can retry it."""
+    q = _load_json(ALERT_QUEUE_FILE, {})
+    q.setdefault(key, {"text": str(text), "created": time.time(), "attempts": 0,
+                       "next_attempt": time.time() + 5, "last_error": str(error)[:180]})
+    _save_json(ALERT_QUEUE_FILE, q)
+
+
+def delivery_succeeded(results, cfg):
+    """When Telegram is configured, require Telegram success even if an optional webhook succeeds."""
+    if cfg.get("tg_token") and cfg.get("tg_chat"):
+        return any(channel == "telegram" and ok for channel, ok, _ in results)
+    return any(ok for _, ok, _ in results)
+
+
+def process_alert_queue(cfg, max_per_run=4):
+    """Best-effort retry queue. Requires the app to rerun; it is not a background worker."""
+    if not cfg.get("enabled") or not (cfg.get("tg_token") and cfg.get("tg_chat") or cfg.get("hook")):
+        return []
+    q = _load_json(ALERT_QUEUE_FILE, {})
+    now_ts, results, processed = time.time(), [], 0
+    for key in list(q.keys()):
+        item = q.get(key, {})
+        if processed >= max_per_run:
+            break
+        if now_ts < float(item.get("next_attempt", 0)):
+            continue
+        processed += 1
+        res = send_alert(item.get("text", ""), cfg.get("tg_token", ""), cfg.get("tg_chat", ""), cfg.get("hook", ""))
+        results.extend(res)
+        if delivery_succeeded(res, cfg):
+            q.pop(key, None)
+            state = _load_json(ALERT_FILE, {})
+            state[key] = now_ts
+            _save_json(ALERT_FILE, state)
+        else:
+            attempts = int(item.get("attempts", 0)) + 1
+            item["attempts"] = attempts
+            item["last_error"] = "; ".join(msg for _, ok, msg in res if not ok)[:180] or "delivery failed"
+            item["next_attempt"] = now_ts + min(300, 5 * (2 ** min(attempts, 6)))
+            if attempts >= 8:
+                # Keep for manual inspection but back off to one retry per hour.
+                item["next_attempt"] = now_ts + 3600
+            q[key] = item
+    _save_json(ALERT_QUEUE_FILE, q)
+    return results
+
+
 def fire_alert(key, text, cooldown_min, cfg):
     if not cfg.get("enabled") or not (cfg.get("tg_token") and cfg.get("tg_chat") or cfg.get("hook")):
         return []
     now_ts = time.time()
     state = _load_json(ALERT_FILE, {})
-    # prune old keys so the file does not grow forever
     state = {k: v for k, v in state.items() if now_ts - float(v) < ALERT_STATE_KEEP_SEC}
     if now_ts - float(state.get(key, 0)) < cooldown_min * 60:
         return []
     res = send_alert(text, cfg.get("tg_token", ""), cfg.get("tg_chat", ""), cfg.get("hook", ""))
-    if any(ok for _, ok, _ in res):
+    if delivery_succeeded(res, cfg):
         state[key] = now_ts
         _save_json(ALERT_FILE, state)
+    else:
+        queue_failed_alert(key, text, "; ".join(msg for _, ok, msg in res if not ok) or "delivery failed")
     return res
 
 
@@ -2157,6 +2249,7 @@ def signal_alert_text(r):
         action, option = ("BUY CALL" if r.get("signal") == "BUY" else "BUY PUT"), "\nNo approved option contract; do not trade."
     return (f"{kind_label}\n{r['index']} | {action} | Underlying {r['entry']:,.2f}\n"
             f"Underlying confirmation levels: target {tgt} | invalidation/stop {sl} | R:R {rr}\n"
+            f"Regime: {r.get('market_regime', 'not classified')} (advisory)\n"
             f"AI confidence {r['confidence']}% | Chain agreement {r['net']:+d}{option}{reason_txt}\n"
             f"{r['time']} IST. Manual execution only. Recheck quote freshness/liquidity; levels are planning estimates, not guaranteed fills.")
 
@@ -2230,9 +2323,41 @@ def sync_scorecard(card):
     card.sort(key=lambda x: x.get("ts", 0))
 
 
+def _sync_active_trades_file(recs):
+    """Publish manually confirmed open positions for the independent monitor process."""
+    active = []
+    for r in recs:
+        if not isinstance(r, dict) or r.get("kind") != "VALIDATED":
+            continue
+        if r.get("manual_entry_confirmed") is not True or r.get("trade_state") != "POSITION_OPEN":
+            continue
+        if not r.get("option_strike") or not r.get("option_expiry") or not r.get("option_type"):
+            continue
+        active.append({k: r.get(k) for k in (
+            "id", "index", "option_expiry", "option_strike", "option_type", "option_side",
+            "manual_entry_confirmed", "trade_state", "actual_entry_price", "actual_entry_qty",
+            "actual_entry_ts", "actual_fees", "option_stop", "option_target1", "option_target2")})
+    path = os.getenv("BBG_ACTIVE_TRADES_FILE") or os.path.join(DATA_DIR, "active_trades.json")
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(active, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception as e:
+        # Do not break the dashboard save if a deployment filesystem is read-only.
+        try:
+            if os.path.exists(tmp): os.remove(tmp)
+        except Exception:
+            pass
+        st.warning(f"Could not sync independent monitor trade file: {str(e)[:160]}")
+
+
 def save_scorecard(recs):
     sync_scorecard(recs)
     _save_json(SCORECARD_FILE, recs)
+    _sync_active_trades_file(recs)
 
 
 def _dir(sig):
@@ -2283,7 +2408,8 @@ def make_record(kind, idx_name, expiry, m, sig, ai, tone, now):
         "target": sig["target"] if kind == "VALIDATED" else None, "sl": sig["sl"] if kind == "VALIDATED" else None,
         "rr": sig["rr"] if kind == "VALIDATED" else None, "confidence": sig["confidence"], "net": sig["net"],
         "lean": sig["lean"], "checks": {c["name"]: c["v"] for c in sig["checks"]},
-        "status": m["status"], "bias": m["score"], "pcr": round(float(m["pcr"]), 3), "atm_iv": round(float(m["atm_iv"]), 2),
+        "status": m["status"], "market_regime": (m.get("market_regime") or {}).get("label"),
+        "bias": m["score"], "pcr": round(float(m["pcr"]), 3), "atm_iv": round(float(m["atm_iv"]), 2),
         "sd": round(daily_sigma(m), 1), "flow_conc": m.get("flow_conc"),
         "gex_regime": m.get("gex_regime"), "regime_stable": m.get("regime_stable"), "net_gex": m.get("net_gex"),
         "zero_gamma_dist_sigma": (round((m["zero_gamma"] - m["spot"]) / daily_sigma(m), 2) if m.get("zero_gamma") else None),
@@ -2311,6 +2437,16 @@ def make_record(kind, idx_name, expiry, m, sig, ai, tone, now):
         "option_last_mark": buyer_plan.get("ltp") if buyer_plan else None,
         "option_event_state": "SIGNAL_VALIDATED" if buyer_plan else None,
         "touch_alerted": False,
+        # Manual-trading lifecycle: a signal is not a position until the user confirms an actual fill.
+        "manual_entry_confirmed": False,
+        "trade_state": "SIGNAL_ONLY" if buyer_plan else "NO_CONTRACT",
+        "actual_entry_price": None,
+        "actual_entry_qty": None,
+        "actual_entry_ts": None,
+        "actual_exit_price": None,
+        "actual_exit_ts": None,
+        "actual_fees": 0.0,
+        "actual_net_pnl": None,
     }
 
 
@@ -2353,7 +2489,8 @@ def update_outcomes(recs, idx_name, spot, now, candles, intraday=None, option_df
         has_levels = r["target"] is not None and r["sl"] is not None
         # Premium-based option events use the latest option-chain LTP snapshot only. This is polling,
         # not tick-level surveillance; quote gaps can miss intrabar touches.
-        if (r.get("kind") == "VALIDATED" and r.get("option_strike") is not None and
+        if (r.get("kind") == "VALIDATED" and r.get("manual_entry_confirmed") is True and
+                r.get("trade_state") == "POSITION_OPEN" and r.get("option_strike") is not None and
                 r.get("option_expiry") == str(current_expiry)[:10] and option_df is not None and not option_df.empty and live):
             match = option_df[option_df["Strike"].astype(float).sub(float(r["option_strike"])).abs() < 0.001]
             side = r.get("option_side") or ("CE" if r.get("option_type") == "CALL" else "PE")
@@ -2365,13 +2502,13 @@ def update_outcomes(recs, idx_name, spot, now, candles, intraday=None, option_df
                 if mark > 0:
                     r["option_last_mark"] = round(mark, 2)
                     event = None
-                    if mark <= _n(r.get("option_stop")) and r.get("option_event_state") != "STOP_LOSS":
+                    if mark <= _n(r.get("option_stop")) and r.get("option_event_state") not in ("STOP_LOSS", "TARGET_2", "EXITED") and r.get("trade_state") == "POSITION_OPEN":
                         event = "OPTION_STOP_LOSS"
                         r["option_event_state"] = "STOP_LOSS"
-                    elif mark >= _n(r.get("option_target2")) and r.get("option_event_state") not in ("TARGET_2", "STOP_LOSS"):
+                    elif mark >= _n(r.get("option_target2")) and r.get("option_event_state") not in ("TARGET_2", "STOP_LOSS", "EXITED") and r.get("trade_state") == "POSITION_OPEN":
                         event = "OPTION_TARGET_2"
                         r["option_event_state"] = "TARGET_2"
-                    elif mark >= _n(r.get("option_target1")) and r.get("option_event_state") not in ("TARGET_1", "TARGET_2", "STOP_LOSS"):
+                    elif mark >= _n(r.get("option_target1")) and r.get("option_event_state") not in ("TARGET_1", "TARGET_2", "STOP_LOSS", "EXITED") and r.get("trade_state") == "POSITION_OPEN":
                         event = "OPTION_TARGET_1"
                         r["option_event_state"] = "TARGET_1"
                     if event:
@@ -2653,7 +2790,7 @@ def esc(x):
 # SIDEBAR
 # ============================================================
 with st.sidebar:
-    st.markdown("### BBG // TERMINAL v13.6")
+    st.markdown("### BBG // BUYER TERMINAL v16.0")
     dhan_token = clean(get_secret("DHAN_ACCESS_TOKEN", DEFAULT_DHAN_TOKEN))
     client_id = clean(get_secret("DHAN_CLIENT_ID", DEFAULT_CLIENT_ID))
     groq_key = get_secret("GROQ_API_KEY", DEFAULT_GROQ_KEY).strip()
@@ -2731,6 +2868,14 @@ if df.empty or spot == 0:
 m = compute_metrics(df, spot, prev_close, expiry, info["step"])
 now_ist = datetime.now(IST)
 data_ok, gate_reason = data_gate(now_ist, m)
+# Cached chain snapshots carry the timestamp from the actual fetch. Fail closed when stale.
+chain_received_ts = None
+if "QuoteReceivedTS" in df.columns and df["QuoteReceivedTS"].notna().any():
+    chain_received_ts = float(df["QuoteReceivedTS"].dropna().max())
+chain_freshness = quote_freshness(chain_received_ts, now_ts=time.time(), max_age_seconds=45)
+if not chain_freshness["ok"]:
+    data_ok = False
+    gate_reason = f"Option-chain quote stale/unverifiable: {chain_freshness['reason']}"
 
 vel = update_oi_velocity(m, key=f"{idx_name}|{expiry}")
 hist = record_snapshot(m, f"{idx_name}|{expiry}", store=data_ok)
@@ -2738,6 +2883,7 @@ _rr0 = next((h.get("rr_25") for h in hist if h.get("rr_25") is not None), None)
 m["rr_shift"] = round(m["rr_25"] - _rr0, 2) if _rr0 is not None else 0.0
 m["exh"] = exhaustion(hist, m, prev_close, exh_lookback)
 m["exh_flag"] = exh_flag(m["exh"])
+m["market_regime"] = classify_market_regime(hist, m["spot"], info["step"], daily_sigma(m))
 
 news_items, news_status, news_stale = [], ["LIVE NEWS: off"], False
 if live_news:
@@ -2806,6 +2952,8 @@ if log_on and is_trading_day(now_ist):
 if "scorecard" not in st.session_state:
     st.session_state["scorecard"] = load_scorecard()
 card = st.session_state["scorecard"]
+# Refresh the independent monitor's durable active-trade manifest even after app restart.
+_sync_active_trades_file(card)
 _tone_val, _tone_hits = headline_tone(news_items) if news_items else (0, 0)
 tone_now = _tone_val if _tone_hits >= NEWS_MIN_TONE_HITS else None
 new_recs, _resolved, _touched = [], [], []
@@ -2848,6 +2996,8 @@ if alerts_on and tg_token and tg_chat:
             f"⚠️ LARGE MOVE: {idx_name} is {move['pct']:+.2f}% vs previous close "
             f"({prev_close:,.0f} → {spot:,.0f}). Review any open positions. Analysis only, not trading advice.",
             0, alert_cfg)
+    # Retry previously failed Telegram/webhook deliveries on subsequent app reruns.
+    alert_results += process_alert_queue(alert_cfg)
 
 # ============================================================
 # DASHBOARD HEADER
@@ -2855,12 +3005,13 @@ if alerts_on and tg_token and tg_chat:
 st.markdown(f"## {idx_name} // SPOT {spot:,.2f}" + (f"  ({spot - prev_close:+,.2f})" if prev_close > 0 else ""))
 
 _mkt = "OPEN" if market_open_now(now_ist) else "CLOSED"
-st.caption(f"{now_ist.strftime('%a %d %b %Y %H:%M:%S')} IST | market {_mkt} | assumption-based GEX {m['gex_regime']} | AI: {gate_label}")
-st.info("OPTION-BUYER MODE: BUY CALL / BUY PUT / WAIT only. Telegram alerts are generated on Streamlit reruns; keep the app and data connection active. Do not assume an alert is an executed trade.")
+st.caption(f"{now_ist.strftime('%a %d %b %Y %H:%M:%S')} IST | market {_mkt} | regime {(m.get('market_regime') or {}).get('label', '—')} (advisory) | assumption-based GEX {m['gex_regime']} | AI: {gate_label}")
+st.info("OPTION-BUYER MODE: BUY CALL / BUY PUT / WAIT only. Manual execution only. Premium monitoring starts only after you confirm an actual entry in Manual Trades. Alerts and monitoring are best-effort while the app refreshes; do not rely on them as your only risk control.")
 
 if not data_ok:
     st.warning(f"DATA GATE CLOSED: {gate_reason}. Figures below may be stale or off-hours; the AI council, history snapshots "
                "and signal validation are paused (signals stay WAIT).")
+st.caption(f"OPTION CHAIN AGE: {chain_freshness.get('age_seconds')}s | basis: {chain_freshness.get('basis')} | {chain_freshness.get('reason')}. Provider exchange timestamp may be unavailable.")
 
 if move and move["triggered"]:
     st.warning(f"Large move: {idx_name} is {move['pct']:+.2f}% vs previous close (alert threshold ±{P('move_alert_pct')}%). "
@@ -2871,9 +3022,9 @@ for _row in health_rows:
     _hc[_row["Status"]] += 1
 st.caption(f"DATA HEALTH: {_hc['OK']} OK · {_hc['WARN']} warn · {_hc['FAIL']} fail")
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
     "📊 Dashboard & Engine", "📐 Day Levels", "🧭 Exhaustion", "🎯 Premium Scanner",
-    "🤖 AI Council & News", "📋 Option Chain", "📒 Scorecard", "🩺 Data Health", "📈 GEX & Skew"])
+    "🤖 AI Council & News", "📋 Option Chain", "📒 Scorecard", "🩺 Data Health", "📈 GEX & Skew", "🧾 Manual Trades", "🧪 Playbooks & Research"])
 
 with tab1:
     status = m["status"]
@@ -3174,3 +3325,233 @@ with tab9:
             _b = _cx["Bias"].dropna()
             if len(_b) >= 2:
                 st.caption("Biases aligned across indices." if _b.nunique() == 1 else "Biases diverge across indices.")
+
+with tab10:
+    st.markdown("#### 🧾 MANUAL OPTION TRADE JOURNAL")
+    st.caption("A validated signal is not a position. Confirm only after your manual order actually fills. The separate monitor_service.py process can monitor confirmed open positions independently when running.")
+    _records = st.session_state.get("scorecard", [])
+    _eligible = [r for r in _records if r.get("kind") == "VALIDATED" and r.get("option_strike") is not None
+                 and not r.get("manual_entry_confirmed") and r.get("trade_state", "SIGNAL_ONLY") not in ("EXITED", "CANCELLED")
+                 and 0 <= time.time() - float(r.get("ts", 0)) <= 30 * 60]
+    if _eligible:
+        st.markdown("##### Confirm an actual entry")
+        for _r in _eligible[-10:][::-1]:
+            _label = f"{_r.get('index')} {_r.get('option_strike')} {_r.get('option_type')} exp {_r.get('option_expiry')} — signal {_r.get('time')} IST — ref ₹{_r.get('option_entry_ref') or 0:.2f}"
+            with st.expander(_label):
+                with st.form(f"confirm_trade_{_r['id']}"):
+                    _fill = st.number_input("Actual average entry premium ₹", min_value=0.05, value=float(_r.get("option_entry_ref") or 1.0), step=0.05, key=f"fill_{_r['id']}")
+                    _qty = st.number_input("Quantity in option units (not lots)", min_value=1, value=1, step=1, key=f"qty_{_r['id']}")
+                    _fees_est = st.number_input("Estimated total entry fees ₹ (optional)", min_value=0.0, value=0.0, step=1.0, key=f"fees_{_r['id']}")
+                    _confirmed = st.form_submit_button("CONFIRM MANUAL ENTRY")
+                if _confirmed:
+                    _r["manual_entry_confirmed"] = True
+                    _r["trade_state"] = "POSITION_OPEN"
+                    _r["actual_entry_price"] = round(float(_fill), 2)
+                    _r["actual_entry_qty"] = int(_qty)
+                    _r["actual_entry_ts"] = time.time()
+                    _r["actual_fees"] = float(_fees_est)
+                    _r["option_stop"] = round(max(0.05, float(_fill) * (1 - BUYER_STOP_PCT / 100.0)), 2)
+                    _r["option_target1"] = round(float(_fill) * (1 + BUYER_TARGET1_PCT / 100.0), 2)
+                    _r["option_target2"] = round(float(_fill) * (1 + BUYER_TARGET2_PCT / 100.0), 2)
+                    _r["option_event_state"] = "POSITION_OPEN"
+                    save_scorecard(_records)
+                    _entry_msg = (f"🟢 MANUAL ENTRY CONFIRMED\n{_r.get('index')} {('BUY CALL' if _r.get('option_type') == 'CALL' else 'BUY PUT')} "
+                                  f"{_r.get('option_strike')} {_r.get('option_type')} exp {_r.get('option_expiry')}\n"
+                                  f"Actual entry ₹{float(_fill):.2f} × {int(_qty)} units | premium SL ₹{_r['option_stop']:.2f} | "
+                                  f"T1 ₹{_r['option_target1']:.2f} | T2 ₹{_r['option_target2']:.2f}\n"
+                                  "Manual tracking only; verify live prices and contract lot size.")
+                    if alerts_on and tg_token and tg_chat:
+                        _ar = fire_alert(f"manual_entry_{_r['id']}", _entry_msg, 24*60, alert_cfg)
+                        st.caption(f"Entry alert delivery result: {_ar or 'queued / cooldown / not sent'}")
+                    st.success("Entry recorded. Premium monitoring will begin on subsequent refreshes.")
+                    st.rerun()
+                if st.button("CANCEL / DID NOT ENTER", key=f"cancel_trade_{_r['id']}"):
+                    _r["trade_state"] = "CANCELLED"
+                    _r["manual_entry_confirmed"] = False
+                    save_scorecard(_records)
+                    st.info("Signal marked as not entered; premium monitoring will not run for it.")
+                    st.rerun()
+    else:
+        st.info("No unconfirmed validated option signals are available to confirm. New validated signals will appear here.")
+
+    _open_positions = [r for r in _records if r.get("trade_state") == "POSITION_OPEN" and r.get("manual_entry_confirmed")]
+    st.markdown("##### Open positions")
+    if _open_positions:
+        st.info("Open positions are also written to active_trades.json for monitor_service.py. Start that separate process and keep it running on a persistent host for index-independent monitoring.")
+        for _r in _open_positions[::-1]:
+            if _r.get("index") != idx_name or str(_r.get("option_expiry")) != str(expiry)[:10]:
+                st.warning(f"Monitoring paused for {_r.get('index')} {_r.get('option_strike')} {_r.get('option_type')} exp {_r.get('option_expiry')}: select that index and expiry to refresh its option quote.")
+            _last = float(_r.get("option_last_mark") or 0.0)
+            _ent = float(_r.get("actual_entry_price") or 0.0)
+            _qty = int(_r.get("actual_entry_qty") or 0)
+            _u_pnl = (_last - _ent) * _qty if _last > 0 and _ent > 0 else None
+            st.write(f"**{_r.get('index')} { _r.get('option_strike')} {_r.get('option_type')} exp {_r.get('option_expiry')}** | entry ₹{_ent:.2f} × {_qty} | last observed bid/LTP ₹{_last:.2f} | indicative gross P&L " + (f"₹{_u_pnl:+,.2f}" if _u_pnl is not None else "n/a"))
+            with st.form(f"close_trade_{_r['id']}"):
+                _exit = st.number_input("Actual average exit premium ₹", min_value=0.05, value=float(_last if _last > 0 else _ent), step=0.05, key=f"exit_{_r['id']}")
+                _exit_fees = st.number_input("Total fees for whole trade ₹", min_value=0.0, value=0.0, step=1.0, key=f"exitfees_{_r['id']}")
+                _close = st.form_submit_button("RECORD EXIT / CLOSE POSITION")
+            if _close:
+                _r["actual_exit_price"] = round(float(_exit), 2)
+                _r["actual_exit_ts"] = time.time()
+                _r["actual_fees"] = float(_r.get("actual_fees") or 0.0) + float(_exit_fees)
+                _r["actual_net_pnl"] = round((float(_exit) - _ent) * _qty - float(_r["actual_fees"]), 2)
+                _r["trade_state"] = "EXITED"
+                _r["option_event_state"] = "EXITED"
+                save_scorecard(_records)
+                _exit_msg = (f"🏁 MANUAL POSITION CLOSED\n{_r.get('index')} {_r.get('option_strike')} {_r.get('option_type')} exp {_r.get('option_expiry')}\n"
+                             f"Entry ₹{_ent:.2f} | exit ₹{float(_exit):.2f} | units {_qty} | fees ₹{_r['actual_fees']:.2f} | NET P&L ₹{_r['actual_net_pnl']:+,.2f}")
+                if alerts_on and tg_token and tg_chat:
+                    fire_alert(f"manual_exit_{_r['id']}", _exit_msg, 24*60, alert_cfg)
+                st.success(f"Exit recorded. Net P&L ₹{_r['actual_net_pnl']:+,.2f}")
+                st.rerun()
+    else:
+        st.info("No manually confirmed open positions.")
+
+    _closed = [r for r in _records if r.get("trade_state") == "EXITED" and r.get("actual_net_pnl") is not None]
+    if _closed:
+        st.markdown("##### Closed trade results")
+        _closed_df = pd.DataFrame([{"Time": r.get("time"), "Index": r.get("index"), "Contract": f"{r.get('option_strike')} {r.get('option_type')}", "Entry ₹": r.get("actual_entry_price"), "Exit ₹": r.get("actual_exit_price"), "Units": r.get("actual_entry_qty"), "Fees ₹": r.get("actual_fees"), "Net P&L ₹": r.get("actual_net_pnl")} for r in _closed])
+        show_df(_closed_df, hide_index=True)
+        st.metric("REALIZED NET P&L (RECORDED TRADES)", f"₹{sum(float(r.get('actual_net_pnl') or 0) for r in _closed):+,.2f}")
+        st.caption("This is only as accurate as the entry, exit and fee values you record. It is not a backtest or a forecast.")
+
+
+with tab11:
+    st.markdown("#### 🧪 STRATEGY PLAYBOOKS & OPTION RESEARCH LAB")
+    st.caption("These are separate experimental playbooks. They do not override the main engine and are not proven profitable. Signals are only displayed when recent candle data passes the freshness check.")
+    _candles_df = pd.DataFrame(intraday or [])
+    if not _candles_df.empty and "ts" in _candles_df.columns:
+        _last_ts = float(pd.to_numeric(_candles_df["ts"], errors="coerce").dropna().max())
+        _candle_age = max(0.0, time.time() - _last_ts)
+        _candle_fresh = _candle_age <= 120
+    else:
+        _last_ts, _candle_age, _candle_fresh = None, None, False
+    st.write(f"Live candle source: {'available' if not _candles_df.empty else 'unavailable'} | last candle age: {round(_candle_age,1) if _candle_age is not None else 'n/a'}s | freshness limit: 120s")
+    if not _candles_df.empty:
+        try:
+            _regime = classify_regime(_candles_df)
+            _tp = trend_pullback_signal(_candles_df)
+            _orb = opening_range_breakout_signal(_candles_df)
+            if not _candle_fresh:
+                _tp = {**_tp, "signal": "WAIT", "reason": f"STALE CANDLES ({_candle_age:.1f}s); no actionable playbook signal"}
+                _orb = {**_orb, "signal": "WAIT", "reason": f"STALE CANDLES ({_candle_age:.1f}s); no actionable playbook signal"}
+            # Playbook alerts are explicitly marked experimental and require fresh underlying candles,
+            # fresh option-chain gate, an eligible buyer contract, and Telegram configuration.
+            if _candle_fresh and data_ok and market_open_now(now_ist) and alerts_on and tg_token and tg_chat:
+                for _pb in (_tp, _orb):
+                    if _pb.get("signal") not in ("BUY_CALL", "BUY_PUT"):
+                        continue
+                    _pb_dir = "BUY" if _pb["signal"] == "BUY_CALL" else "SELL"
+                    _pb_plan = select_buyer_contract(m, _pb_dir)
+                    if not _pb_plan:
+                        continue
+                    _pb_ts = str(_pb.get("timestamp") or "unknown-time")
+                    _pb_key = f"playbook_{idx_name}_{str(expiry)[:10]}_{_pb.get('strategy')}_{_pb['signal']}_{_pb_ts}"
+                    _pb_text = (f"🧪 EXPERIMENTAL PLAYBOOK SIGNAL — MANUAL REVIEW ONLY\n"
+                        f"Strategy: {_pb.get('strategy')} | {idx_name} | {expiry}\n"
+                        f"Signal: {_pb['signal']} | underlying close ₹{float(_pb.get('spot') or spot):,.2f} | candle {_pb_ts}\n"
+                        f"Candidate: {idx_name} {_pb_plan['strike']:g} {_pb_plan['option_type']} | bid/ask ₹{_pb_plan['bid']:.2f}/₹{_pb_plan['ask']:.2f} | Δ {_pb_plan['delta']:+.2f} | IV {_pb_plan['iv']:.1f}%\n"
+                        f"Ask reference ₹{_pb_plan['entry_ref']:.2f} | planning SL ₹{_pb_plan['stop_premium']:.2f} | T1 ₹{_pb_plan['target1_premium']:.2f} | T2 ₹{_pb_plan['target2_premium']:.2f}\n"
+                        f"Reason: {_pb.get('reason')}\nNot a fill or guaranteed forecast. Verify the live quote and main terminal checks before acting.")
+                    fire_alert(_pb_key, _pb_text, 24*60, alert_cfg)
+            c1, c2, c3 = st.columns(3)
+            c1.metric("MARKET REGIME", _regime.get("regime", "n/a"))
+            c2.metric("TREND PULLBACK", _tp.get("signal", "WAIT"))
+            c3.metric("OPENING RANGE BREAKOUT", _orb.get("signal", "WAIT"))
+            with st.expander("Trend-pullback details", expanded=True): st.json(_tp)
+            with st.expander("Opening-range breakout details", expanded=True): st.json(_orb)
+        except Exception as _e:
+            st.error(f"Could not evaluate playbooks: {str(_e)[:240]}")
+    else:
+        st.warning("Live intraday candles unavailable. Use the CSV backtest below; no playbook signal is inferred.")
+
+    st.markdown("##### Option pricing diagnostics")
+    _pr1, _pr2, _pr3, _pr4 = st.columns(4)
+    _pr_spot = _pr1.number_input("Underlying spot", min_value=0.01, value=float(spot), key="research_spot")
+    _pr_strike = _pr2.number_input("Option strike", min_value=0.01, value=float(round(spot / info["step"]) * info["step"]), key="research_strike")
+    _pr_iv = _pr3.number_input("IV (%)", min_value=0.1, max_value=500.0, value=float(max(1.0, m.get("atm_iv", 15.0))), key="research_iv")
+    _pr_prem = _pr4.number_input("Observed premium ₹", min_value=0.05, value=float(max(0.05, m.get("atm_straddle", 50.0) / 2)), key="research_prem")
+    _pr5, _pr6, _pr7, _pr8 = st.columns(4)
+    _pr_type = _pr5.selectbox("Contract side", ["CALL", "PUT"], key="research_type")
+    _pr_days = _pr6.number_input("Days to expiry", min_value=0.01, max_value=365.0, value=3.0, key="research_dte")
+    _pr_horizon = _pr7.number_input("Expected holding minutes", min_value=1, max_value=375, value=30, key="research_horizon")
+    _pr_cost = _pr8.number_input("Estimated round-trip cost per unit ₹", min_value=0.0, value=2.0, key="research_cost")
+    _pr9, _pr10, _pr11 = st.columns(3)
+    _pr_bid = _pr9.number_input("Observed bid ₹ (0 = omit)", min_value=0.0, value=0.0, key="research_bid")
+    _pr_ask = _pr10.number_input("Observed ask ₹ (0 = omit)", min_value=0.0, value=0.0, key="research_ask")
+    _pr_ivshock = _pr11.number_input("IV shock scenario (vol points)", min_value=-50.0, max_value=50.0, value=0.0, key="research_ivshock")
+    _iv_upload = st.file_uploader("Optional IV history CSV (column named iv or IV)", type=["csv"], key="iv_history_upload")
+    _iv_hist = []
+    if _iv_upload is not None:
+        try:
+            _ivdf = pd.read_csv(_iv_upload)
+            _ivcol = "iv" if "iv" in _ivdf.columns else "IV" if "IV" in _ivdf.columns else None
+            if _ivcol: _iv_hist = pd.to_numeric(_ivdf[_ivcol], errors="coerce").dropna().tolist()
+        except Exception as _e: st.warning(f"Could not read IV history: {_e}")
+    try:
+        _pa = option_analytics(_pr_spot, _pr_strike, _pr_iv, _pr_days / 365.0, _pr_type == "CALL", _pr_prem,
+            bid=(_pr_bid if _pr_bid > 0 else None), ask=(_pr_ask if _pr_ask > 0 else None),
+            iv_history=_iv_hist, horizon_minutes=int(_pr_horizon), iv_shock_points=float(_pr_ivshock), cost_per_unit=float(_pr_cost))
+        st.json(_pa)
+        if _pa["iv_percentile"]["status"] != "OK": st.caption("IV percentile not available: provide at least 20 valid historical IV observations. The Black–Scholes values are scenario estimates, not predictions.")
+    except Exception as _e: st.error(f"Pricing diagnostics unavailable: {str(_e)[:200]}")
+
+    st.markdown("##### Historical option-level backtest (CSV upload)")
+    st.caption("Underlying CSV: timestamp, open, high, low, close (volume optional). Option quotes CSV: timestamp, expiry, strike, option_type (CALL/PUT or CE/PE), bid, ask; IV/delta optional. Quotes are snapshots, not tick history.")
+    _bt1, _bt2 = st.columns(2)
+    _underlying_upload = _bt1.file_uploader("Underlying candles CSV", type=["csv"], key="bt_underlying")
+    _options_upload = _bt2.file_uploader("Historical option quotes CSV", type=["csv"], key="bt_options")
+    _bt3, _bt4, _bt5 = st.columns(3)
+    _bt_strategy = _bt3.selectbox("Playbook", ["TREND_PULLBACK", "OPENING_RANGE_BREAKOUT"], key="bt_strategy")
+    _bt_hold = _bt4.number_input("Max hold (minutes)", min_value=1, max_value=375, value=30, key="bt_hold")
+    _bt_cost = _bt5.number_input("Round-trip cost per option unit ₹", min_value=0.0, value=2.0, key="bt_cost")
+    if _underlying_upload is not None and _options_upload is not None and st.button("RUN SNAPSHOT BACKTEST", key="run_option_bt"):
+        try:
+            _udf = pd.read_csv(_underlying_upload)
+            _qdf = pd.read_csv(_options_upload)
+            _trades = backtest_option_playbook(_udf, _qdf, strategy=_bt_strategy, max_hold_minutes=int(_bt_hold), costs_per_unit=float(_bt_cost))
+            st.session_state["research_backtest_trades"] = _trades
+            st.success(f"Backtest completed: {_trades.shape[0]} trade(s). This is a research result, not proof of future profitability.")
+        except Exception as _e: st.error(f"Backtest failed: {str(_e)[:300]}")
+    _trades = st.session_state.get("research_backtest_trades")
+    if isinstance(_trades, pd.DataFrame) and not _trades.empty:
+        _wins = float((_trades["net_pnl_per_unit"] > 0).mean() * 100)
+        _avg = float(_trades["net_pnl_per_unit"].mean())
+        _sum = float(_trades["net_pnl_per_unit"].sum())
+        _m1, _m2, _m3 = st.columns(3)
+        _m1.metric("TRADES", len(_trades)); _m2.metric("WIN RATE", f"{_wins:.1f}%"); _m3.metric("MEAN NET P&L / UNIT", f"₹{_avg:+.2f}")
+        st.metric("SUM NET P&L / UNIT (not multiplied by lots)", f"₹{_sum:+.2f}")
+        st.dataframe(_trades, use_container_width=True, hide_index=True)
+        st.download_button("Download backtest trades CSV", _trades.to_csv(index=False), file_name="option_backtest_trades.csv", mime="text/csv")
+        st.caption("Backtest limitations: no guaranteed fills, snapshot-only stop/target ordering, no brokerage schedule inference, and no walk-forward guarantee. Inspect the data before trusting results.")
+    st.markdown("##### Probability calibration (historical predictions only)")
+    _cal_upload = st.file_uploader("CSV with predicted_probability (0–1) and net_pnl_per_unit or win (0/1)", type=["csv"], key="calibration_upload")
+    if _cal_upload is not None:
+        try:
+            _cdf = pd.read_csv(_cal_upload)
+            if "predicted_probability" in _cdf.columns:
+                if "win" in _cdf.columns:
+                    _outcomes = pd.to_numeric(_cdf["win"], errors="coerce")
+                elif "net_pnl_per_unit" in _cdf.columns:
+                    _outcomes = (pd.to_numeric(_cdf["net_pnl_per_unit"], errors="coerce") > 0).astype(float)
+                else: _outcomes = None
+                if _outcomes is None:
+                    st.warning("CSV must include win (0/1) or net_pnl_per_unit.")
+                else:
+                    _probs = pd.to_numeric(_cdf["predicted_probability"], errors="coerce")
+                    _metrics = probability_metrics(_probs, _outcomes)
+                    st.write("Probability quality metrics", _metrics)
+                    _cal_data = _cdf.copy(); _cal_data["win"] = _outcomes
+                    if "net_pnl_per_unit" in _cal_data.columns:
+                        st.dataframe(calibration_table(_cal_data, outcome_col="net_pnl_per_unit"), use_container_width=True, hide_index=True)
+                    else:
+                        st.dataframe(calibration_table(_cal_data, outcome_col="win"), use_container_width=True, hide_index=True)
+                    _fit = chronological_calibration_report(_probs, _outcomes, train_fraction=0.7, min_train_samples=100, min_test_samples=30)
+                    st.write("Chronological train / holdout calibration report", _fit)
+                    if _fit.get("status") == "INSUFFICIENT_DATA": st.caption("Need at least 100 valid training observations and 30 later holdout observations, with both outcomes in the training segment. The tool will not manufacture probabilities when data is insufficient.")
+        except Exception as _e: st.error(f"Calibration analysis failed: {str(_e)[:240]}")
+
+    st.markdown("##### Independent monitor service")
+    _active_file = os.getenv("BBG_ACTIVE_TRADES_FILE") or os.path.join(DATA_DIR, "active_trades.json")
+    st.code(f"python monitor_service.py\nActive trade file: {_active_file}\nPoll interval: {os.getenv('BBG_MONITOR_POLL_SECONDS', '15')} seconds", language="bash")
+    st.caption("Run monitor_service.py as a separate persistent process on the same host/storage. It reads confirmed open positions and sends best-effort Telegram alerts. It does not place orders; provider exchange timestamps may not be available, and polling can miss fast moves.")
