@@ -1,5 +1,5 @@
 """
-VIPUL BLOOMBERG PROFESSIONAL TERMINAL v13.6 (MINIMAL-SIDEBAR EDITION)
+VIPUL OPTIONS BUYER SIGNAL TERMINAL v14.0
 Built on v13.4. Changes in this version:
  - AI Council & News tab now renders headlines and each agent's verdict as readable text (no raw JSON dump)
  - DATA GATE: AI runs, snapshots and signals are paused when the market is closed / holiday / IV is unusable
@@ -16,8 +16,8 @@ Built on v13.4. Changes in this version:
  - Headline tone needs >= 4 keyword hits before it shows a number
  - Telegram: validated signals + outcomes by default (rejected optional), correct resolve time, alert state pruned
  - NET GEX shown in Rs crore, cross-index view cached 5 min
- - NSE holiday list via secret NSE_HOLIDAYS (comma separated YYYY-MM-DD)
-No order execution features: this app places no orders.
+ - NSE holiday list via secret NSE_HOLIDAYS (comma separated YYYY-MM-DD); OI velocity normalized to 180-second equivalent; missing close data marked DATA_GAP
+BUYER-ONLY: signals are BUY CALL / BUY PUT / WAIT; no writing/selling options and no order execution. Telegram is best-effort while Streamlit is running; this is not a 24/7 background monitor.
 """
 
 import os
@@ -49,7 +49,7 @@ try:
 except ImportError:
     Groq = None
 
-st.set_page_config(page_title="Vipul Bloomberg Terminal v13.6", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Vipul Options Buyer Terminal v14.0", layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
 # CSS
@@ -140,7 +140,7 @@ PARAM_DEFAULTS = {
     "noise_pct": 0.5, "dominance": 1.5, "min_confirm": 2,
     "flow_conc_on": False, "flow_conc_min": 50,
     "max_risk": 2.0, "capital": 100000, "move_alert_pct": 2.0,
-    "min_conf": 50, "exh_veto": False, "alert_rejected": False,
+    "min_conf": 60, "exh_veto": False, "alert_rejected": False,
 }
 
 
@@ -171,8 +171,13 @@ EXH_ALERT = 60
 
 RISK_FREE = 0.065
 MIN_PREMIUM = 5.0
+MAX_OPTION_SPREAD_PCT = 8.0
+BUYER_STOP_PCT = 25.0
+BUYER_TARGET1_PCT = 35.0
+BUYER_TARGET2_PCT = 60.0
+MAX_AI_VERDICT_AGE_SEC = 120
 AI_RETRY_SEC = 60
-AI_VERDICT_MAX_AGE_SEC = 600
+AI_VERDICT_MAX_AGE_SEC = 120
 
 NEWS_MAX_AGE_H = 24
 NEWS_TOP_N = 10
@@ -302,6 +307,17 @@ def _n(x):
         return 0.0
 
 
+def _maybe_n(x):
+    """Keep absent OI as NaN; missing history must not masquerade as a zero-OI build."""
+    if x is None or x == "":
+        return float("nan")
+    try:
+        v = float(x)
+        return v if math.isfinite(v) else float("nan")
+    except (TypeError, ValueError):
+        return float("nan")
+
+
 def _fetch_chain_raw(scrip, seg, expiry, token, client_id):
     enforce_global_api_throttle()
     r = requests.post(OPTIONCHAIN_URL, headers=auth_headers(token, client_id),
@@ -322,7 +338,7 @@ def _fetch_chain_raw(scrip, seg, expiry, token, client_id):
         rows.append({
             "Strike": strike,
             "CE_OI": _n(ce.get("oi")), "PE_OI": _n(pe.get("oi")),
-            "CE_PrevOI": _n(ce.get("previous_oi")), "PE_PrevOI": _n(pe.get("previous_oi")),
+            "CE_PrevOI": _maybe_n(ce.get("previous_oi")), "PE_PrevOI": _maybe_n(pe.get("previous_oi")),
             "CE_IV": _n(ce.get("implied_volatility")), "PE_IV": _n(pe.get("implied_volatility")),
             "CE_Gamma": _n(ce_g.get("gamma")), "PE_Gamma": _n(pe_g.get("gamma")),
             "CE_LTP": _n(ce.get("last_price")), "PE_LTP": _n(pe.get("last_price")),
@@ -996,15 +1012,22 @@ def update_oi_velocity(m, key):
         st.session_state.velocity = dict(ZERO_VEL)
         return st.session_state.velocity
 
-    if (now - snap["ts"]).total_seconds() < VELOCITY_WINDOW_SEC:
+    elapsed = (now - snap["ts"]).total_seconds()
+    if elapsed < VELOCITY_WINDOW_SEC:
         return st.session_state.get("velocity", dict(ZERO_VEL))
+    if elapsed > 600:
+        # A long pause is not a 3-minute flow observation; reset baseline rather than exaggerating velocity.
+        st.session_state.oi_snap = {"key": key, "ts": now, "map": current}
+        st.session_state.velocity = dict(ZERO_VEL)
+        return st.session_state.velocity
 
+    scale_to_180s = 180.0 / max(elapsed, 1.0)
     vel = dict(ZERO_VEL)
     for stk, (c_ce, c_pe) in current.items():
         if stk not in snap["map"]:
             continue
         p_ce, p_pe = snap["map"][stk]
-        d_ce, d_pe = c_ce - p_ce, c_pe - p_pe
+        d_ce, d_pe = (c_ce - p_ce) * scale_to_180s, (c_pe - p_pe) * scale_to_180s
         if d_ce > 0:
             vel["ce_builds"] += d_ce
         elif d_ce < 0:
@@ -1141,6 +1164,7 @@ AGENTS:
 4. Sentiment Agent: judge ONLY from the LIVE HEADLINES list; name the headline(s) driving the view. If the list says NO HEADLINES FETCHED, say that instead of claiming "no news impact"
 5. Risk Officer: final approval; reject if evidence is conflicting or engine status is CONFLICTED. Begin final_approval with the single word APPROVE or REJECT, then a short reason.
 
+IMPORTANT: This user only BUYS options. Signal BUY means bullish underlying -> BUY CALL; signal SELL means bearish underlying -> BUY PUT. Never recommend selling/writing options. WAIT when evidence is weak or stale.
 Return ONLY this JSON:
 {{"price_action_agent":"1 sentence","order_flow_agent":"1 sentence","volatility_agent":"1 sentence",
 "news_agent":"1 sentence","news_score":-100 to 100,"final_approval":"APPROVE or REJECT: short reason","signal":"BUY or SELL or WAIT","confidence":0-100}}"""
@@ -1233,6 +1257,49 @@ def chain_checks(m):
 VETO_RE = re.compile(r"\b(REJECT|REJECTED|VETO|VETOED|DENY|DENIED|DECLINE|DECLINED|DISAPPROVE|DISAPPROVED|NOT APPROVED)\b")
 
 
+def select_buyer_contract(m, direction):
+    """Choose a liquid, near-ATM long option. This ranks available quotes; it does not predict returns."""
+    df = m.get("df")
+    if df is None or df.empty or direction not in ("BUY", "SELL"):
+        return None
+    side = "CE" if direction == "BUY" else "PE"
+    rows = []
+    for _, r in df.iterrows():
+        strike = _n(r.get("Strike"))
+        ltp = _n(r.get(f"{side}_LTP"))
+        bid, ask = _n(r.get(f"{side}_Bid")), _n(r.get(f"{side}_Ask"))
+        delta = _n(r.get(f"{side}_Delta"))
+        iv = _n(r.get(f"{side}_IV"))
+        oi, vol = _n(r.get(f"{side}_OI")), _n(r.get(f"{side}_Vol"))
+        if not all(math.isfinite(x) for x in (strike, ltp, bid, ask, delta, iv, oi, vol)):
+            continue
+        if ltp < MIN_PREMIUM or bid <= 0 or ask < bid or ask <= 0 or oi <= 0:
+            continue
+        mid = (bid + ask) / 2.0
+        spread_pct = (ask - bid) / mid * 100.0 if mid > 0 else 999.0
+        abs_delta = abs(delta)
+        # Favor 0.45-0.60 absolute delta, allow 0.30-0.70; reject very wide/illiquid quotes.
+        if not (0.30 <= abs_delta <= 0.70) or spread_pct > MAX_OPTION_SPREAD_PCT:
+            continue
+        # Spread dominates score; then delta proximity to 0.50 and distance to spot.
+        score = abs(abs_delta - 0.50) * 3.0 + spread_pct / 100.0 + abs(strike - m["spot"]) / max(m["step"], 1) * 0.025
+        rows.append({"option_type": "CALL" if side == "CE" else "PUT", "side": side,
+                     "strike": strike, "expiry": str(m.get("expiry", "")), "ltp": ltp,
+                     "bid": bid, "ask": ask, "mid": mid, "spread_pct": spread_pct,
+                     "delta": delta, "iv": iv, "oi": int(oi), "volume": int(vol), "score": score})
+    if not rows:
+        return None
+    best = min(rows, key=lambda x: x["score"])
+    premium = best["ask"]  # conservative manual-entry reference; never treat this as a fill
+    best["entry_ref"] = round(premium, 2)
+    best["stop_premium"] = round(max(0.05, premium * (1 - BUYER_STOP_PCT / 100.0)), 2)
+    best["target1_premium"] = round(premium * (1 + BUYER_TARGET1_PCT / 100.0), 2)
+    best["target2_premium"] = round(premium * (1 + BUYER_TARGET2_PCT / 100.0), 2)
+    best["max_loss_per_unit"] = round(premium - best["stop_premium"], 2)
+    best["risk_note"] = "Premium levels are fixed-percentage planning levels, not exchange orders or a modelled fill. Re-check live bid/ask before entry."
+    return best
+
+
 def build_signal(m, ai, data_ok=True, gate_reason=""):
     ai_sig = str(ai.get("signal", "WAIT")).upper()
     if ai_sig not in ("BUY", "SELL", "WAIT"):
@@ -1246,6 +1313,12 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
     min_conf = int(P("min_conf"))
     direction = {"BUY": 1, "SELL": -1}.get(ai_sig, 0)
     checks = chain_checks(m)
+    _near_df = m.get("near", m.get("df"))
+    _oi_coverage = 0.0
+    if _near_df is not None and len(_near_df):
+        _oi_cols = [c for c in ("CE_PrevOI", "PE_PrevOI") if c in _near_df.columns]
+        if _oi_cols:
+            _oi_coverage = float(_near_df[_oi_cols].notna().mean().mean() * 100.0)
 
     # one vote per family: sign of the summed counted votes inside the family
     fam_sum = {f: 0 for f in FAMILIES}
@@ -1266,10 +1339,16 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
         notes.append(f"{sig} rejected: data gate closed ({gate_reason}).")
         sig = "WAIT"
 
+    if sig != "WAIT" and _oi_coverage < 70.0:
+        notes.append(f"{sig} rejected: previous-OI history coverage is only {_oi_coverage:.0f}% (need at least 70%).")
+        sig = "WAIT"
+
     if sig != "WAIT":
-        fa = str(ai.get("final_approval", "")).upper()
-        if VETO_RE.search(fa):
-            notes.append(f"{sig} rejected: AI risk officer veto ({str(ai.get('final_approval', ''))[:80]}).")
+        fa_raw = str(ai.get("final_approval", "")).strip()
+        fa = fa_raw.upper()
+        # Fail closed: blank, malformed, or anything other than an explicit APPROVE is rejected.
+        if not re.match(r"^APPROVE(?:\b|:)", fa) or re.match(r"^REJECT\b", fa):
+            notes.append(f"{sig} rejected: risk officer did not provide an explicit APPROVE ({fa_raw[:80] or 'missing approval'}).")
             sig = "WAIT"
 
     if sig != "WAIT" and conf < min_conf:
@@ -1316,9 +1395,13 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
                          f"(target {target:,.0f}, SL {sl:,.0f}) is below 1:{MIN_RR:.1f}.")
             sig, target, sl, rr = "WAIT", None, None, None
 
+    buyer_plan = select_buyer_contract(m, sig) if sig in ("BUY", "SELL") else None
+    if sig in ("BUY", "SELL") and buyer_plan is None:
+        notes.append(f"{sig} rejected: no near-ATM option passed premium, bid/ask, spread (≤{MAX_OPTION_SPREAD_PCT:.0f}%), OI and delta filters. Do not chase an illiquid contract.")
+        sig, target, sl, rr = "WAIT", None, None, None
     return {"signal": sig, "ai_signal": ai_sig, "entry": entry, "target": target, "sl": sl, "rr": rr,
             "confidence": conf, "note": " ".join(notes), "checks": checks, "net": net, "lean": lean,
-            "families": families, "direction": direction}
+            "families": families, "direction": direction, "buyer_plan": buyer_plan}
 
 
 # ============================================================
@@ -1648,12 +1731,12 @@ def bs_price(S, K, T, iv_pct, is_call):
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return max(0.0, (S - K) if is_call else (K - S))
     sq = sigma * math.sqrt(T)
-    d1 = (math.log(S / K) + (RISK_FREE + 0.5 * sigma * sigma) * T) / sq
+    d1 = (math.log(S / K) + (RISK_FREE - DIV_YIELD + 0.5 * sigma * sigma) * T) / sq
     d2 = d1 - sq
-    disc = math.exp(-RISK_FREE * T)
+    disc_r, disc_q = math.exp(-RISK_FREE * T), math.exp(-DIV_YIELD * T)
     if is_call:
-        return S * _ncdf(d1) - K * disc * _ncdf(d2)
-    return K * disc * _ncdf(-d2) - S * _ncdf(-d1)
+        return S * disc_q * _ncdf(d1) - K * disc_r * _ncdf(d2)
+    return K * disc_r * _ncdf(-d2) - S * disc_q * _ncdf(-d1)
 
 
 def bs_delta(S, K, T, iv_pct, is_call):
@@ -1661,8 +1744,9 @@ def bs_delta(S, K, T, iv_pct, is_call):
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return (1.0 if S > K else 0.0) if is_call else (-1.0 if S < K else 0.0)
     sq = sigma * math.sqrt(T)
-    d1 = (math.log(S / K) + (RISK_FREE + 0.5 * sigma * sigma) * T) / sq
-    return _ncdf(d1) if is_call else _ncdf(d1) - 1.0
+    d1 = (math.log(S / K) + (RISK_FREE - DIV_YIELD + 0.5 * sigma * sigma) * T) / sq
+    disc_q = math.exp(-DIV_YIELD * T)
+    return disc_q * _ncdf(d1) if is_call else disc_q * (_ncdf(d1) - 1.0)
 
 
 def reprice(ltp, S0, S1, K, T0, T1, iv0, iv1, is_call):
@@ -1960,8 +2044,8 @@ def kelly_sizing(sig, card, capital, max_risk_pct):
 # ============================================================
 # SCORECARD, ALERTS & DATA HEALTH
 # ============================================================
-SCORECARD_FILE = os.path.join(DATA_DIR, "bbg_scorecard_v13_2.json")
-ALERT_FILE = os.path.join(DATA_DIR, "bbg_alerts_sent_v13_2.json")
+SCORECARD_FILE = os.path.join(DATA_DIR, "bbg_scorecard_v14.json")
+ALERT_FILE = os.path.join(DATA_DIR, "bbg_alerts_sent_v14.json")
 SIGNAL_DEDUP_MIN = 30
 OUTCOME_HORIZONS = (15, 30, 60)
 HORIZON_TOL_MIN = 10
@@ -1977,13 +2061,30 @@ def _load_json(path, default):
 
 
 def _save_json(path, obj):
+    lock_handle = None
     try:
-        tmp = f"{path}.{os.getpid()}.tmp"
+        try:
+            import fcntl
+            lock_handle = open(path + ".lock", "a+")
+            fcntl.flock(lock_handle, fcntl.LOCK_EX)
+        except (ImportError, OSError):
+            lock_handle = None
+        tmp = f"{path}.{os.getpid()}.{time.time_ns()}.tmp"
         with open(tmp, "w") as f:
             json.dump(obj, f)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
     except Exception:
         pass
+    finally:
+        if lock_handle is not None:
+            try:
+                import fcntl
+                fcntl.flock(lock_handle, fcntl.LOCK_UN)
+                lock_handle.close()
+            except Exception:
+                pass
 
 
 def token_expiry(token):
@@ -2042,19 +2143,37 @@ def signal_alert_text(r):
     tgt = f"{r['target']:,.0f}" if r.get("target") else "-"
     sl = f"{r['sl']:,.0f}" if r.get("sl") else "-"
     rr = f"1:{r['rr']:.2f}" if r.get("rr") else "-"
-    kind_label = "✅ VALIDATED SIGNAL" if r['kind'] == "VALIDATED" else "❌ REJECTED SIGNAL"
+    kind_label = "✅ VALIDATED OPTION-BUY SIGNAL" if r["kind"] == "VALIDATED" else "❌ REJECTED SIGNAL (NOT ACTIONABLE)"
     reason_txt = f"\nReason: {r['reason']}" if r.get("reason") else ""
-    return (f"📣 **{kind_label}**\n{r['index']} | **{r['signal']}** @ {r['entry']:,.0f}\n"
-            f"Target {tgt} | Stop {sl} | R:R {rr}\n"
-            f"AI Confidence {r['confidence']}% | Chain Agreement {r['net']:+d}{reason_txt}\n"
-            f"{r['time']} IST. Analysis only, not trading advice.")
+    if r.get("kind") == "VALIDATED" and r.get("option_strike") is not None:
+        action = "BUY CALL" if r.get("option_type") == "CALL" else "BUY PUT"
+        option = (f"\nContract: {r.get('index')} {r.get('option_strike'):g} {r.get('option_type')} | Expiry {r.get('option_expiry')}"
+                  f"\nQuote bid/ask: ₹{r.get('option_bid', 0):.2f} / ₹{r.get('option_ask', 0):.2f}"
+                  f" | spread {r.get('option_spread_pct', 0):.1f}% | Δ {r.get('option_delta', 0):+.2f} | IV {r.get('option_iv', 0):.1f}%"
+                  f"\nManual entry reference: ≤ ₹{r.get('option_entry_ref', 0):.2f} (ask snapshot, not a fill)"
+                  f"\nOption premium plan: SL ₹{r.get('option_stop', 0):.2f} | T1 ₹{r.get('option_target1', 0):.2f} | T2 ₹{r.get('option_target2', 0):.2f}"
+                  f"\nMax planned loss/unit ≈ ₹{(r.get('option_entry_ref') or 0) - (r.get('option_stop') or 0):.2f}")
+    else:
+        action, option = ("BUY CALL" if r.get("signal") == "BUY" else "BUY PUT"), "\nNo approved option contract; do not trade."
+    return (f"{kind_label}\n{r['index']} | {action} | Underlying {r['entry']:,.2f}\n"
+            f"Underlying confirmation levels: target {tgt} | invalidation/stop {sl} | R:R {rr}\n"
+            f"AI confidence {r['confidence']}% | Chain agreement {r['net']:+d}{option}{reason_txt}\n"
+            f"{r['time']} IST. Manual execution only. Recheck quote freshness/liquidity; levels are planning estimates, not guaranteed fills.")
 
 
 def outcome_alert_text(r):
-    return (f"🏁 **SIGNAL RESOLVED: {r['outcome']}**\n"
-            f"{r['index']} | {r['signal']} entered @ {r['entry']:,.0f}\n"
-            f"MFE: +{r['mfe']} pts | MAE: -{r['mae']} pts\n"
-            f"Result: {r['outcome']} at {r.get('resolved_time', r['time'])} IST.")
+    if str(r.get("event_type", "")).startswith("OPTION_"):
+        action = "BUY CALL" if r.get("option_type") == "CALL" else "BUY PUT"
+        return (f"{'🛑' if r.get('event_type') == 'OPTION_STOP_LOSS' else '🎯'} OPTION PREMIUM EVENT: {r.get('event_type')}\n"
+                f"{r.get('index')} | {action} | {r.get('option_strike')} {r.get('option_type')} | expiry {r.get('option_expiry')}\n"
+                f"Latest observed exit-side bid/LTP ₹{r.get('premium_mark', r.get('option_last_mark', 0)):.2f} | SL ₹{r.get('option_stop', 0):.2f} | T1 ₹{r.get('option_target1', 0):.2f} | T2 ₹{r.get('option_target2', 0):.2f}\n"
+                f"Snapshot time {r.get('time', '')} IST. Bid is used where available (LTP fallback); polling can miss fast moves, so verify live bid/ask and manage manually.")
+    action = "BUY CALL" if r.get("signal") == "BUY" else "BUY PUT"
+    return (f"🏁 UNDERLYING LEVEL EVENT: {r['outcome']}\n"
+            f"{r['index']} | {action} candidate {r.get('option_strike', 'N/A')} {r.get('option_type', '')}\n"
+            f"Underlying signal level {r['entry']:,.0f} | target/stop {r.get('target')} / {r.get('sl')}\n"
+            f"Underlying MFE: +{r['mfe']} pts | MAE: -{r['mae']} pts\n"
+            f"Event time: {r.get('resolved_time', r['time'])} IST. This is NOT confirmation that option premium target/SL was hit; check live option quote manually.")
 
 
 def post_webhook(url, payload):
@@ -2155,8 +2274,10 @@ def make_record(kind, idx_name, expiry, m, sig, ai, tone, now):
     ready = bool(ex.get("ready"))
     own = (ex["buyer"] if direction == "BUY" else ex["seller"]) if ready else None
     note = sig["note"] if kind == "REJECTED" else ""
+    buyer_plan = select_buyer_contract(m, direction) if kind == "VALIDATED" and direction in ("BUY", "SELL") else None
+    trade_key = f"{idx_name}|{str(expiry)[:10]}|{direction}|{buyer_plan.get('option_type') if buyer_plan else 'NA'}|{buyer_plan.get('strike') if buyer_plan else 'NA'}"
     return {
-        "id": hashlib.md5(f"{now.timestamp()}{idx_name}{kind}{direction}".encode()).hexdigest()[:8],
+        "id": hashlib.sha256(f"{now.timestamp()}|{trade_key}|{kind}".encode()).hexdigest()[:12], "trade_key": trade_key,
         "kind": kind, "ts": now.timestamp(), "date": now.date().isoformat(), "time": now.strftime("%H:%M:%S"),
         "index": idx_name, "expiry": str(expiry)[:10], "signal": direction, "entry": round(float(m["spot"]), 2),
         "target": sig["target"] if kind == "VALIDATED" else None, "sl": sig["sl"] if kind == "VALIDATED" else None,
@@ -2174,6 +2295,22 @@ def make_record(kind, idx_name, expiry, m, sig, ai, tone, now):
         "s15": None, "s30": None, "s60": None, "sclose": None, "first_touch": None, "mfe": 0.0, "mae": 0.0,
         "samples": 0, "last_sample_ts": None, "max_gap_min": 0.0, "resolved": False, "outcome": "OPEN",
         "touch_alerted": False,
+        "option_type": buyer_plan.get("option_type") if buyer_plan else None,
+        "option_side": buyer_plan.get("side") if buyer_plan else None,
+        "option_strike": buyer_plan.get("strike") if buyer_plan else None,
+        "option_expiry": str(expiry)[:10],
+        "option_entry_ref": buyer_plan.get("entry_ref") if buyer_plan else None,
+        "option_bid": buyer_plan.get("bid") if buyer_plan else None,
+        "option_ask": buyer_plan.get("ask") if buyer_plan else None,
+        "option_spread_pct": buyer_plan.get("spread_pct") if buyer_plan else None,
+        "option_delta": buyer_plan.get("delta") if buyer_plan else None,
+        "option_iv": buyer_plan.get("iv") if buyer_plan else None,
+        "option_stop": buyer_plan.get("stop_premium") if buyer_plan else None,
+        "option_target1": buyer_plan.get("target1_premium") if buyer_plan else None,
+        "option_target2": buyer_plan.get("target2_premium") if buyer_plan else None,
+        "option_last_mark": buyer_plan.get("ltp") if buyer_plan else None,
+        "option_event_state": "SIGNAL_VALIDATED" if buyer_plan else None,
+        "touch_alerted": False,
     }
 
 
@@ -2182,8 +2319,9 @@ def maybe_log_signal(recs, idx_name, expiry, m, sig, ai, tone, now):
         return []
 
     def recent(kind, direction):
-        return any(r["index"] == idx_name and r["kind"] == kind and r["signal"] == direction
-                   and now.timestamp() - r["ts"] < SIGNAL_DEDUP_MIN * 60 for r in recs)
+        return any(r.get("index") == idx_name and r.get("expiry") == str(expiry)[:10]
+                   and r.get("kind") == kind and r.get("signal") == direction
+                   and now.timestamp() - r.get("ts", 0) < SIGNAL_DEDUP_MIN * 60 for r in recs)
 
     new = []
     if sig["signal"] in ("BUY", "SELL"):
@@ -2196,7 +2334,7 @@ def maybe_log_signal(recs, idx_name, expiry, m, sig, ai, tone, now):
     return new
 
 
-def update_outcomes(recs, idx_name, spot, now, candles, intraday=None):
+def update_outcomes(recs, idx_name, spot, now, candles, intraday=None, option_df=None, current_expiry=None):
     """Update open records of the CURRENT index. 1-minute candle highs/lows (when available) drive
     MFE/MAE and target/stop touches; if target and stop are inside the same 1-minute bar the STOP is assumed
     first (conservative). Spot samples are used as a fallback and for the 15/30/60 min marks."""
@@ -2213,6 +2351,33 @@ def update_outcomes(recs, idx_name, spot, now, candles, intraday=None):
         el = (now.timestamp() - r["ts"]) / 60.0
         same_day = r["date"] == today
         has_levels = r["target"] is not None and r["sl"] is not None
+        # Premium-based option events use the latest option-chain LTP snapshot only. This is polling,
+        # not tick-level surveillance; quote gaps can miss intrabar touches.
+        if (r.get("kind") == "VALIDATED" and r.get("option_strike") is not None and
+                r.get("option_expiry") == str(current_expiry)[:10] and option_df is not None and not option_df.empty and live):
+            match = option_df[option_df["Strike"].astype(float).sub(float(r["option_strike"])).abs() < 0.001]
+            side = r.get("option_side") or ("CE" if r.get("option_type") == "CALL" else "PE")
+            if not match.empty:
+                # For a long option, the bid is the more realistic immediate exit-side quote.
+                mark = _n(match.iloc[0].get(f"{side}_Bid"))
+                if mark <= 0:
+                    mark = _n(match.iloc[0].get(f"{side}_LTP"))
+                if mark > 0:
+                    r["option_last_mark"] = round(mark, 2)
+                    event = None
+                    if mark <= _n(r.get("option_stop")) and r.get("option_event_state") != "STOP_LOSS":
+                        event = "OPTION_STOP_LOSS"
+                        r["option_event_state"] = "STOP_LOSS"
+                    elif mark >= _n(r.get("option_target2")) and r.get("option_event_state") not in ("TARGET_2", "STOP_LOSS"):
+                        event = "OPTION_TARGET_2"
+                        r["option_event_state"] = "TARGET_2"
+                    elif mark >= _n(r.get("option_target1")) and r.get("option_event_state") not in ("TARGET_1", "TARGET_2", "STOP_LOSS"):
+                        event = "OPTION_TARGET_1"
+                        r["option_event_state"] = "TARGET_1"
+                    if event:
+                        touched_now.append({**r, "event_type": event, "premium_mark": round(mark, 2),
+                                            "outcome": event, "time": stamp, "resolved_time": stamp})
+                    changed = True
         if same_day:
             later = [b for b in bars if b["ts"] >= r["ts"]]
             for b in later:
@@ -2254,13 +2419,13 @@ def update_outcomes(recs, idx_name, spot, now, candles, intraday=None):
         if past_close:
             if r["date"] in closes:
                 r["sclose"] = round(float(closes[r["date"]]), 2)
-            elif same_day:
-                r["sclose"] = round(spot, 2)
             r["resolved"] = True
             if r["first_touch"] in ("TARGET", "STOP"):
                 r["outcome"] = r["first_touch"]
-            elif r["target"] is not None:
+            elif r.get("sclose") is not None and r["target"] is not None:
                 r["outcome"] = "TIMEOUT"
+            elif r["target"] is not None:
+                r["outcome"] = "DATA_GAP"
             else:
                 r["outcome"] = "RESOLVED"
             changed = True
@@ -2528,10 +2693,10 @@ with st.sidebar:
                           help="Token and chat id are read from secrets (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID).")
     if alerts_on and not (tg_token and tg_chat):
         st.caption("Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to secrets.")
-    auto_refresh = st.toggle("AUTO REFRESH (3 MIN)", value=True)
+    auto_refresh = st.toggle("AUTO REFRESH (30 SEC)", value=True)
     force_run = st.button("FORCE AI RUN", use_container_width=True)
     if auto_refresh and st_autorefresh:
-        st_autorefresh(interval=180000, limit=None, key="bbg")
+        st_autorefresh(interval=30000, limit=None, key="bbg")
     elif auto_refresh:
         st.caption("Auto refresh needs: pip install streamlit-autorefresh")
 
@@ -2646,7 +2811,7 @@ tone_now = _tone_val if _tone_hits >= NEWS_MIN_TONE_HITS else None
 new_recs, _resolved, _touched = [], [], []
 if log_on:
     sync_scorecard(card)
-    _chg, _resolved, _touched = update_outcomes(card, idx_name, spot, now_ist, candles_pre, intraday)
+    _chg, _resolved, _touched = update_outcomes(card, idx_name, spot, now_ist, candles_pre, intraday, option_df=m["df"], current_expiry=expiry)
     if sig is not None:
         new_recs = maybe_log_signal(card, idx_name, expiry, m, sig, ai, tone_now, now_ist)
     if _chg or new_recs:
@@ -2673,7 +2838,7 @@ if alerts_on and tg_token and tg_chat:
         if _r["kind"] == "VALIDATED" or P("alert_rejected"):
             alert_results += fire_alert(f"auto_sig_{_r['id']}", signal_alert_text(_r), 24 * 60, alert_cfg)
     for _r in _touched:
-        alert_results += fire_alert(f"auto_touch_{_r['id']}", outcome_alert_text(_r), 24 * 60, alert_cfg)
+        alert_results += fire_alert(f"auto_touch_{_r['id']}_{_r.get('event_type', _r.get('outcome', 'EVENT'))}", outcome_alert_text(_r), 24 * 60, alert_cfg)
     for _r in _resolved:
         if _r.get("outcome") in ("TARGET", "STOP") and not _r.get("touch_alerted"):
             alert_results += fire_alert(f"auto_res_{_r['id']}", outcome_alert_text(_r), 24 * 60, alert_cfg)
@@ -2690,7 +2855,8 @@ if alerts_on and tg_token and tg_chat:
 st.markdown(f"## {idx_name} // SPOT {spot:,.2f}" + (f"  ({spot - prev_close:+,.2f})" if prev_close > 0 else ""))
 
 _mkt = "OPEN" if market_open_now(now_ist) else "CLOSED"
-st.caption(f"{now_ist.strftime('%a %d %b %Y %H:%M:%S')} IST | market {_mkt} | dealer gamma (assumed) {m['gex_regime']} | AI: {gate_label}")
+st.caption(f"{now_ist.strftime('%a %d %b %Y %H:%M:%S')} IST | market {_mkt} | assumption-based GEX {m['gex_regime']} | AI: {gate_label}")
+st.info("OPTION-BUYER MODE: BUY CALL / BUY PUT / WAIT only. Telegram alerts are generated on Streamlit reruns; keep the app and data connection active. Do not assume an alert is an executed trade.")
 
 if not data_ok:
     st.warning(f"DATA GATE CLOSED: {gate_reason}. Figures below may be stale or off-hours; the AI council, history snapshots "
@@ -2838,7 +3004,13 @@ with tab5:
     if "error" in ai and "signal" not in ai:
         st.warning(ai["error"])
     else:
-        st.markdown(f"**Signal:** {sig['signal']} | **AI said:** {sig['ai_signal']} | **Confidence:** {sig['confidence']}%")
+        _action_label = "BUY CALL" if sig["signal"] == "BUY" else "BUY PUT" if sig["signal"] == "SELL" else "WAIT / NO TRADE"
+        st.markdown(f"**Buyer action:** {_action_label} | **Underlying bias:** {sig['signal']} | **AI confidence:** {sig['confidence']}%")
+        _bp = sig.get("buyer_plan")
+        if _bp and sig["signal"] in ("BUY", "SELL"):
+            st.success(f"Candidate: {idx_name} { _bp['strike']:g } {_bp['option_type']} {expiry} | bid/ask ₹{_bp['bid']:.2f}/₹{_bp['ask']:.2f} | spread {_bp['spread_pct']:.1f}% | delta {_bp['delta']:+.2f} | IV {_bp['iv']:.1f}%")
+            st.write(f"**Premium plan (manual):** entry reference ≤ ₹{_bp['entry_ref']:.2f} · stop ₹{_bp['stop_premium']:.2f} · target 1 ₹{_bp['target1_premium']:.2f} · target 2 ₹{_bp['target2_premium']:.2f}")
+            st.caption(_bp['risk_note'] + " No quantity is recommended because lot size and your account-specific risk are not confirmed.")
         if sig["note"]:
             st.caption(sig["note"])
         for label, key in (("Price action", "price_action_agent"), ("Order flow", "order_flow_agent"),
@@ -2853,15 +3025,16 @@ with tab5:
             show_df(pd.DataFrame([{"Family": c["family"], "Check": c["name"], "Vote": c["v"],
                                    "Counted": c.get("counted", True), "Detail": c["detail"]} for c in sig["checks"]]),
                     hide_index=True)
-        if sig["signal"] in ("BUY", "SELL"):
-            _ks = kelly_sizing(sig, card, P("capital"), P("max_risk"))
-            if _ks:
-                k1, k2, k3 = st.columns(3)
-                k1.metric("RISK BUDGET", f"{_ks['risk_pct']:.2f}%")
-                k2.metric("CAPITAL AT RISK", f"₹{_ks['capital_at_risk']:,.0f}")
-                k3.metric("TARGET / STOP", f"{sig['target']:,.0f} / {sig['sl']:,.0f}")
-                st.caption(_ks["method"] + (f". {_ks['note']}" if _ks["note"] else "") +
-                           ". This is the amount you would lose if the index hits the stop; convert it to lots using your option's own stop.")
+        if sig["signal"] in ("BUY", "SELL") and sig.get("buyer_plan"):
+            _bp = sig["buyer_plan"]
+            _risk_budget = P("capital") * P("max_risk") / 100.0
+            _loss_unit = max(0.01, _bp["entry_ref"] - _bp["stop_premium"])
+            _max_units = max(0, int(_risk_budget // _loss_unit))
+            k1, k2, k3 = st.columns(3)
+            k1.metric("RISK BUDGET", f"₹{_risk_budget:,.0f}")
+            k2.metric("PREMIUM RISK / UNIT", f"₹{_loss_unit:.2f}")
+            k3.metric("THEORETICAL UNIT CAP", f"{_max_units:,}")
+            st.caption("Unit cap excludes lot-size rounding, fees, slippage and gaps. Verify the contract lot size and reduce size for real execution; this is not a guaranteed maximum loss.")
         with st.expander("Raw AI JSON"):
             st.json(ai)
 
@@ -2934,7 +3107,7 @@ with tab8:
 
 with tab9:
     st.markdown("#### 📈 DEALER POSITIONING & VOLATILITY SURFACE")
-    st.caption("Dealer signs assume dealers are long calls / short puts. That is unverified for NSE, so treat this as a model view, not fact.")
+    st.caption("GEX is an assumption-based proxy; option-chain OI cannot identify dealer net positioning. Do not use this alone to trigger an option buy.")
     g1, g2, g3, g4 = st.columns(4)
     g1.metric("REGIME (assumed)", m["gex_regime"])
     g2.metric("ZERO-GAMMA LEVEL", f"{m['zero_gamma']:,.0f}" if m["zero_gamma"] else "none")

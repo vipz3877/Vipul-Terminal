@@ -1,7 +1,6 @@
-streamlit
-pandas
-numpy
-requests
-groq
-streamlit-autorefresh
-websocket-client
+streamlit>=1.36,<2.0
+streamlit-autorefresh>=1.0.1
+requests>=2.31
+pandas>=2.0
+numpy>=1.26
+groq>=0.9
