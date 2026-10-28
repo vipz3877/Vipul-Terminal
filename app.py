@@ -156,7 +156,7 @@ PARAM_DEFAULTS = {
     "flow_conc_on": False, "flow_conc_min": 50,
     "max_risk": 2.0, "capital": 100000, "move_alert_pct": 2.0,
     "min_conf": 60, "exh_veto": False, "alert_rejected": False,
-    "fp_mode": "VETO AGAINST", "target_cap": 0.8,
+    "fp_mode": "REQUIRE ALIGNED", "target_cap": 0.8,
 }
 
 
@@ -1360,6 +1360,12 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
         notes.append(f"{sig} rejected: data gate closed ({gate_reason}).")
         sig = "WAIT"
 
+    # A cached verdict may be displayed for context after an AI/API failure, but it must
+    # never act as fresh risk-officer approval for a new signal.
+    if sig != "WAIT" and ai.get("_stale_fallback"):
+        notes.append("Signal rejected: AI service failed; cached AI analysis is display-only and cannot approve a new trade.")
+        sig = "WAIT"
+
     if sig != "WAIT" and _oi_coverage < 70.0:
         notes.append(f"{sig} rejected: previous-OI history coverage is only {_oi_coverage:.0f}% (need at least 70%).")
         sig = "WAIT"
@@ -1401,6 +1407,38 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
         blocked, why = FP.footprint_veto(sig, m.get("fp"), P("fp_mode"))
         if blocked:
             notes.append(f"{sig} rejected: {why}.")
+            sig = "WAIT"
+
+    # Fail closed when futures-footprint data is missing or stale. A completed 1-minute
+    # candle may naturally be 60-120 seconds old; allow a modest delivery buffer.
+    if sig != "WAIT":
+        fp = m.get("fp") or {}
+        fp_asof = fp.get("asof")
+        if not fp.get("ok") or not fp_asof:
+            notes.append(f"{sig} rejected: futures-footprint timestamp is unavailable.")
+            sig = "WAIT"
+        else:
+            try:
+                fp_age = max(0.0, time.time() - float(fp_asof))
+            except (TypeError, ValueError):
+                fp_age = float("inf")
+            if fp_age > 180:
+                notes.append(f"{sig} rejected: futures footprint is stale ({fp_age:.0f}s old; maximum 180s).")
+                sig = "WAIT"
+
+    # Directional market regime is a hard gate, not merely dashboard commentary.
+    # The descriptive regime heuristic must show a clear trend before a trade is eligible.
+    if sig != "WAIT":
+        regime_info = m.get("market_regime") or {}
+        regime = str(regime_info.get("label", "UNAVAILABLE")).upper()
+        if regime not in ("TRENDING UP", "TRENDING DOWN"):
+            notes.append(
+                f"{sig} rejected: market regime is {regime}. "
+                "Wait for a clearer directional regime; this filter is conservative and must be backtested."
+            )
+            sig = "WAIT"
+        elif (sig == "BUY" and regime != "TRENDING UP") or (sig == "SELL" and regime != "TRENDING DOWN"):
+            notes.append(f"{sig} rejected: signal direction conflicts with market regime {regime}.")
             sig = "WAIT"
 
     if sig != "WAIT":
@@ -2811,7 +2849,7 @@ def esc(x):
 # SIDEBAR
 # ============================================================
 with st.sidebar:
-    st.markdown("### BBG // BUYER TERMINAL v15.0")
+    st.markdown("### BBG // BUYER TERMINAL v15.1 HARDENED")
     dhan_token = clean(get_secret("DHAN_ACCESS_TOKEN", DEFAULT_DHAN_TOKEN))
     client_id = clean(get_secret("DHAN_CLIENT_ID", DEFAULT_CLIENT_ID))
     groq_key = get_secret("GROQ_API_KEY", DEFAULT_GROQ_KEY).strip()
@@ -2846,8 +2884,8 @@ with st.sidebar:
     r1, r2 = st.columns(2)
     r1.number_input("CAPITAL ₹", min_value=1000, value=PARAM_DEFAULTS["capital"], step=10000, key="p_capital")
     r2.number_input("MAX RISK %", min_value=0.5, max_value=5.0, value=float(PARAM_DEFAULTS["max_risk"]), step=0.5, key="p_max_risk")
-    st.selectbox("FUTURES FOOTPRINT FILTER", ["VETO AGAINST", "REQUIRE ALIGNED", "OFF"], index=0, key="p_fp_mode",
-                 help="VETO AGAINST: block a signal that trades against the index-futures flow. REQUIRE ALIGNED: also block when the flow is neutral/unavailable. OFF: advisory only.")
+    st.selectbox("FUTURES FOOTPRINT FILTER", ["VETO AGAINST", "REQUIRE ALIGNED", "OFF"], index=1, key="p_fp_mode",
+                 help="Recommended: REQUIRE ALIGNED blocks signals unless index-futures flow is aligned and available. VETO AGAINST only blocks opposing flow. OFF disables this filter.")
     st.number_input("MAX TARGET DISTANCE (daily σ)", min_value=0.2, max_value=3.0, value=float(PARAM_DEFAULTS["target_cap"]), step=0.1, key="p_target_cap",
                     help="Targets farther than this from entry are trimmed, so a distant OI wall cannot inflate R:R.")
 
@@ -2958,7 +2996,12 @@ if run_ai:
     else:
         err = ai["error"]
         cached = valid_cached_verdict(_ai_key)
-        ai = cached if cached else ai
+        if cached:
+            ai = dict(cached)
+            ai["_stale_fallback"] = True
+            ai["_fallback_error"] = str(err)[:180]
+        else:
+            ai = {"error": str(err)[:180]}
         gate_label = f"AI ERROR: {err}"
 else:
     ai = valid_cached_verdict(_ai_key) or {
