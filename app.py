@@ -1,6 +1,11 @@
 """
-VIPUL OPTIONS BUYER SIGNAL TERMINAL v15.0
-Built on v14.0. Changes in this version:
+VIPUL OPTIONS BUYER SIGNAL TERMINAL v15.1
+v15.1 adds an INSTITUTIONAL FOOTPRINT layer (needs footprint.py next to this file):
+ - Index-futures price / volume / open-interest flow + session VWAP decide whether money is really moving your way
+ - Footprint filter: VETO AGAINST (default) / REQUIRE ALIGNED / OFF; blocked signals are still logged with footprint fields
+ - Target distance capped (default 0.8 daily sigma) so far-away OI walls cannot inflate R:R
+ - Previous-day NSE participant OI (FII / DII / Pro / Client) shown as context
+Built on v14.0. Changes in v15.0:
  - Market-regime context from recent spot snapshots (advisory only, not a proven filter)
  - Manual trade lifecycle: confirm actual fill before premium stop/target monitoring; record actual exits and net P&L
  - Failed alert deliveries are persisted and retried on subsequent app reruns
@@ -44,6 +49,12 @@ import requests
 import streamlit as st
 
 try:
+    import footprint as FP
+    FP_IMPORT_ERR = ""
+except Exception as _fp_e:      # app still runs; footprint just shows as unavailable
+    FP, FP_IMPORT_ERR = None, str(_fp_e)
+
+try:
     from streamlit_autorefresh import st_autorefresh
 except ImportError:
     st_autorefresh = None
@@ -53,7 +64,7 @@ try:
 except ImportError:
     Groq = None
 
-st.set_page_config(page_title="Vipul Options Buyer Terminal v15.0", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Vipul Options Buyer Terminal v15.1", layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
 # CSS
@@ -145,6 +156,7 @@ PARAM_DEFAULTS = {
     "flow_conc_on": False, "flow_conc_min": 50,
     "max_risk": 2.0, "capital": 100000, "move_alert_pct": 2.0,
     "min_conf": 60, "exh_veto": False, "alert_rejected": False,
+    "fp_mode": "VETO AGAINST", "target_cap": 0.8,
 }
 
 
@@ -1073,6 +1085,9 @@ def evaluate_market_state_change(m, vel, nhash=""):
         return True, "GAMMA_ZONE_SHIFT"
     # NOTE: the assumed dealer-gamma regime flip is intentionally NOT an AI trigger any more
     # (its sign convention is an assumption for NSE and it flickers near zero).
+    _fpb = (m.get("fp") or {}).get("bias")
+    if _fpb in ("BULLISH", "BEARISH") and _fpb != last.get("fp_bias"):
+        return True, "FOOTPRINT_SHIFT"
     if m["status"] != last["status"]:
         return True, "ENGINE_STATUS_CHANGE"
     trap_now = (m["ce_trap"] is not None) or (m["pe_trap"] is not None)
@@ -1141,6 +1156,7 @@ MARKET DATA:
 - Spot: {m['spot']:.2f} | PCR: {m['pcr']:.3f} | Bias: {m['bias']} (score {m['score']}/100)
 - Jobber Microstructure: Ladder Imbalance={m['jobber']['ladder_imbalance']}, Pocket Support={m['jobber']['pocket_support']}, Micro-Turn={m['jobber']['micro_turn']}
 - Engine status: {m['status']} | OI battle: {m['battle']}
+{m.get('fp_text', '')}
 - Dealer positioning (ASSUMES dealers long calls / short puts, unverified for NSE): regime {m['gex_regime']} (stable across windows: {m['regime_stable']}), zero-gamma level {m['zero_gamma']}, per-strike crossover {m['crossover']}
 - Volatility surface: synthetic future {m['syn_fut']:.1f} vs fair carry forward {m['fair_fwd']:.1f} (excess {m['excess_basis']:+.1f} pts), 25d risk reversal {m['rr_25']:+.2f}, butterfly {m['bf_25']:+.2f}
 - Dual-Force flow (near-spot strikes only, % = share of that side's near-spot OI):
@@ -1168,6 +1184,7 @@ AGENTS:
 4. Sentiment Agent: judge ONLY from the LIVE HEADLINES list; name the headline(s) driving the view. If the list says NO HEADLINES FETCHED, say that instead of claiming "no news impact"
 5. Risk Officer: final approval; reject if evidence is conflicting or engine status is CONFLICTED. Begin final_approval with the single word APPROVE or REJECT, then a short reason.
 
+IMPORTANT: The futures footprint is the best available proxy for where institutional money is actually moving. Do not signal against a BULLISH or BEARISH footprint; option-chain OI is anonymous and must not override it. If the footprint is NEUTRAL or unavailable, prefer WAIT unless the other evidence is strong.
 IMPORTANT: This user only BUYS options. Signal BUY means bullish underlying -> BUY CALL; signal SELL means bearish underlying -> BUY PUT. Never recommend selling/writing options. WAIT when evidence is weak or stale.
 Return ONLY this JSON:
 {{"price_action_agent":"1 sentence","order_flow_agent":"1 sentence","volatility_agent":"1 sentence",
@@ -1380,6 +1397,12 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
             notes.append(f"Caution: {who} exhaustion {mine['flag'].lower()} ({mine['score']}/100)"
                          + ("" if P("exh_veto") else " [advisory only: exhaustion veto is off]") + ".")
 
+    if sig != "WAIT" and FP is not None:
+        blocked, why = FP.footprint_veto(sig, m.get("fp"), P("fp_mode"))
+        if blocked:
+            notes.append(f"{sig} rejected: {why}.")
+            sig = "WAIT"
+
     if sig != "WAIT":
         if res is None or sup is None:
             notes.append(f"{sig} rejected: no usable OI wall on one side of spot.")
@@ -1388,6 +1411,12 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
             target, sl = res["level"], sup["level"] - sl_buf
         else:
             target, sl = sup["level"], res["level"] + sl_buf
+        if sig != "WAIT":
+            cap = float(P("target_cap")) * daily_sigma(m)
+            if cap > 0 and abs(target - entry) > cap:
+                new_t = entry + cap if sig == "BUY" else entry - cap
+                notes.append(f"Target trimmed from {target:,.0f} to {new_t:,.0f} (more than {P('target_cap'):.1f} daily sigma away is not a realistic intraday target).")
+                target = new_t
 
     if sig != "WAIT":
         risk = abs(entry - sl)
@@ -1461,6 +1490,21 @@ def fetch_intraday_candles(scrip, seg, token, client_id):
         raise RuntimeError("empty intraday response")
     return [{"ts": _epoch(d["timestamp"][i]), "h": float(d["high"][i]), "l": float(d["low"][i]),
              "c": float(d["close"][i])} for i in range(n)]
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _fp_future(idx_name, override, day):
+    return FP.find_index_future(idx_name, override)
+
+
+@st.cache_data(ttl=25, show_spinner=False)
+def _fp_candles(sec_id, token, client_id, day):
+    return FP.fetch_future_candles(sec_id, token, client_id)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fp_participants(day):
+    return FP.fetch_participant_context()
 
 
 def compute_day_levels(candles, spot, sd, m, prev_close_fallback, today_ohlc=None):
@@ -2241,7 +2285,7 @@ def signal_alert_text(r):
         action, option = ("BUY CALL" if r.get("signal") == "BUY" else "BUY PUT"), "\nNo approved option contract; do not trade."
     return (f"{kind_label}\n{r['index']} | {action} | Underlying {r['entry']:,.2f}\n"
             f"Underlying confirmation levels: target {tgt} | invalidation/stop {sl} | R:R {rr}\n"
-            f"Regime: {r.get('market_regime', 'not classified')} (advisory)\n"
+            f"Regime: {r.get('market_regime', 'not classified')} (advisory) | Futures footprint: {r.get('fp_bias') or 'n/a'}\n"
             f"AI confidence {r['confidence']}% | Chain agreement {r['net']:+d}{option}{reason_txt}\n"
             f"{r['time']} IST. Manual execution only. Recheck quote freshness/liquidity; levels are planning estimates, not guaranteed fills.")
 
@@ -2332,6 +2376,8 @@ def classify_rejection(note):
         return "None (validated)"
     if "data gate" in n:
         return "Data gate closed"
+    if "footprint" in n:
+        return "Against futures footprint"
     if "veto" in n:
         return "AI risk officer veto"
     if "ai confidence" in n:
@@ -2353,6 +2399,16 @@ def rejection_category(r):
     return r.get("rejection_category") or classify_rejection(r.get("reason"))
 
 
+def fp_fields(m, direction):
+    fp = m.get("fp") or {}
+    ok = bool(fp.get("ok"))
+    bias = fp.get("bias") if ok else None
+    against = None if bias is None or direction not in ("BUY", "SELL") else bool(
+        (direction == "BUY" and bias == "BEARISH") or (direction == "SELL" and bias == "BULLISH"))
+    return {"fp_bias": bias, "fp_score": fp.get("score") if ok else None, "fp_quad30": fp.get("quad30") if ok else None,
+            "fp_vwap_dist": fp.get("vwap_dist") if ok else None, "fp_orb": fp.get("orb") if ok else None, "fp_against": against}
+
+
 def make_record(kind, idx_name, expiry, m, sig, ai, tone, now):
     direction = sig["signal"] if kind == "VALIDATED" else sig["ai_signal"]
     ex = m.get("exh") or {}
@@ -2372,6 +2428,7 @@ def make_record(kind, idx_name, expiry, m, sig, ai, tone, now):
         "bias": m["score"], "pcr": round(float(m["pcr"]), 3), "atm_iv": round(float(m["atm_iv"]), 2),
         "sd": round(daily_sigma(m), 1), "flow_conc": m.get("flow_conc"),
         "gex_regime": m.get("gex_regime"), "regime_stable": m.get("regime_stable"), "net_gex": m.get("net_gex"),
+        **fp_fields(m, direction),
         "zero_gamma_dist_sigma": (round((m["zero_gamma"] - m["spot"]) / daily_sigma(m), 2) if m.get("zero_gamma") else None),
         "excess_basis": m.get("excess_basis"), "rr_25": m.get("rr_25"), "rr_shift": m.get("rr_shift"), "bf_25": m.get("bf_25"),
         "rejection_category": classify_rejection(note) if kind == "REJECTED" else "None (validated)",
@@ -2622,7 +2679,7 @@ def scorecard_to_df(recs):
         row = {k: r.get(k) for k in ("id", "kind", "date", "time", "index", "expiry", "signal", "entry", "target", "sl", "rr",
                                     "confidence", "net", "lean", "status", "bias", "pcr", "atm_iv", "sd", "flow_conc", "exh_buyer",
                                     "exh_seller", "exh_own_flag", "tone", "news_score", "reason", "rejection_category", "gex_regime", "regime_stable", "zero_gamma_dist_sigma", "excess_basis", "rr_25", "rr_shift", "bf_25", "s15", "s30", "s60",
-                                    "sclose", "first_touch", "mfe", "mae", "samples", "max_gap_min", "resolved", "outcome", "touch_alerted")}
+                                    "sclose", "first_touch", "mfe", "mae", "samples", "max_gap_min", "resolved", "outcome", "touch_alerted", "fp_bias", "fp_score", "fp_quad30", "fp_vwap_dist", "fp_orb", "fp_against")}
         for nm, v in (r.get("checks") or {}).items():
             row[f"check:{nm}"] = v
         for key in ("s15", "s30", "s60", "sclose"):
@@ -2730,6 +2787,10 @@ def data_health(c):
         f"{len(c.get('candles') or [])} loaded" + (f" | {c['candle_err'][:80]}" if c.get("candle_err") else ""))
     add("Intraday 1-min candles", "OK" if c.get("intraday") else "WARN",
         f"{len(c.get('intraday') or [])} bars" + (f" | {c['intraday_err']}" if c.get("intraday_err") else " (needed for exact target/stop touches)"))
+    _fp = (m.get("fp") or {})
+    add("Futures footprint", "OK" if _fp.get("ok") else "WARN",
+        f"{_fp.get('bars', 0)} one-minute futures bars, bias {_fp.get('bias')}" if _fp.get("ok")
+        else f"unavailable: {_fp.get('why', 'not loaded')}. The filter fails open unless REQUIRE ALIGNED is selected")
     add("Snapshot history", "OK", f"{len(c.get('hist') or [])} snapshot(s) stored today")
     _ai = c.get("ai") or {}
     if "error" in _ai and "signal" not in _ai:
@@ -2785,6 +2846,10 @@ with st.sidebar:
     r1, r2 = st.columns(2)
     r1.number_input("CAPITAL ₹", min_value=1000, value=PARAM_DEFAULTS["capital"], step=10000, key="p_capital")
     r2.number_input("MAX RISK %", min_value=0.5, max_value=5.0, value=float(PARAM_DEFAULTS["max_risk"]), step=0.5, key="p_max_risk")
+    st.selectbox("FUTURES FOOTPRINT FILTER", ["VETO AGAINST", "REQUIRE ALIGNED", "OFF"], index=0, key="p_fp_mode",
+                 help="VETO AGAINST: block a signal that trades against the index-futures flow. REQUIRE ALIGNED: also block when the flow is neutral/unavailable. OFF: advisory only.")
+    st.number_input("MAX TARGET DISTANCE (daily σ)", min_value=0.2, max_value=3.0, value=float(PARAM_DEFAULTS["target_cap"]), step=0.1, key="p_target_cap",
+                    help="Targets farther than this from entry are trimmed, so a distant OI wall cannot inflate R:R.")
 
     alerts_on = st.toggle("TELEGRAM ALERTS", value=bool(tg_token and tg_chat), key="alerts_on",
                           help="Token and chat id are read from secrets (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID).")
@@ -2837,6 +2902,23 @@ m["exh"] = exhaustion(hist, m, prev_close, exh_lookback)
 m["exh_flag"] = exh_flag(m["exh"])
 m["market_regime"] = classify_market_regime(hist, m["spot"], info["step"], daily_sigma(m))
 
+m["fp"] = {"ok": False, "why": "footprint.py not loaded: " + FP_IMPORT_ERR, "bias": "UNAVAILABLE"}
+fp_pc = {"ok": False}
+if FP is not None and is_trading_day(now_ist):
+    try:
+        _day = now_ist.date().isoformat()
+        _fut = _fp_future(idx_name, get_secret(f"FUT_ID_{FP.UNDERLYING.get(idx_name, idx_name)}", "").strip(), _day)
+        _bars = _fp_candles(_fut["security_id"], dhan_token, client_id, _day)
+        m["fp"] = FP.compute_footprint(_bars, daily_sigma(m), prev_close)
+        m["fp"]["future"] = _fut
+    except Exception as _e:
+        m["fp"] = {"ok": False, "why": str(_e)[:160], "bias": "UNAVAILABLE"}
+    try:
+        fp_pc = _fp_participants(now_ist.date().isoformat())
+    except Exception:
+        fp_pc = {"ok": False}
+m["fp_text"] = FP.footprint_text(m["fp"], fp_pc) if FP is not None else "- Futures footprint: unavailable"
+
 news_items, news_status, news_stale = [], ["LIVE NEWS: off"], False
 if live_news:
     try:
@@ -2869,7 +2951,7 @@ if run_ai:
             "put_wall": m["put_wall"], "gamma_strike": m["gamma_strike"], "status": m["status"],
             "gex_regime": m.get("gex_regime"),
             "trap_active": bool(m["ce_trap"] or m["pe_trap"]),
-            "news_hash": nhash,
+            "news_hash": nhash, "fp_bias": (m.get("fp") or {}).get("bias"),
             "exh_flag": m.get("exh_flag", ""),
         }
         gate_label = f"FRESH ({'FORCED' if force_run else reason}) | {ai.get('_model', groq_model)}"
@@ -2955,7 +3037,7 @@ if alerts_on and tg_token and tg_chat:
 st.markdown(f"## {idx_name} // SPOT {spot:,.2f}" + (f"  ({spot - prev_close:+,.2f})" if prev_close > 0 else ""))
 
 _mkt = "OPEN" if market_open_now(now_ist) else "CLOSED"
-st.caption(f"{now_ist.strftime('%a %d %b %Y %H:%M:%S')} IST | market {_mkt} | regime {(m.get('market_regime') or {}).get('label', '—')} (advisory) | assumption-based GEX {m['gex_regime']} | AI: {gate_label}")
+st.caption(f"{now_ist.strftime('%a %d %b %Y %H:%M:%S')} IST | market {_mkt} | regime {(m.get('market_regime') or {}).get('label', '—')} (advisory) | futures footprint {(m.get('fp') or {}).get('bias', '—')} | assumption-based GEX {m['gex_regime']} | AI: {gate_label}")
 st.info("OPTION-BUYER MODE: BUY CALL / BUY PUT / WAIT only. Manual execution only. Premium monitoring starts only after you confirm an actual entry in Manual Trades. Alerts and monitoring are best-effort while the app refreshes; do not rely on them as your only risk control.")
 
 if not data_ok:
@@ -2971,9 +3053,9 @@ for _row in health_rows:
     _hc[_row["Status"]] += 1
 st.caption(f"DATA HEALTH: {_hc['OK']} OK · {_hc['WARN']} warn · {_hc['FAIL']} fail")
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
     "📊 Dashboard & Engine", "📐 Day Levels", "🧭 Exhaustion", "🎯 Premium Scanner",
-    "🤖 AI Council & News", "📋 Option Chain", "📒 Scorecard", "🩺 Data Health", "📈 GEX & Skew", "🧾 Manual Trades"])
+    "🤖 AI Council & News", "📋 Option Chain", "📒 Scorecard", "🩺 Data Health", "📈 GEX & Skew", "🧾 Manual Trades", "🏦 Footprint"])
 
 with tab1:
     status = m["status"]
@@ -3171,6 +3253,10 @@ with tab7:
         if _ex_rows:
             st.markdown("##### Exhaustion flag vs 60-min outcome (validate before enabling the veto)")
             show_df(group_table(_ex_rows, lambda r: r.get("exh_own_flag") or "none"), hide_index=True)
+        _fp_rows = [r for r in recs if r.get("fp_against") is not None]
+        if _fp_rows:
+            st.markdown("##### Futures footprint vs 60-min outcome (does trading against it lose?)")
+            show_df(group_table(_fp_rows, lambda r: "AGAINST footprint" if r.get("fp_against") else "WITH / neutral footprint"), hide_index=True)
         st.markdown("##### Rejection Reason Breakdown")
         show_df(rejection_breakdown_table(recs), hide_index=True)
         st.markdown("##### Recent Records")
@@ -3363,3 +3449,37 @@ with tab10:
         show_df(_closed_df, hide_index=True)
         st.metric("REALIZED NET P&L (RECORDED TRADES)", f"₹{sum(float(r.get('actual_net_pnl') or 0) for r in _closed):+,.2f}")
         st.caption("This is only as accurate as the entry, exit and fee values you record. It is not a backtest or a forecast.")
+
+
+with tab11:
+    st.markdown("#### Institutional footprint: index futures (price, volume, open interest) and session VWAP")
+    _fp = m.get("fp") or {}
+    if not _fp.get("ok"):
+        st.warning(f"Footprint unavailable: {_fp.get('why', 'unknown')}. Place footprint.py next to app.py. If the futures contract is not found "
+                   "automatically, set the secret FUT_ID_NIFTY (or FUT_ID_BANKNIFTY ...) to the current-month future's Dhan security id.")
+    else:
+        _fu = _fp.get("future") or {}
+        f1, f2, f3, f4 = st.columns(4)
+        f1.metric("FOOTPRINT BIAS", _fp["bias"], f"score {_fp['score']:+.1f} of ±4")
+        f2.metric("PRICE VS FUTURES VWAP", f"{_fp['vwap_dist']:+.2f} σ", f"VWAP {_fp['vwap']:,.1f}")
+        f3.metric("30-MIN FLOW", _fp["quad30"])
+        f4.metric("OPENING RANGE", _fp["orb"])
+        st.caption(f"Contract {_fu.get('symbol', '?')} (expiry {_fu.get('expiry', '?')}) | {_fp['bars']} one-minute bars | filter mode: {P('fp_mode')}")
+        show_df(pd.DataFrame([{"Vote": k, "Value": v} for k, v in _fp["votes"].items()]), hide_index=True)
+        _wrows = [{"Window": f"{w} min", "Price move (σ)": round(x["dp_sigma"], 3), "Futures OI change %": round(x["oi_pct"], 3),
+                   "Volume vs day avg": round(x["vol_ratio"], 2), "Reading": x["quad"]} for w, x in _fp["windows"].items()]
+        if _wrows:
+            show_df(pd.DataFrame(_wrows), hide_index=True)
+        for _f in _fp["flags"]:
+            st.warning(_f)
+    st.markdown("##### Previous-day participant positioning (NSE, end-of-day; context only, never a veto)")
+    if fp_pc.get("ok"):
+        st.write(f"As of {fp_pc['asof']}: {fp_pc['summary']}.")
+        _raw = fp_pc.get("raw") or {}
+        show_df(pd.DataFrame([{"Participant": k, "Index fut long": v["fut_long"], "Index fut short": v["fut_short"],
+                               "Index fut net": v["fut_long"] - v["fut_short"], "Call long": v["call_long"], "Call short": v["call_short"],
+                               "Put long": v["put_long"], "Put short": v["put_short"]} for k, v in _raw.items()]), hide_index=True)
+    else:
+        st.info(f"Participant OI not available ({fp_pc.get('why', 'not fetched')}). NSE may block automated downloads; the footprint filter does not depend on it.")
+    st.caption("How to read this: build-ups (price and OI move together) are fresh positions; short-covering / long-unwinding (OI falling) are exits and fade. "
+               "Institutions cannot be identified directly from public data; this is a rule-based proxy and is validated only by your scorecard.")
