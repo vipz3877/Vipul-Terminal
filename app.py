@@ -3108,7 +3108,7 @@ with tab5:
         st.markdown(f"**Buyer action:** {_action_label} | **Underlying bias:** {sig['signal']} | **AI confidence:** {sig['confidence']}%")
         _bp = sig.get("buyer_plan")
         if _bp and sig["signal"] in ("BUY", "SELL"):
-            st.success(f"Candidate: {idx_name} { _bp['strike']:g } {_bp['option_type']} {expiry} | bid/ask ₹{_bp['bid']:.2f}/₹{_bp['ask']:.2f} | spread {_bp['spread_pct']:.1f}% | delta {_bp['delta']:+.2f} | IV {_bp['iv']:.1f}%")
+            st.success(f"Candidate: {idx_name} {_bp['strike']:g} {_bp['option_type']} {expiry} | bid/ask ₹{_bp['bid']:.2f}/₹{_bp['ask']:.2f} | spread {_bp['spread_pct']:.1f}% | delta {_bp['delta']:+.2f} | IV {_bp['iv']:.1f}%")
             st.write(f"**Premium plan (manual):** entry reference ≤ ₹{_bp['entry_ref']:.2f} · stop ₹{_bp['stop_premium']:.2f} · target 1 ₹{_bp['target1_premium']:.2f} · target 2 ₹{_bp['target2_premium']:.2f}")
             st.caption(_bp['risk_note'] + " No quantity is recommended because lot size and your account-specific risk are not confirmed.")
         if sig["note"]:
