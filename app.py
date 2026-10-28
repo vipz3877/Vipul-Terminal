@@ -218,6 +218,7 @@ INDEX_MAP = {
     "NIFTY BANK": {"scrip": 25, "seg": "IDX_I", "step": 100},
     "FINNIFTY": {"scrip": 27, "seg": "IDX_I", "step": 50},
     "MIDCPNIFTY": {"scrip": 118, "seg": "IDX_I", "step": 25},
+    "SENSEX": {"scrip": 51, "seg": "IDX_I", "step": 100},  # v16: BSE index; verify id 51 on first run (see notes)
 }
 
 DIV_YIELD = 0.013
