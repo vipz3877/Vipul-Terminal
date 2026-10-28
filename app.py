@@ -1,5 +1,5 @@
 """
-VIPUL OPTIONS BUYER SIGNAL TERMINAL v15.1
+VIPUL OPTIONS BUYER SIGNAL TERMINAL v16.0 (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
 v15.1 adds an INSTITUTIONAL FOOTPRINT layer (needs footprint.py next to this file):
  - Index-futures price / volume / open-interest flow + session VWAP decide whether money is really moving your way
  - Footprint filter: VETO AGAINST (default) / REQUIRE ALIGNED / OFF; blocked signals are still logged with footprint fields
@@ -64,7 +64,7 @@ try:
 except ImportError:
     Groq = None
 
-st.set_page_config(page_title="Vipul Options Buyer Terminal v15.1", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Vipul Options Buyer Terminal v16.0", layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
 # CSS
@@ -156,7 +156,8 @@ PARAM_DEFAULTS = {
     "flow_conc_on": False, "flow_conc_min": 50,
     "max_risk": 2.0, "capital": 100000, "move_alert_pct": 2.0,
     "min_conf": 60, "exh_veto": False, "alert_rejected": False,
-    "fp_mode": "REQUIRE ALIGNED", "target_cap": 0.8,
+    "fp_mode": "VETO AGAINST", "target_cap": 0.8,
+    "engine_led": True, "regime_gate": "SOFT (block against trend)", "session_guard": True,
 }
 
 
@@ -1321,6 +1322,167 @@ def select_buyer_contract(m, direction):
     return best
 
 
+# ============================================================
+# v16 ADDITIONS: session guard, daily risk lock, IV history, realised vol, level map
+# ============================================================
+DAILY_RISK_FILE = os.path.join(DATA_DIR, "bbg_daily_risk_v16.json")
+IV_LOG_FILE = os.path.join(DATA_DIR, "bbg_iv_log_v16.json")
+
+
+def session_phase(now):
+    """(label, blocks_new_entries, note) for the current IST time. Times are a rule of thumb, not a proven edge."""
+    if not is_trading_day(now):
+        return "CLOSED (non-trading day)", True, "Market is closed today."
+    t = _mins(now)
+    if t < 9 * 60 + 15:
+        return "PRE-OPEN", True, "Market not open yet."
+    if t < 9 * 60 + 25:
+        return "OPENING 10 MIN", True, "Spreads are wide and OI data is stale in the first 10 minutes."
+    if t < 11 * 60 + 30:
+        return "MORNING TREND WINDOW", False, ""
+    if t < 13 * 60 + 30:
+        return "MIDDAY CHOP", False, "Midday often has weaker follow-through (advisory only, check your scorecard)."
+    if t < 14 * 60 + 45:
+        return "AFTERNOON", False, ""
+    if t < 15 * 60 + 5:
+        return "LATE SESSION", False, "Theta and gamma accelerate; keep holds short."
+    if t < 15 * 60 + 30:
+        return "CLOSING 25 MIN", True, "No new buyer entries this close to the bell."
+    return "CLOSED", True, "Market is closed."
+
+
+def load_daily_risk(now):
+    d = _load_json(DAILY_RISK_FILE, {}) or {}
+    today = now.date().isoformat()
+    cap = float(P("capital"))
+    max_loss = d.get("max_loss") or round(cap * float(P("max_risk")) / 100.0 * 2.0)
+    max_trades = d.get("max_trades") or 3
+    if d.get("date") != today:
+        return {"date": today, "pnl": 0.0, "trades": 0, "max_loss": max_loss, "max_trades": int(max_trades)}
+    return {"date": today, "pnl": float(d.get("pnl", 0.0)), "trades": int(d.get("trades", 0)),
+            "max_loss": max_loss, "max_trades": int(max_trades)}
+
+
+def save_daily_risk(d):
+    _save_json(DAILY_RISK_FILE, d)
+
+
+def daily_lock_status(now):
+    d = load_daily_risk(now)
+    reasons = []
+    if d["max_loss"] and d["pnl"] <= -abs(float(d["max_loss"])):
+        reasons.append(f"daily loss limit reached (P&L {d['pnl']:+,.0f} vs limit -{abs(float(d['max_loss'])):,.0f})")
+    if d["max_trades"] and d["trades"] >= d["max_trades"]:
+        reasons.append(f"max trades per day reached ({d['trades']}/{d['max_trades']})")
+    return bool(reasons), "; ".join(reasons), d
+
+
+def log_iv_and_percentile(idx_name, atm_iv, now, record):
+    """Append an ATM IV sample at most every 5 minutes during market hours; return percentile vs the last 30 days.
+    Caveat: samples mix different expiries' ATM IV, so treat the percentile as a rough guide until you have weeks of data."""
+    try:
+        d = _load_json(IV_LOG_FILE, {}) or {}
+        rows = d.get(idx_name, [])
+        ts = time.time()
+        if record and market_open_now(now) and atm_iv and atm_iv > 0 and (not rows or ts - rows[-1][0] >= 300):
+            rows.append([round(ts), round(float(atm_iv), 2)])
+            rows = rows[-4000:]
+            d[idx_name] = rows
+            _save_json(IV_LOG_FILE, d)
+        cutoff = ts - 30 * 86400
+        vals = [iv for t, iv in rows if t >= cutoff]
+        if len(vals) < 30:
+            return {"pct": None, "n": len(vals)}
+        pct = sum(1 for v in vals if v <= atm_iv) / len(vals) * 100.0
+        return {"pct": int(round(pct)), "n": len(vals)}
+    except Exception:
+        return {"pct": None, "n": 0}
+
+
+def realized_vol(candles, today_iso, n=10):
+    """Annualised close-to-close realised volatility (%) over the last n completed daily candles."""
+    closes = [c["c"] for c in (candles or []) if c.get("date", "") < today_iso and c.get("c", 0) > 0][-(n + 1):]
+    if len(closes) < 6:
+        return None
+    rets = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes))]
+    mean = sum(rets) / len(rets)
+    var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+    return math.sqrt(var) * math.sqrt(252.0) * 100.0
+
+
+def level_map(m, candles, today_iso):
+    """Fuse the levels the terminal already computes into confluence zones. These are places where price
+    is likely to react, not predictions."""
+    spot, step = m["spot"], m["step"]
+    pts = []  # (price, source, weight)
+
+    def add(price, src, w):
+        try:
+            p = float(price)
+        except (TypeError, ValueError):
+            return
+        if p > 0 and abs(p - spot) <= spot * 0.05:
+            pts.append((p, src, w))
+
+    add(m.get("call_wall"), "Call OI wall", 2)
+    add(m.get("put_wall"), "Put OI wall", 2)
+    add(m.get("max_pain"), "Max pain", 1)
+    add(m.get("gamma_strike"), "Max gamma strike", 1)
+    zg = m.get("zero_gamma")
+    if zg is not None and pd.notna(zg) and float(zg) != 0.0:
+        add(zg, "Gamma flip", 2)
+    add(m.get("upper_1sigma"), "+1σ (to expiry)", 1)
+    add(m.get("lower_1sigma"), "-1σ (to expiry)", 1)
+    fp = m.get("fp") or {}
+    if fp.get("ok") and fp.get("vwap"):
+        add(fp["vwap"], "Futures VWAP", 1)
+    prior = [c for c in (candles or []) if c.get("date", "") < today_iso]
+    if prior:
+        pd_ = prior[-1]
+        add(pd_["h"], "Prev day high", 1)
+        add(pd_["l"], "Prev day low", 1)
+        add(pd_["c"], "Prev day close", 1)
+    try:
+        rn = round_number_levels(m["df"], spot, step, 3)
+        if rn is not None and len(rn):
+            for lv in rn["Level"].tolist():
+                add(lv, "Round-number strike", 1)
+    except Exception:
+        pass
+
+    if not pts:
+        return pd.DataFrame()
+    tol = max(step * 0.5, spot * 0.001)
+    pts.sort(key=lambda x: x[0])
+    clusters, cur = [], [pts[0]]
+    for p in pts[1:]:
+        if p[0] - cur[-1][0] <= tol and p[0] - cur[0][0] <= 2 * tol:
+            cur.append(p)
+        else:
+            clusters.append(cur)
+            cur = [p]
+    clusters.append(cur)
+
+    sd = daily_sigma(m) if callable(globals().get("daily_sigma")) else 0.0
+    rows = []
+    for c in clusters:
+        prices = [x[0] for x in c]
+        centre = sum(prices) / len(prices)
+        score = sum(x[2] for x in c)
+        srcs = sorted({x[1] for x in c})
+        dist = centre - spot
+        side = "AT SPOT" if abs(dist) <= tol else ("RESISTANCE (above)" if dist > 0 else "SUPPORT (below)")
+        rows.append({
+            "Zone": round(centre), "Low": round(min(prices)), "High": round(max(prices)), "Score": score,
+            "Strength": "STRONG" if score >= 5 else "MODERATE" if score >= 3 else "MINOR",
+            "Side": side, "Dist pts": round(dist), "Dist σ": round(abs(dist) / sd, 2) if sd else None,
+            "Sources": ", ".join(srcs),
+        })
+    out = pd.DataFrame(rows)
+    out["_a"] = out["Dist pts"].abs()
+    return out.sort_values("_a").drop(columns="_a").reset_index(drop=True)
+
+
 def build_signal(m, ai, data_ok=True, gate_reason=""):
     ai_sig = str(ai.get("signal", "WAIT")).upper()
     if ai_sig not in ("BUY", "SELL", "WAIT"):
@@ -1354,7 +1516,21 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
     res, sup = m["struct"]["res"], m["struct"]["sup"]
     notes = []
     sl_buf = SL_BUFFER * m["step"] / 50.0
-    sig, target, sl, rr = ai_sig, None, None, None
+    engine_led = bool(P("engine_led"))
+    if engine_led:
+        # v16: the numeric chain engine decides direction; the AI council is advisory only.
+        direction = 1 if lean >= min_confirm else -1 if lean <= -min_confirm else 0
+        net = lean * direction
+        sig = {1: "BUY", -1: "SELL", 0: "WAIT"}[direction]
+        if sig == "WAIT":
+            notes.append(f"Engine-led: option-chain agreement {lean:+d} is inside ±{min_confirm}, so there is no direction yet.")
+        elif ai_sig in ("BUY", "SELL") and ai_sig != sig:
+            notes.append(f"Advisory: AI council says {ai_sig} but the chain engine says {sig}.")
+        elif ai_sig == "WAIT" and ai.get("error") is None:
+            notes.append("Advisory: AI council says WAIT.")
+    else:
+        sig = ai_sig
+    target, sl, rr = None, None, None
 
     if sig != "WAIT" and not data_ok:
         notes.append(f"{sig} rejected: data gate closed ({gate_reason}).")
@@ -1362,7 +1538,7 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
 
     # A cached verdict may be displayed for context after an AI/API failure, but it must
     # never act as fresh risk-officer approval for a new signal.
-    if sig != "WAIT" and ai.get("_stale_fallback"):
+    if sig != "WAIT" and not engine_led and ai.get("_stale_fallback"):
         notes.append("Signal rejected: AI service failed; cached AI analysis is display-only and cannot approve a new trade.")
         sig = "WAIT"
 
@@ -1370,7 +1546,7 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
         notes.append(f"{sig} rejected: previous-OI history coverage is only {_oi_coverage:.0f}% (need at least 70%).")
         sig = "WAIT"
 
-    if sig != "WAIT":
+    if sig != "WAIT" and not engine_led:
         fa_raw = str(ai.get("final_approval", "")).strip()
         fa = fa_raw.upper()
         # Fail closed: blank, malformed, or anything other than an explicit APPROVE is rejected.
@@ -1378,7 +1554,7 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
             notes.append(f"{sig} rejected: risk officer did not provide an explicit APPROVE ({fa_raw[:80] or 'missing approval'}).")
             sig = "WAIT"
 
-    if sig != "WAIT" and conf < min_conf:
+    if sig != "WAIT" and not engine_led and conf < min_conf:
         notes.append(f"{sig} rejected: AI confidence {conf}% is below the required {min_conf}%.")
         sig = "WAIT"
 
@@ -1411,7 +1587,10 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
 
     # Fail closed when futures-footprint data is missing or stale. A completed 1-minute
     # candle may naturally be 60-120 seconds old; allow a modest delivery buffer.
-    if sig != "WAIT":
+    if sig != "WAIT" and P("fp_mode") != "REQUIRE ALIGNED":
+        if not (m.get("fp") or {}).get("ok"):
+            notes.append("Caution: futures footprint is unavailable, so the footprint filter could not check this signal (filter mode is not REQUIRE ALIGNED).")
+    if sig != "WAIT" and P("fp_mode") == "REQUIRE ALIGNED":
         fp = m.get("fp") or {}
         fp_asof = fp.get("asof")
         if not fp.get("ok") or not fp_asof:
@@ -1426,20 +1605,47 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
                 notes.append(f"{sig} rejected: futures footprint is stale ({fp_age:.0f}s old; maximum 180s).")
                 sig = "WAIT"
 
-    # Directional market regime is a hard gate, not merely dashboard commentary.
-    # The descriptive regime heuristic must show a clear trend before a trade is eligible.
+    # Regime gate (v16: three modes). STRICT = original behaviour, SOFT = only block against a clear trend, OFF = advisory.
     if sig != "WAIT":
         regime_info = m.get("market_regime") or {}
         regime = str(regime_info.get("label", "UNAVAILABLE")).upper()
-        if regime not in ("TRENDING UP", "TRENDING DOWN"):
-            notes.append(
-                f"{sig} rejected: market regime is {regime}. "
-                "Wait for a clearer directional regime; this filter is conservative and must be backtested."
-            )
+        mode = str(P("regime_gate"))
+        against = (sig == "BUY" and regime == "TRENDING DOWN") or (sig == "SELL" and regime == "TRENDING UP")
+        if mode.startswith("STRICT"):
+            if regime not in ("TRENDING UP", "TRENDING DOWN"):
+                notes.append(f"{sig} rejected: market regime is {regime}. Wait for a clearer directional regime (STRICT regime gate).")
+                sig = "WAIT"
+            elif against or (sig == "BUY" and regime != "TRENDING UP") or (sig == "SELL" and regime != "TRENDING DOWN"):
+                notes.append(f"{sig} rejected: signal direction conflicts with market regime {regime}.")
+                sig = "WAIT"
+        elif mode.startswith("SOFT"):
+            if against:
+                notes.append(f"{sig} rejected: it fights a clear trend (regime {regime}).")
+                sig = "WAIT"
+            elif regime not in ("TRENDING UP", "TRENDING DOWN"):
+                notes.append(f"Caution: regime is {regime}, not a clear trend; expect chop and keep size small.")
+        elif against:
+            notes.append(f"Caution: signal fights the market regime {regime} (regime gate is OFF).")
+
+    # v16: session guard and daily risk lock (new entries only)
+    if sig != "WAIT" and P("session_guard"):
+        _lbl, _blk, _why = session_phase(datetime.now(IST))
+        if _blk:
+            notes.append(f"{sig} rejected: session guard ({_lbl}). {_why}")
             sig = "WAIT"
-        elif (sig == "BUY" and regime != "TRENDING UP") or (sig == "SELL" and regime != "TRENDING DOWN"):
-            notes.append(f"{sig} rejected: signal direction conflicts with market regime {regime}.")
+        elif _why:
+            notes.append(f"Caution: {_lbl}. {_why}")
+    if sig != "WAIT":
+        _lk, _lk_why, _ = daily_lock_status(datetime.now(IST))
+        if _lk:
+            notes.append(f"{sig} rejected: daily risk lock ({_lk_why}).")
             sig = "WAIT"
+    if sig != "WAIT":
+        if m.get("dte") == 0:
+            notes.append("Caution: expiry day. Gamma and theta are extreme; size down and keep holds short.")
+        _ivp = (m.get("iv_pct") or {}).get("pct")
+        if _ivp is not None and _ivp >= 85:
+            notes.append(f"Caution: ATM IV is at the {_ivp}th percentile of the last 30 days, so buying options is expensive.")
 
     if sig != "WAIT":
         if res is None or sup is None:
@@ -2884,8 +3090,13 @@ with st.sidebar:
     r1, r2 = st.columns(2)
     r1.number_input("CAPITAL ₹", min_value=1000, value=PARAM_DEFAULTS["capital"], step=10000, key="p_capital")
     r2.number_input("MAX RISK %", min_value=0.5, max_value=5.0, value=float(PARAM_DEFAULTS["max_risk"]), step=0.5, key="p_max_risk")
-    st.selectbox("FUTURES FOOTPRINT FILTER", ["VETO AGAINST", "REQUIRE ALIGNED", "OFF"], index=1, key="p_fp_mode",
-                 help="Recommended: REQUIRE ALIGNED blocks signals unless index-futures flow is aligned and available. VETO AGAINST only blocks opposing flow. OFF disables this filter.")
+    st.selectbox("FUTURES FOOTPRINT FILTER", ["VETO AGAINST", "REQUIRE ALIGNED", "OFF"], index=0, key="p_fp_mode",
+                 help="VETO AGAINST (v16 default) only blocks opposing futures flow and does not fail if footprint data is missing. REQUIRE ALIGNED blocks signals unless futures flow is aligned and available (the old v15 default). OFF disables the filter.")
+    st.toggle("ENGINE-LED SIGNALS (AI advisory only)", value=bool(PARAM_DEFAULTS["engine_led"]), key="p_engine_led",
+              help="ON (v16): direction comes from the option-chain engine and the AI council only comments. OFF: original v15 behaviour where the AI must say BUY/SELL and approve.")
+    st.selectbox("REGIME GATE", ["SOFT (block against trend)", "STRICT (trend only)", "OFF"], index=0, key="p_regime_gate",
+                 help="STRICT is the old v15 rule (needs a clear trend). SOFT only blocks trades that fight a clear trend. OFF is advisory.")
+    st.toggle("SESSION GUARD (no entries first 10 min / last 25 min)", value=bool(PARAM_DEFAULTS["session_guard"]), key="p_session_guard")
     st.number_input("MAX TARGET DISTANCE (daily σ)", min_value=0.2, max_value=3.0, value=float(PARAM_DEFAULTS["target_cap"]), step=0.1, key="p_target_cap",
                     help="Targets farther than this from entry are trimmed, so a distant OI wall cannot inflate R:R.")
 
@@ -2939,6 +3150,7 @@ m["rr_shift"] = round(m["rr_25"] - _rr0, 2) if _rr0 is not None else 0.0
 m["exh"] = exhaustion(hist, m, prev_close, exh_lookback)
 m["exh_flag"] = exh_flag(m["exh"])
 m["market_regime"] = classify_market_regime(hist, m["spot"], info["step"], daily_sigma(m))
+m["iv_pct"] = log_iv_and_percentile(idx_name, m["atm_iv"], now_ist, data_ok)
 
 m["fp"] = {"ok": False, "why": "footprint.py not loaded: " + FP_IMPORT_ERR, "bias": "UNAVAILABLE"}
 fp_pc = {"ok": False}
@@ -3011,7 +3223,7 @@ else:
     gate_label = (f"PAUSED ({gate_reason})" if not data_ok else f"CACHED {t.strftime('%H:%M:%S') if t else ''}")
 
 ai_ok = not ("error" in ai and "signal" not in ai)
-sig = build_signal(m, ai, data_ok, gate_reason) if ai_ok else None
+sig = build_signal(m, ai, data_ok, gate_reason) if (ai_ok or P("engine_led")) else None
 scan, smeta = premium_scanner(m, horizon_days, iv_shock, skew=use_skew)
 
 try:
@@ -3096,8 +3308,8 @@ for _row in health_rows:
     _hc[_row["Status"]] += 1
 st.caption(f"DATA HEALTH: {_hc['OK']} OK · {_hc['WARN']} warn · {_hc['FAIL']} fail")
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
-    "📊 Dashboard & Engine", "📐 Day Levels", "🧭 Exhaustion", "🎯 Premium Scanner",
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
+    "🛡️ Trade Desk", "📊 Dashboard & Engine", "📐 Day Levels", "🧭 Exhaustion", "🎯 Premium Scanner",
     "🤖 AI Council & News", "📋 Option Chain", "📒 Scorecard", "🩺 Data Health", "📈 GEX & Skew", "🧾 Manual Trades", "🏦 Footprint"])
 
 with tab1:
@@ -3526,3 +3738,142 @@ with tab11:
         st.info(f"Participant OI not available ({fp_pc.get('why', 'not fetched')}). NSE may block automated downloads; the footprint filter does not depend on it.")
     st.caption("How to read this: build-ups (price and OI move together) are fresh positions; short-covering / long-unwinding (OI falling) are exits and fade. "
                "Institutions cannot be identified directly from public data; this is a rule-based proxy and is validated only by your scorecard.")
+
+
+# ============================================================
+# v16 TRADE DESK TAB
+# ============================================================
+with tab0:
+    st.markdown("#### 🛡️ TRADE DESK: where is the battlefield, what regime is this, and is buying options worth it right now")
+    st.caption("Levels are likely reaction zones, not predictions. Everything here is advisory and unproven until your scorecard says otherwise.")
+
+    _phase, _blocks, _pnote = session_phase(now_ist)
+    _locked, _lock_why, _risk = daily_lock_status(now_ist)
+    _today_iso = now_ist.date().isoformat()
+    _rv = realized_vol(candles_pre, _today_iso, 10)
+    _ivp = m.get("iv_pct") or {"pct": None, "n": 0}
+    _sd_pts = daily_sigma(m)
+    _atm_i = (m["df"]["Strike"] - spot).abs().idxmin()
+    _straddle = float(m["df"].loc[_atm_i, "CE_LTP"]) + float(m["df"].loc[_atm_i, "PE_LTP"])
+    _lv = level_map(m, candles_pre, _today_iso)
+
+    if _locked:
+        st.error(f"DAILY RISK LOCK ACTIVE: {_lock_why}. New signals are blocked. Stop trading for today.")
+    elif _blocks:
+        st.warning(f"SESSION GUARD: {_phase}. {_pnote}")
+
+    # ---- 1. Signal + contract plan
+    _s = sig
+    if _s is None:
+        st.info("No signal object (AI errored and engine-led mode is off).")
+    else:
+        _col = "#00e676" if _s["signal"] == "BUY" else "#ff1744" if _s["signal"] == "SELL" else "#ffab00"
+        _lead = "ENGINE-LED" if P("engine_led") else "AI-LED"
+        st.markdown(f"<div style='border:2px solid {_col};border-radius:6px;padding:10px 14px;'>"
+                    f"<span style='font-size:1.4rem;color:{_col};font-weight:700;'>{esc(_s['signal'])}</span> "
+                    f"&nbsp; <span style='color:#aaa;'>{_lead} | chain agreement {_s['lean']:+d} | AI says {esc(_s['ai_signal'])} ({_s['confidence']}%)</span></div>",
+                    unsafe_allow_html=True)
+        if _s.get("note"):
+            st.caption(_s["note"])
+        _bp = _s.get("buyer_plan")
+        if _bp:
+            b1, b2, b3, b4 = st.columns(4)
+            b1.metric("CONTRACT", f"{int(_bp['strike'])} {_bp['option_type']}", f"delta {_bp['delta']:+.2f}", delta_color="off")
+            b2.metric("ENTRY REF (ask)", f"{_bp['entry_ref']:,.2f}", f"spread {_bp['spread_pct']:.1f}%", delta_color="off")
+            b3.metric("STOP (premium)", f"{_bp['stop_premium']:,.2f}")
+            b4.metric("TARGETS", f"{_bp['target1_premium']:,.2f} / {_bp['target2_premium']:,.2f}")
+
+    # ---- 2. Session and regime
+    st.markdown("##### Session and regime")
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("SESSION", _phase)
+    r2.metric("DAYS TO EXPIRY", f"{m['dte']}", "EXPIRY DAY: size down" if m["dte"] == 0 else None, delta_color="off")
+    r3.metric("MARKET REGIME", (m.get("market_regime") or {}).get("label", "—"))
+    r4.metric("DEALER GAMMA (assumed)", m["gex_regime"])
+
+    # ---- 3. Is it worth buying options now?
+    st.markdown("##### Option price check (is buying expensive right now?)")
+    v1, v2, v3, v4 = st.columns(4)
+    v1.metric("ATM IV", f"{m['atm_iv']:.1f}%",
+              f"{_ivp['pct']}th pct of last 30d ({_ivp['n']} samples)" if _ivp["pct"] is not None
+              else f"percentile building ({_ivp['n']}/30 samples)", delta_color="off")
+    v2.metric("REALISED VOL (10d)", f"{_rv:.1f}%" if _rv else "n/a",
+              f"IV minus RV {m['atm_iv'] - _rv:+.1f} pts" if _rv else None, delta_color="off")
+    v3.metric("ATM STRADDLE", f"{_straddle:,.0f}", f"expected daily move ±{_sd_pts:,.0f} pts", delta_color="off")
+    v4.metric("EXPECTED MOVE TO EXPIRY (±)", f"{m['exp_move']:,.0f}", f"{m['lower_1sigma']:,.0f} to {m['upper_1sigma']:,.0f}", delta_color="off")
+    st.caption("When IV is well above recent realised volatility, buyers need a bigger move than the market has recently delivered just to break even. "
+               "The percentile is built from samples this app records while it is open, so it needs weeks to become meaningful; keep BBG_DATA_DIR on a persistent disk.")
+
+    # ---- 4. Level map
+    st.markdown("##### Level map (confluence zones)")
+    if _lv.empty:
+        st.info("No levels available yet.")
+    else:
+        _above = _lv[_lv["Dist pts"] > 0].head(4)
+        _below = _lv[_lv["Dist pts"] <= 0].head(4)
+        show_df(pd.concat([_above.sort_values("Dist pts", ascending=False), _below]), hide_index=True)
+        st.caption("Score adds up how many independent sources meet in a zone (OI walls and gamma flip count double). STRONG = 5 or more. "
+                   "Use zones to judge room to run before your target and where price may stall or reverse; wait for rejection or acceptance before acting.")
+
+    # ---- 5. Daily risk lock
+    st.markdown("##### Daily risk lock")
+    k1, k2, k3, k4 = st.columns(4)
+    _pnl_in = k1.number_input("REALISED P&L TODAY ₹", value=float(_risk["pnl"]), step=500.0, key="dr_pnl")
+    _tr_in = k2.number_input("TRADES TAKEN TODAY", min_value=0, value=int(_risk["trades"]), step=1, key="dr_trades")
+    _ml_in = k3.number_input("DAILY MAX LOSS ₹", min_value=0.0, value=float(_risk["max_loss"]), step=500.0, key="dr_maxloss")
+    _mt_in = k4.number_input("MAX TRADES / DAY", min_value=1, value=int(_risk["max_trades"]), step=1, key="dr_maxtrades")
+    if st.button("SAVE DAILY RISK", key="dr_save"):
+        save_daily_risk({"date": _today_iso, "pnl": float(_pnl_in), "trades": int(_tr_in),
+                         "max_loss": float(_ml_in), "max_trades": int(_mt_in)})
+        st.success("Saved. The lock applies to new signals on the next refresh.")
+    st.caption("Defaults: max loss = 2 x your per-trade risk, 3 trades a day. The lock only blocks new signals here; it cannot stop orders you place elsewhere.")
+
+    # ---- 6. Pre-trade checklist
+    st.markdown("##### Pre-trade checklist")
+    _rows = []
+
+    def _chk(name, status, detail):
+        _rows.append({"Check": name, "Status": status, "Detail": detail})
+
+    _chk("Data gate", "PASS" if data_ok else "FAIL", "open" if data_ok else gate_reason)
+    _chk("Signal", "PASS" if (_s and _s["signal"] != "WAIT") else "FAIL",
+         _s["signal"] if _s else "none")
+    _chk("Session", "FAIL" if _blocks else ("WARN" if _pnote else "PASS"), f"{_phase}. {_pnote}".strip())
+    _chk("Daily risk lock", "FAIL" if _locked else "PASS", _lock_why or "within limits")
+    _fpd = m.get("fp") or {}
+    _chk("Futures footprint", "PASS" if _fpd.get("ok") else "WARN",
+         f"bias {_fpd.get('bias')}" if _fpd.get("ok") else f"unavailable ({str(_fpd.get('why', ''))[:70]})")
+    _bp2 = _s.get("buyer_plan") if _s else None
+    _chk("Contract liquidity", "PASS" if _bp2 else "FAIL",
+         f"spread {_bp2['spread_pct']:.1f}%, volume {_bp2['volume']:,}" if _bp2 else "no contract passed spread/volume/delta filters")
+    if _ivp["pct"] is None:
+        _chk("IV level", "WARN", f"history still building ({_ivp['n']}/30 samples)")
+    else:
+        _chk("IV level", "WARN" if _ivp["pct"] >= 85 else "PASS", f"{_ivp['pct']}th percentile of the last 30 days")
+    if _rv:
+        _gap = m["atm_iv"] - _rv
+        _chk("IV vs realised vol", "WARN" if _gap > 5 else "PASS", f"IV is {_gap:+.1f} pts vs 10-day realised")
+    _chk("Expiry day", "WARN" if m["dte"] == 0 else "PASS",
+         "gamma and theta are extreme: size down, keep it short" if m["dte"] == 0 else f"{m['dte']} days to expiry")
+    if _s and _s["signal"] in ("BUY", "SELL") and not _lv.empty and _sd_pts:
+        _want_up = _s["signal"] == "BUY"
+        _blk = _lv[(_lv["Dist pts"] > 0) & (_lv["Strength"] == "STRONG")] if _want_up else _lv[(_lv["Dist pts"] < 0) & (_lv["Strength"] == "STRONG")]
+        _blk = _blk[_blk["Dist σ"].fillna(9) <= 0.25]
+        _chk("Room to run", "WARN" if len(_blk) else "PASS",
+             (f"STRONG zone {int(_blk.iloc[0]['Zone'])} within 0.25 σ in your direction" if len(_blk) else "no STRONG zone within 0.25 σ ahead"))
+    _event = st.checkbox("A major event is scheduled today (RBI / Fed / Budget / results)", key="td_event")
+    _chk("Event risk", "WARN" if _event else "PASS", "expect IV crush and gaps" if _event else "none flagged by you")
+    show_df(pd.DataFrame(_rows), hide_index=True)
+
+    _m1 = st.checkbox("I know my exit (stop premium AND a time stop) before I enter", key="td_exit")
+    _m2 = st.checkbox("Position size keeps my loss within my max risk", key="td_size")
+    _fails = [r for r in _rows if r["Status"] == "FAIL"]
+    _warns = [r for r in _rows if r["Status"] == "WARN"]
+    if _fails:
+        st.error("NO-GO: " + ", ".join(r["Check"] for r in _fails))
+    elif not (_m1 and _m2):
+        st.warning("Tick both confirmations above before entering.")
+    elif _warns:
+        st.warning("CAUTION: " + ", ".join(r["Check"] for r in _warns) + ". Entry is your call; consider smaller size.")
+    else:
+        st.success("GO: all checks pass. Execute manually and respect your stop.")
