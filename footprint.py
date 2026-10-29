@@ -10,6 +10,10 @@ WHY THIS EXISTS
 
   It is a rule-based FILTER, not a prediction. Every threshold is a plain constant below, and the app
   logs the footprint fields on each signal so the scorecard / backtest_footprint.py can test it.
+
+  v16: SENSEX support. Sensex futures trade on BSE (segment BSE_FNO), so the exchange and segment now
+  come from EXCHANGES below. BSE index futures are usually much thinner than NSE's, so treat the
+  Sensex footprint as weaker evidence than Nifty's.
 """
 import io
 import math
@@ -24,7 +28,10 @@ import requests
 IST = timezone(timedelta(hours=5, minutes=30))
 BASE_URL = "https://api.dhan.co/v2"
 SCRIP_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
-UNDERLYING = {"NIFTY 50": "NIFTY", "NIFTY BANK": "BANKNIFTY", "FINNIFTY": "FINNIFTY", "MIDCPNIFTY": "MIDCPNIFTY"}
+UNDERLYING = {"NIFTY 50": "NIFTY", "NIFTY BANK": "BANKNIFTY", "FINNIFTY": "FINNIFTY", "MIDCPNIFTY": "MIDCPNIFTY",
+              "SENSEX": "SENSEX"}
+# (exchange id in the scrip master, Dhan exchange segment). Anything not listed is NSE.
+EXCHANGES = {"SENSEX": ("BSE", "BSE_FNO")}
 
 # ---- tunable constants (all in daily-sigma units so they scale across indices) -----------------
 VWAP_BAND_SIGMA = 0.08      # price must be this far from futures VWAP to count as "above/below"
@@ -38,6 +45,12 @@ ROLL_DAYS = 2               # inside this many days to expiry, use the next-mont
 MODES = ("OFF", "VETO AGAINST", "REQUIRE ALIGNED")
 
 
+def exchange_for(idx_name):
+    """(scrip-master exchange id, Dhan segment) for an index name as used by the app."""
+    name = UNDERLYING.get(idx_name, idx_name)
+    return EXCHANGES.get(name, ("NSE", "NSE_FNO"))
+
+
 # =====================================================================================
 # DATA: index future lookup + candles with OI (Dhan)
 # =====================================================================================
@@ -48,6 +61,7 @@ def _headers(token, client_id):
 def pick_index_future(master_df, idx_name, today=None):
     """Choose the liquid index-future contract from the Dhan scrip master (pure function, testable)."""
     name = UNDERLYING.get(idx_name, idx_name)
+    exch, segment = exchange_for(idx_name)
     today = today or datetime.now(IST).date()
     d = master_df.copy()
     d.columns = [str(c).strip().upper() for c in d.columns]
@@ -56,22 +70,24 @@ def pick_index_future(master_df, idx_name, today=None):
     c_sym, c_exp, c_id = col("TRADING", "SYMBOL"), col("EXPIRY", "DATE"), col("SECURITY", "ID")
     if not all((c_exch, c_inst, c_sym, c_exp, c_id)):
         raise RuntimeError("scrip master columns not recognised")
-    d = d[(d[c_exch].astype(str).str.upper() == "NSE") & (d[c_inst].astype(str).str.upper() == "FUTIDX")]
+    d = d[(d[c_exch].astype(str).str.upper() == exch) & (d[c_inst].astype(str).str.upper() == "FUTIDX")]
     d = d[d[c_sym].astype(str).str.upper().str.match(rf"^{re.escape(name)}-.*FUT$")]
     d = d.assign(_exp=pd.to_datetime(d[c_exp], errors="coerce").dt.date).dropna(subset=["_exp"])
     d = d[d["_exp"] >= today].sort_values("_exp")
     if d.empty:
-        raise RuntimeError(f"no live {name} index future found in scrip master")
+        raise RuntimeError(f"no live {name} index future found in scrip master ({exch})")
     row = d.iloc[0]
     if (row["_exp"] - today).days <= ROLL_DAYS and len(d) > 1:
         row = d.iloc[1]
-    return {"security_id": str(int(float(row[c_id]))), "symbol": str(row[c_sym]), "expiry": row["_exp"].isoformat()}
+    return {"security_id": str(int(float(row[c_id]))), "symbol": str(row[c_sym]), "expiry": row["_exp"].isoformat(),
+            "segment": segment}
 
 
 def find_index_future(idx_name, override_id="", timeout=40):
     """Resolve the future's security id. `override_id` (secret FUT_ID_<INDEX>) wins when provided."""
     if override_id:
-        return {"security_id": str(override_id).strip(), "symbol": "override", "expiry": ""}
+        return {"security_id": str(override_id).strip(), "symbol": "override", "expiry": "",
+                "segment": exchange_for(idx_name)[1]}
     r = requests.get(SCRIP_MASTER_URL, timeout=timeout)
     r.raise_for_status()
     return pick_index_future(pd.read_csv(io.StringIO(r.text), low_memory=False), idx_name)
@@ -92,9 +108,9 @@ def parse_candles(d):
     return df.sort_values("ts").reset_index(drop=True)
 
 
-def fetch_future_candles(sec_id, token, client_id, day=None, interval=1, timeout=15):
+def fetch_future_candles(sec_id, token, client_id, day=None, interval=1, timeout=15, segment="NSE_FNO"):
     day = (day or datetime.now(IST).date()).isoformat()
-    body = {"securityId": str(sec_id), "exchangeSegment": "NSE_FNO", "instrument": "FUTIDX", "interval": str(interval),
+    body = {"securityId": str(sec_id), "exchangeSegment": segment, "instrument": "FUTIDX", "interval": str(interval),
             "oi": True, "fromDate": f"{day} 09:15:00", "toDate": f"{day} 15:30:00"}
     r = requests.post(f"{BASE_URL}/charts/intraday", headers=_headers(token, client_id), json=body, timeout=timeout)
     if not r.ok:
@@ -307,12 +323,23 @@ if __name__ == "__main__":      # offline self-test on synthetic data
     print("veto SELL vs bullish:", footprint_veto("SELL", fp, "VETO AGAINST"))
     print("neutral REQUIRE:", footprint_veto("BUY", {"ok": True, "bias": "NEUTRAL", "score": 0.5, "quad30": "x", "vwap_dist": 0}, "REQUIRE ALIGNED"))
     print("unavailable VETO (fail-open):", footprint_veto("BUY", None, "VETO AGAINST"))
-    master = pd.DataFrame({"SEM_EXM_EXCH_ID": ["NSE"] * 4, "SEM_INSTRUMENT_NAME": ["FUTIDX"] * 4,
-                           "SEM_TRADING_SYMBOL": ["NIFTY-Oct2026-FUT", "NIFTY-Nov2026-FUT", "BANKNIFTY-Oct2026-FUT", "NIFTY-Dec2026-FUT"],
-                           "SEM_EXPIRY_DATE": ["2026-10-27 14:30:00", "2026-11-24 14:30:00", "2026-10-27 14:30:00", "2026-12-29 14:30:00"],
-                           "SEM_SMST_SECURITY_ID": [111, 222, 333, 444]})
+    master = pd.DataFrame({"SEM_EXM_EXCH_ID": ["NSE"] * 4 + ["BSE"] * 4,
+                           "SEM_INSTRUMENT_NAME": ["FUTIDX"] * 8,
+                           "SEM_TRADING_SYMBOL": ["NIFTY-Oct2026-FUT", "NIFTY-Nov2026-FUT", "BANKNIFTY-Oct2026-FUT", "NIFTY-Dec2026-FUT",
+                                                  "SENSEX-Oct2026-FUT", "SENSEX-Nov2026-FUT", "SENSEX50-Oct2026-FUT", "BANKEX-Oct2026-FUT"],
+                           "SEM_EXPIRY_DATE": ["2026-10-27 14:30:00", "2026-11-24 14:30:00", "2026-10-27 14:30:00", "2026-12-29 14:30:00",
+                                               "2026-10-29 14:30:00", "2026-11-26 14:30:00", "2026-10-29 14:30:00", "2026-10-29 14:30:00"],
+                           "SEM_SMST_SECURITY_ID": [111, 222, 333, 444, 555, 666, 777, 888]})
     print("pick (before expiry roll):", pick_index_future(master, "NIFTY 50", date(2026, 10, 20)))
     print("pick (inside roll window):", pick_index_future(master, "NIFTY 50", date(2026, 10, 26)))
+    sx = pick_index_future(master, "SENSEX", date(2026, 10, 20))
+    print("pick SENSEX (BSE, current month):", sx)
+    assert sx["security_id"] == "555" and sx["segment"] == "BSE_FNO"
+    sx2 = pick_index_future(master, "SENSEX", date(2026, 10, 28))
+    print("pick SENSEX (inside roll window, next month):", sx2)
+    assert sx2["security_id"] == "666"
+    assert pick_index_future(master, "NIFTY 50", date(2026, 10, 20))["segment"] == "NSE_FNO"
+    print("override segment:", find_index_future("SENSEX", "12345"))
     csv = ("Participant wise Open Interest (no. of contracts) in Futures & Options Segment as on 27-Oct-2026\n"
            "Client Type,Future Index Long,Future Index Short,Future Stock Long,Future Stock Short,Option Index Call Long,"
            "Option Index Put Long,Option Index Call Short,Option Index Put Short,Total Long Contracts,Total Short Contracts\n"

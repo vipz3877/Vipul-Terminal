@@ -1945,8 +1945,8 @@ def _fp_future(idx_name, override, day):
 
 
 @st.cache_data(ttl=25, show_spinner=False)
-def _fp_candles(sec_id, token, client_id, day):
-    return FP.fetch_future_candles(sec_id, token, client_id)
+def _fp_candles(sec_id, token, client_id, day, segment="NSE_FNO"):
+    return FP.fetch_future_candles(sec_id, token, client_id, segment=segment)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -3368,7 +3368,7 @@ if FP is not None and is_trading_day(now_ist):
     try:
         _day = now_ist.date().isoformat()
         _fut = _fp_future(idx_name, get_secret(f"FUT_ID_{FP.UNDERLYING.get(idx_name, idx_name)}", "").strip(), _day)
-        _bars = _fp_candles(_fut["security_id"], dhan_token, client_id, _day)
+        _bars = _fp_candles(_fut["security_id"], dhan_token, client_id, _day, _fut.get("segment", "NSE_FNO"))
         m["fp"] = FP.compute_footprint(_bars, daily_sigma(m), prev_close)
         m["fp"]["future"] = _fut
     except Exception as _e:
