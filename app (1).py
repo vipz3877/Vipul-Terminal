@@ -1,5 +1,5 @@
 """
-VIPUL OPTIONS BUYER SIGNAL TERMINAL v15.1
+VIPUL OPTIONS BUYER SIGNAL TERMINAL v16.0 (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
 v15.1 adds an INSTITUTIONAL FOOTPRINT layer (needs footprint.py next to this file):
  - Index-futures price / volume / open-interest flow + session VWAP decide whether money is really moving your way
  - Footprint filter: VETO AGAINST (default) / REQUIRE ALIGNED / OFF; blocked signals are still logged with footprint fields
@@ -64,7 +64,7 @@ try:
 except ImportError:
     Groq = None
 
-st.set_page_config(page_title="Vipul Options Buyer Terminal v15.1", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Vipul Options Buyer Terminal v16.0", layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
 # CSS
@@ -157,6 +157,7 @@ PARAM_DEFAULTS = {
     "max_risk": 2.0, "capital": 100000, "move_alert_pct": 2.0,
     "min_conf": 60, "exh_veto": False, "alert_rejected": False,
     "fp_mode": "VETO AGAINST", "target_cap": 0.8,
+    "expiry_mode": True, "engine_led": True, "regime_gate": "SOFT (block against trend)", "session_guard": True,
 }
 
 
@@ -217,6 +218,7 @@ INDEX_MAP = {
     "NIFTY BANK": {"scrip": 25, "seg": "IDX_I", "step": 100},
     "FINNIFTY": {"scrip": 27, "seg": "IDX_I", "step": 50},
     "MIDCPNIFTY": {"scrip": 118, "seg": "IDX_I", "step": 25},
+    "SENSEX": {"scrip": 51, "seg": "IDX_I", "step": 100},  # v16: BSE index; verify id 51 on first run (see notes)
 }
 
 DIV_YIELD = 0.013
@@ -1278,7 +1280,7 @@ def chain_checks(m):
 VETO_RE = re.compile(r"\b(REJECT|REJECTED|VETO|VETOED|DENY|DENIED|DECLINE|DECLINED|DISAPPROVE|DISAPPROVED|NOT APPROVED)\b")
 
 
-def select_buyer_contract(m, direction):
+def select_buyer_contract(m, direction, allowed=None):
     """Choose a liquid, near-ATM long option. This ranks available quotes; it does not predict returns."""
     df = m.get("df")
     if df is None or df.empty or direction not in ("BUY", "SELL"):
@@ -1293,6 +1295,8 @@ def select_buyer_contract(m, direction):
         iv = _n(r.get(f"{side}_IV"))
         oi, vol = _n(r.get(f"{side}_OI")), _n(r.get(f"{side}_Vol"))
         if not all(math.isfinite(x) for x in (strike, ltp, bid, ask, delta, iv, oi, vol)):
+            continue
+        if allowed is not None and strike not in allowed:
             continue
         if ltp < MIN_PREMIUM or bid <= 0 or ask < bid or ask <= 0 or oi <= 0:
             continue
@@ -1319,6 +1323,320 @@ def select_buyer_contract(m, direction):
     best["max_loss_per_unit"] = round(premium - best["stop_premium"], 2)
     best["risk_note"] = "Premium levels are fixed-percentage planning levels, not exchange orders or a modelled fill. Re-check live bid/ask before entry."
     return best
+
+
+# ============================================================
+# v16 ADDITIONS: session guard, daily risk lock, IV history, realised vol, level map
+# ============================================================
+DAILY_RISK_FILE = os.path.join(DATA_DIR, "bbg_daily_risk_v16.json")
+IV_LOG_FILE = os.path.join(DATA_DIR, "bbg_iv_log_v16.json")
+
+
+def session_phase(now, expiry_active=False):
+    """(label, blocks_new_entries, note) for the current IST time. Times are a rule of thumb, not a proven edge."""
+    if not is_trading_day(now):
+        return "CLOSED (non-trading day)", True, "Market is closed today."
+    t = _mins(now)
+    if t < 9 * 60 + 15:
+        return "PRE-OPEN", True, "Market not open yet."
+    if expiry_active and EXPIRY_CUTOFF_MIN <= t < 15 * 60 + 30:
+        return "EXPIRY CUTOFF (after 2:30 pm)", True, "No new expiry-day entries after 2:30 pm: theta and gamma make late buying very hard."
+    if t < 9 * 60 + 25:
+        return "OPENING 10 MIN", True, "Spreads are wide and OI data is stale in the first 10 minutes."
+    if t < 11 * 60 + 30:
+        return "MORNING TREND WINDOW", False, ""
+    if t < 13 * 60 + 30:
+        return "MIDDAY CHOP", False, "Midday often has weaker follow-through (advisory only, check your scorecard)."
+    if t < 14 * 60 + 45:
+        return "AFTERNOON", False, ""
+    if t < 15 * 60 + 5:
+        return "LATE SESSION", False, "Theta and gamma accelerate; keep holds short."
+    if t < 15 * 60 + 30:
+        return "CLOSING 25 MIN", True, "No new buyer entries this close to the bell."
+    return "CLOSED", True, "Market is closed."
+
+
+def load_daily_risk(now):
+    d = _load_json(DAILY_RISK_FILE, {}) or {}
+    today = now.date().isoformat()
+    cap = float(P("capital"))
+    max_loss = d.get("max_loss") or round(cap * float(P("max_risk")) / 100.0 * 2.0)
+    max_trades = d.get("max_trades") or 3
+    if d.get("date") != today:
+        return {"date": today, "pnl": 0.0, "trades": 0, "max_loss": max_loss, "max_trades": int(max_trades)}
+    return {"date": today, "pnl": float(d.get("pnl", 0.0)), "trades": int(d.get("trades", 0)),
+            "max_loss": max_loss, "max_trades": int(max_trades)}
+
+
+def save_daily_risk(d):
+    _save_json(DAILY_RISK_FILE, d)
+
+
+def daily_lock_status(now, trade_cap=None):
+    d = load_daily_risk(now)
+    reasons = []
+    if d["max_loss"] and d["pnl"] <= -abs(float(d["max_loss"])):
+        reasons.append(f"daily loss limit reached (P&L {d['pnl']:+,.0f} vs limit -{abs(float(d['max_loss'])):,.0f})")
+    cap_t = min(d["max_trades"], trade_cap) if (trade_cap and d["max_trades"]) else (trade_cap or d["max_trades"])
+    if cap_t and d["trades"] >= cap_t:
+        reasons.append(f"max trades per day reached ({d['trades']}/{cap_t})")
+    return bool(reasons), "; ".join(reasons), d
+
+
+def log_iv_and_percentile(idx_name, atm_iv, now, record):
+    """Append an ATM IV sample at most every 5 minutes during market hours; return percentile vs the last 30 days.
+    Caveat: samples mix different expiries' ATM IV, so treat the percentile as a rough guide until you have weeks of data."""
+    try:
+        d = _load_json(IV_LOG_FILE, {}) or {}
+        rows = d.get(idx_name, [])
+        ts = time.time()
+        if record and market_open_now(now) and atm_iv and atm_iv > 0 and (not rows or ts - rows[-1][0] >= 300):
+            rows.append([round(ts), round(float(atm_iv), 2)])
+            rows = rows[-4000:]
+            d[idx_name] = rows
+            _save_json(IV_LOG_FILE, d)
+        cutoff = ts - 30 * 86400
+        vals = [iv for t, iv in rows if t >= cutoff]
+        if len(vals) < 30:
+            return {"pct": None, "n": len(vals)}
+        pct = sum(1 for v in vals if v <= atm_iv) / len(vals) * 100.0
+        return {"pct": int(round(pct)), "n": len(vals)}
+    except Exception:
+        return {"pct": None, "n": 0}
+
+
+def realized_vol(candles, today_iso, n=10):
+    """Annualised close-to-close realised volatility (%) over the last n completed daily candles."""
+    closes = [c["c"] for c in (candles or []) if c.get("date", "") < today_iso and c.get("c", 0) > 0][-(n + 1):]
+    if len(closes) < 6:
+        return None
+    rets = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes))]
+    mean = sum(rets) / len(rets)
+    var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+    return math.sqrt(var) * math.sqrt(252.0) * 100.0
+
+
+def level_map(m, candles, today_iso):
+    """Fuse the levels the terminal already computes into confluence zones. These are places where price
+    is likely to react, not predictions."""
+    spot, step = m["spot"], m["step"]
+    pts = []  # (price, source, weight)
+
+    def add(price, src, w):
+        try:
+            p = float(price)
+        except (TypeError, ValueError):
+            return
+        if p > 0 and abs(p - spot) <= spot * 0.05:
+            pts.append((p, src, w))
+
+    add(m.get("call_wall"), "Call OI wall", 2)
+    add(m.get("put_wall"), "Put OI wall", 2)
+    add(m.get("max_pain"), "Max pain", 1)
+    add(m.get("gamma_strike"), "Max gamma strike", 1)
+    zg = m.get("zero_gamma")
+    if zg is not None and pd.notna(zg) and float(zg) != 0.0:
+        add(zg, "Gamma flip", 2)
+    add(m.get("upper_1sigma"), "+1σ (to expiry)", 1)
+    add(m.get("lower_1sigma"), "-1σ (to expiry)", 1)
+    fp = m.get("fp") or {}
+    if fp.get("ok") and fp.get("vwap"):
+        add(fp["vwap"], "Futures VWAP", 1)
+    prior = [c for c in (candles or []) if c.get("date", "") < today_iso]
+    if prior:
+        pd_ = prior[-1]
+        add(pd_["h"], "Prev day high", 1)
+        add(pd_["l"], "Prev day low", 1)
+        add(pd_["c"], "Prev day close", 1)
+    try:
+        rn = round_number_levels(m["df"], spot, step, 3)
+        if rn is not None and len(rn):
+            for lv in rn["Level"].tolist():
+                add(lv, "Round-number strike", 1)
+    except Exception:
+        pass
+
+    if not pts:
+        return pd.DataFrame()
+    tol = max(step * 0.5, spot * 0.001)
+    pts.sort(key=lambda x: x[0])
+    clusters, cur = [], [pts[0]]
+    for p in pts[1:]:
+        if p[0] - cur[-1][0] <= tol and p[0] - cur[0][0] <= 2 * tol:
+            cur.append(p)
+        else:
+            clusters.append(cur)
+            cur = [p]
+    clusters.append(cur)
+
+    sd = daily_sigma(m) if callable(globals().get("daily_sigma")) else 0.0
+    rows = []
+    for c in clusters:
+        prices = [x[0] for x in c]
+        centre = sum(prices) / len(prices)
+        score = sum(x[2] for x in c)
+        srcs = sorted({x[1] for x in c})
+        dist = centre - spot
+        side = "AT SPOT" if abs(dist) <= tol else ("RESISTANCE (above)" if dist > 0 else "SUPPORT (below)")
+        rows.append({
+            "Zone": round(centre), "Low": round(min(prices)), "High": round(max(prices)), "Score": score,
+            "Strength": "STRONG" if score >= 5 else "MODERATE" if score >= 3 else "MINOR",
+            "Side": side, "Dist pts": round(dist), "Dist σ": round(abs(dist) / sd, 2) if sd else None,
+            "Sources": ", ".join(srcs),
+        })
+    out = pd.DataFrame(rows)
+    out["_a"] = out["Dist pts"].abs()
+    return out.sort_values("_a").drop(columns="_a").reset_index(drop=True)
+
+
+# ============================================================
+# v16 EXPIRY MODE (auto-on when the selected expiry is today)
+# ============================================================
+EXPIRY_RISK_FACTOR = 0.5                  # half the normal risk per trade
+EXPIRY_MAX_TRADES = 2                     # at most this many trades on expiry day
+EXPIRY_CUTOFF_MIN = 14 * 60 + 30          # no new entries after 2:30 pm
+EXPIRY_TIME_STOPS = {"A": 20, "B": 30, "C": 15}   # minutes; planning guides, not exchange orders
+EXPIRY_MIN_RR = 1.0                       # minimum reward:risk on playbook levels (scalps need less than the normal 1.5)
+EXPIRY_WALL_OI_DROP_PCT = 3.0             # wall OI must fall this % in ~10 min to count as writers covering
+
+
+def expiry_active(m):
+    return bool((m.get("xctx") or {}).get("active"))
+
+
+def effective_max_risk(m):
+    return float(P("max_risk")) * (EXPIRY_RISK_FACTOR if expiry_active(m) else 1.0)
+
+
+def xctx_allowed(m, direction):
+    """Strikes allowed on expiry day: ATM or one strike in the money. None = no restriction."""
+    xc = m.get("xctx") or {}
+    if not xc.get("active"):
+        return None
+    return xc.get("allowed_calls") if direction == "BUY" else xc.get("allowed_puts") if direction == "SELL" else None
+
+
+def _chunk_ranges(cs, n=30):
+    out = []
+    for i in range(0, len(cs), n):
+        part = cs[i:i + n]
+        if len(part) >= 20:
+            out.append(max(x[1] for x in part) - min(x[2] for x in part))
+    return out
+
+
+def expiry_context(m, intraday, hist, now):
+    """Playbook triggers and guards for expiry day. Rules of thumb for observation, not proven edges."""
+    xc = {"active": False}
+    if not P("expiry_mode") or m.get("dte") != 0 or not market_open_now(now):
+        return xc
+    spot, step = float(m["spot"]), float(m["step"])
+    sd = daily_sigma(m)
+    t = _mins(now)
+    atm = float(round(spot / step) * step)
+    xc.update({
+        "active": True, "sd": sd, "t": t,
+        "a_window": 9 * 60 + 30 <= t < 11 * 60,
+        "b_window": 9 * 60 + 30 <= t < EXPIRY_CUTOFF_MIN,
+        "late": t >= 13 * 60 + 30, "cutoff": t >= EXPIRY_CUTOFF_MIN,
+        "allowed_calls": {atm, atm - step}, "allowed_puts": {atm, atm + step},
+        "time_stops": dict(EXPIRY_TIME_STOPS),
+    })
+
+    cs = []
+    for c in intraday or []:
+        try:
+            cs.append((datetime.fromtimestamp(float(c["ts"]), IST), float(c["h"]), float(c["l"]), float(c["c"])))
+        except (KeyError, TypeError, ValueError, OSError):
+            continue
+    cs.sort(key=lambda x: x[0])
+    xc["candles"] = len(cs)
+
+    # Playbook A: opening-range break (range = first 15 one-minute candles)
+    orc = [x for x in cs if x[0].hour * 60 + x[0].minute < 9 * 60 + 30]
+    a = {"dir": 0, "state": "no opening range yet"}
+    if len(orc) >= 10:
+        or_hi, or_lo = max(x[1] for x in orc), min(x[2] for x in orc)
+        xc["or_high"], xc["or_low"] = or_hi, or_lo
+        buf = 0.2 * step
+        last3 = [x[3] for x in cs[-3:]]
+        if len(last3) == 3 and min(last3) > or_hi + buf:
+            a = {"dir": 1, "state": f"3 closes above the opening range high {or_hi:,.0f}"}
+        elif len(last3) == 3 and max(last3) < or_lo - buf:
+            a = {"dir": -1, "state": f"3 closes below the opening range low {or_lo:,.0f}"}
+        else:
+            a = {"dir": 0, "state": f"inside opening range {or_lo:,.0f} to {or_hi:,.0f}"}
+    xc["A"] = a
+
+    # Playbook B / C: close beyond a strong OI wall while that wall's OI is falling (writers covering)
+    near, df = m.get("near"), m["df"]
+    b = {"dir": 0, "state": "no wall break", "confirmed": False, "level": None, "oi_chg_pct": None}
+    old = None
+    for h in reversed(hist or []):
+        if h.get("ts", 0) <= now.timestamp() - 600:
+            old = h
+            break
+
+    def wall_oi_change(strike, side):
+        if old is None:
+            return None
+        o = (old.get("oi") or {}).get(str(int(strike)))
+        if not o:
+            return None
+        cur = df.loc[df["Strike"] == strike, "CE_OI" if side == "CE" else "PE_OI"]
+        if cur.empty or o[0 if side == "CE" else 1] <= 0:
+            return None
+        base = o[0 if side == "CE" else 1]
+        return (float(cur.iloc[0]) - base) / base * 100.0
+
+    if near is not None and len(near) and len(cs) >= 5:
+        last5 = [x[3] for x in cs[-5:]]
+        buf = 0.2 * step
+        best = None
+        for side, col, sign in (("CE", "CE_OI", 1), ("PE", "PE_OI", -1)):
+            mx = float(near[col].max())
+            if mx <= 0:
+                continue
+            for _, r in near[near[col] >= 0.7 * mx].iterrows():
+                w = float(r["Strike"])
+                beyond = (min(last5) > w + buf) if sign == 1 else (max(last5) < w - buf)
+                if beyond and abs(spot - w) <= max(sd, 2 * step):
+                    chg = wall_oi_change(w, side)
+                    cand = {"dir": sign, "level": w, "oi_chg_pct": chg, "side": side,
+                            "confirmed": chg is not None and chg <= -EXPIRY_WALL_OI_DROP_PCT}
+                    if best is None or abs(spot - w) < abs(spot - best["level"]):
+                        best = cand
+        if best:
+            if best["confirmed"]:
+                b = {**best, "state": f"closed beyond the {best['side']} wall {best['level']:,.0f} and its OI fell {best['oi_chg_pct']:.1f}% (writers covering)"}
+            elif best["oi_chg_pct"] is None:
+                b = {**best, "state": f"price beyond the {best['side']} wall {best['level']:,.0f}; OI history under 10 min, not confirmed"}
+            else:
+                b = {**best, "state": f"price beyond the {best['side']} wall {best['level']:,.0f} but OI changed {best['oi_chg_pct']:+.1f}%, not confirmed"}
+    xc["B"] = b
+
+    # Pin guard (late day): spot sitting on max pain with a compressed range
+    pin = float(m.get("max_pain") or spot)
+    last30 = cs[-30:]
+    rng30 = (max(x[1] for x in last30) - min(x[2] for x in last30)) if len(last30) >= 20 else None
+    chunk = _chunk_ranges(cs)
+    xc.update({"pin": pin, "gamma_strike": m.get("gamma_strike"), "rng30": rng30,
+               "avg30": (sum(chunk) / len(chunk)) if chunk else None,
+               "pinned": bool(xc["late"] and rng30 is not None and abs(spot - pin) <= max(step, 0.2 * sd) and rng30 <= 0.35 * sd)})
+    return xc
+
+
+def expiry_breakeven(plan, m, xc):
+    """Index move needed for the bought option to finish in profit if held to expiry, versus what is left in the day."""
+    K, prem = float(plan["strike"]), float(plan["entry_ref"])
+    call = plan["option_type"] == "CALL"
+    be = K + prem if call else K - prem
+    req = max(0.0, (be - m["spot"]) if call else (m["spot"] - be))
+    exp_left = float(m.get("exp_move") or 0.0)
+    avg30 = xc.get("avg30")
+    return {"breakeven": be, "required_move": req,
+            "vs_expected_left": (req / exp_left) if exp_left > 0 else None,
+            "vs_avg30": (req / avg30) if avg30 else None}
 
 
 def build_signal(m, ai, data_ok=True, gate_reason=""):
@@ -1354,17 +1672,65 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
     res, sup = m["struct"]["res"], m["struct"]["sup"]
     notes = []
     sl_buf = SL_BUFFER * m["step"] / 50.0
-    sig, target, sl, rr = ai_sig, None, None, None
+    engine_led = bool(P("engine_led"))
+    if engine_led:
+        # v16: the numeric chain engine decides direction; the AI council is advisory only.
+        direction = 1 if lean >= min_confirm else -1 if lean <= -min_confirm else 0
+        net = lean * direction
+        sig = {1: "BUY", -1: "SELL", 0: "WAIT"}[direction]
+        if sig == "WAIT":
+            notes.append(f"Engine-led: option-chain agreement {lean:+d} is inside ±{min_confirm}, so there is no direction yet.")
+        elif ai_sig in ("BUY", "SELL") and ai_sig != sig:
+            notes.append(f"Advisory: AI council says {ai_sig} but the chain engine says {sig}.")
+        elif ai_sig == "WAIT" and ai.get("error") is None:
+            notes.append("Advisory: AI council says WAIT.")
+    else:
+        sig = ai_sig
+    target, sl, rr = None, None, None
+
+    # v16 expiry mode: on expiry day a trade needs a playbook trigger that matches its direction.
+    xc = m.get("xctx") or {}
+    playbook, time_stop, b_lead, be_info = None, None, False, None
+    if xc.get("active"):
+        trig_a, trig_b = xc.get("A", {}), xc.get("B", {})
+        d_eng = {"BUY": 1, "SELL": -1}.get(sig, 0)
+        tag_b = "C" if xc.get("late") else "B"
+        if d_eng != 0:
+            if xc.get("b_window") and trig_b.get("confirmed") and trig_b.get("dir") == d_eng:
+                playbook = tag_b
+            elif xc.get("a_window") and trig_a.get("dir") == d_eng:
+                playbook = "A"
+            if playbook is None:
+                notes.append(f"{sig} rejected: expiry day needs a playbook trigger in the same direction. "
+                             f"A (opening-range break): {trig_a.get('state', 'n/a')}. B/C (wall break): {trig_b.get('state', 'n/a')}.")
+                sig = "WAIT"
+        elif xc.get("b_window") and trig_b.get("confirmed"):
+            sig = "BUY" if trig_b["dir"] > 0 else "SELL"
+            direction = trig_b["dir"]
+            net, b_lead, playbook = lean * direction, True, tag_b
+            notes.append(f"Expiry playbook {playbook} leads: {trig_b['state']}. Chain agreement is only {lean:+d}, so size down further.")
+        if sig != "WAIT" and xc.get("pinned") and playbook not in ("B", "C"):
+            notes.append(f"{sig} rejected: price is pinned near max pain {xc.get('pin', 0):,.0f} with a compressed range. Do not buy decay.")
+            sig, playbook = "WAIT", None
+        if playbook:
+            time_stop = xc.get("time_stops", {}).get(playbook)
+            notes.append(f"Expiry playbook {playbook}: half size, max {EXPIRY_MAX_TRADES} trades today, time stop {time_stop} min.")
 
     if sig != "WAIT" and not data_ok:
         notes.append(f"{sig} rejected: data gate closed ({gate_reason}).")
+        sig = "WAIT"
+
+    # A cached verdict may be displayed for context after an AI/API failure, but it must
+    # never act as fresh risk-officer approval for a new signal.
+    if sig != "WAIT" and not engine_led and ai.get("_stale_fallback"):
+        notes.append("Signal rejected: AI service failed; cached AI analysis is display-only and cannot approve a new trade.")
         sig = "WAIT"
 
     if sig != "WAIT" and _oi_coverage < 70.0:
         notes.append(f"{sig} rejected: previous-OI history coverage is only {_oi_coverage:.0f}% (need at least 70%).")
         sig = "WAIT"
 
-    if sig != "WAIT":
+    if sig != "WAIT" and not engine_led:
         fa_raw = str(ai.get("final_approval", "")).strip()
         fa = fa_raw.upper()
         # Fail closed: blank, malformed, or anything other than an explicit APPROVE is rejected.
@@ -1372,11 +1738,11 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
             notes.append(f"{sig} rejected: risk officer did not provide an explicit APPROVE ({fa_raw[:80] or 'missing approval'}).")
             sig = "WAIT"
 
-    if sig != "WAIT" and conf < min_conf:
+    if sig != "WAIT" and not engine_led and conf < min_conf:
         notes.append(f"{sig} rejected: AI confidence {conf}% is below the required {min_conf}%.")
         sig = "WAIT"
 
-    if sig != "WAIT" and net < min_confirm:
+    if sig != "WAIT" and net < min_confirm and not b_lead:
         notes.append(f"{sig} rejected: option-chain agreement {net:+d} (one vote per family) is below the required +{min_confirm}.")
         sig = "WAIT"
 
@@ -1403,7 +1769,78 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
             notes.append(f"{sig} rejected: {why}.")
             sig = "WAIT"
 
+    # Fail closed when futures-footprint data is missing or stale. A completed 1-minute
+    # candle may naturally be 60-120 seconds old; allow a modest delivery buffer.
+    if sig != "WAIT" and P("fp_mode") != "REQUIRE ALIGNED":
+        if not (m.get("fp") or {}).get("ok"):
+            notes.append("Caution: futures footprint is unavailable, so the footprint filter could not check this signal (filter mode is not REQUIRE ALIGNED).")
+    if sig != "WAIT" and P("fp_mode") == "REQUIRE ALIGNED":
+        fp = m.get("fp") or {}
+        fp_asof = fp.get("asof")
+        if not fp.get("ok") or not fp_asof:
+            notes.append(f"{sig} rejected: futures-footprint timestamp is unavailable.")
+            sig = "WAIT"
+        else:
+            try:
+                fp_age = max(0.0, time.time() - float(fp_asof))
+            except (TypeError, ValueError):
+                fp_age = float("inf")
+            if fp_age > 180:
+                notes.append(f"{sig} rejected: futures footprint is stale ({fp_age:.0f}s old; maximum 180s).")
+                sig = "WAIT"
+
+    # Regime gate (v16: three modes). STRICT = original behaviour, SOFT = only block against a clear trend, OFF = advisory.
     if sig != "WAIT":
+        regime_info = m.get("market_regime") or {}
+        regime = str(regime_info.get("label", "UNAVAILABLE")).upper()
+        mode = str(P("regime_gate"))
+        against = (sig == "BUY" and regime == "TRENDING DOWN") or (sig == "SELL" and regime == "TRENDING UP")
+        if mode.startswith("STRICT"):
+            if regime not in ("TRENDING UP", "TRENDING DOWN"):
+                notes.append(f"{sig} rejected: market regime is {regime}. Wait for a clearer directional regime (STRICT regime gate).")
+                sig = "WAIT"
+            elif against or (sig == "BUY" and regime != "TRENDING UP") or (sig == "SELL" and regime != "TRENDING DOWN"):
+                notes.append(f"{sig} rejected: signal direction conflicts with market regime {regime}.")
+                sig = "WAIT"
+        elif mode.startswith("SOFT"):
+            if against:
+                notes.append(f"{sig} rejected: it fights a clear trend (regime {regime}).")
+                sig = "WAIT"
+            elif regime not in ("TRENDING UP", "TRENDING DOWN"):
+                notes.append(f"Caution: regime is {regime}, not a clear trend; expect chop and keep size small.")
+        elif against:
+            notes.append(f"Caution: signal fights the market regime {regime} (regime gate is OFF).")
+
+    # v16: session guard and daily risk lock (new entries only)
+    if sig != "WAIT" and P("session_guard"):
+        _lbl, _blk, _why = session_phase(datetime.now(IST), bool(xc.get("active")))
+        if _blk:
+            notes.append(f"{sig} rejected: session guard ({_lbl}). {_why}")
+            sig = "WAIT"
+        elif _why:
+            notes.append(f"Caution: {_lbl}. {_why}")
+    if sig != "WAIT":
+        _lk, _lk_why, _ = daily_lock_status(datetime.now(IST), EXPIRY_MAX_TRADES if xc.get("active") else None)
+        if _lk:
+            notes.append(f"{sig} rejected: daily risk lock ({_lk_why}).")
+            sig = "WAIT"
+    if sig != "WAIT":
+        if m.get("dte") == 0:
+            notes.append("Caution: expiry day. Gamma and theta are extreme; size down and keep holds short.")
+        _ivp = (m.get("iv_pct") or {}).get("pct")
+        if _ivp is not None and _ivp >= 85:
+            notes.append(f"Caution: ATM IV is at the {_ivp}th percentile of the last 30 days, so buying options is expensive.")
+
+    if sig != "WAIT" and playbook:
+        _unit = max(0.5 * float(m.get("exp_move") or 0.0), 0.6 * m["step"])
+        _lvl = (xc.get("or_high") if sig == "BUY" else xc.get("or_low")) if playbook == "A" else (xc.get("B") or {}).get("level")
+        if _lvl is None:
+            _lvl = entry
+        _stop_dist = max(abs(entry - _lvl) + 0.2 * m["step"], 0.3 * _unit)
+        target = entry + _unit if sig == "BUY" else entry - _unit
+        sl = entry - _stop_dist if sig == "BUY" else entry + _stop_dist
+        notes.append(f"Expiry playbook levels: target {target:,.0f} (half the remaining expected move), stop {sl:,.0f} (back through {_lvl:,.0f}).")
+    if sig != "WAIT" and not playbook:
         if res is None or sup is None:
             notes.append(f"{sig} rejected: no usable OI wall on one side of spot.")
             sig = "WAIT"
@@ -1422,19 +1859,29 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
         risk = abs(entry - sl)
         reward = abs(target - entry)
         rr = reward / risk if risk > 0 else None
-        if rr is None or rr < MIN_RR:
+        _min_rr = EXPIRY_MIN_RR if playbook else MIN_RR
+        if rr is None or rr < _min_rr:
             rr_txt = f"1:{rr:.2f}" if rr else "n/a"
-            notes.append(f"{sig} rejected: R:R {rr_txt} from the nearest OI walls "
-                         f"(target {target:,.0f}, SL {sl:,.0f}) is below 1:{MIN_RR:.1f}.")
+            notes.append(f"{sig} rejected: R:R {rr_txt} from the {'playbook levels' if playbook else 'nearest OI walls'} "
+                         f"(target {target:,.0f}, SL {sl:,.0f}) is below 1:{_min_rr:.1f}.")
             sig, target, sl, rr = "WAIT", None, None, None
 
-    buyer_plan = select_buyer_contract(m, sig) if sig in ("BUY", "SELL") else None
+    buyer_plan = select_buyer_contract(m, sig, xctx_allowed(m, sig)) if sig in ("BUY", "SELL") else None
     if sig in ("BUY", "SELL") and buyer_plan is None:
         notes.append(f"{sig} rejected: no near-ATM option passed premium, bid/ask, spread (≤{MAX_OPTION_SPREAD_PCT:.0f}%), OI, nonzero traded volume and delta filters. Do not chase an illiquid contract.")
         sig, target, sl, rr = "WAIT", None, None, None
+    if sig in ("BUY", "SELL") and buyer_plan is not None and xc.get("active"):
+        be_info = expiry_breakeven(buyer_plan, m, xc)
+        if be_info["vs_expected_left"] is not None and be_info["vs_expected_left"] > 1.0:
+            notes.append(f"{sig} rejected: expiry breakeven needs a {be_info['required_move']:,.0f} pt move, more than the "
+                         f"{m.get('exp_move', 0):,.0f} pt the market still expects today.")
+            sig, target, sl, rr, buyer_plan, playbook = "WAIT", None, None, None, None, None
+        elif be_info["vs_avg30"] is not None and be_info["vs_avg30"] > 1.5:
+            notes.append(f"Caution: breakeven needs {be_info['required_move']:,.0f} pts, {be_info['vs_avg30']:.1f}x today's typical 30-minute range.")
     return {"signal": sig, "ai_signal": ai_sig, "entry": entry, "target": target, "sl": sl, "rr": rr,
             "confidence": conf, "note": " ".join(notes), "checks": checks, "net": net, "lean": lean,
-            "families": families, "direction": direction, "buyer_plan": buyer_plan}
+            "families": families, "direction": direction, "buyer_plan": buyer_plan,
+            "playbook": playbook, "time_stop_min": time_stop, "expiry_day": bool(xc.get("active")), "breakeven": be_info}
 
 
 # ============================================================
@@ -1498,8 +1945,8 @@ def _fp_future(idx_name, override, day):
 
 
 @st.cache_data(ttl=25, show_spinner=False)
-def _fp_candles(sec_id, token, client_id, day):
-    return FP.fetch_future_candles(sec_id, token, client_id)
+def _fp_candles(sec_id, token, client_id, day, segment="NSE_FNO"):
+    return FP.fetch_future_candles(sec_id, token, client_id, segment=segment)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -2250,19 +2697,28 @@ def process_alert_queue(cfg, max_per_run=4):
     return results
 
 
+MIN_ALERT_COOLDOWN_MIN = 5   # safety floor: a cooldown of 0 would resend on every 30s autorefresh
+
+
 def fire_alert(key, text, cooldown_min, cfg):
     if not cfg.get("enabled") or not (cfg.get("tg_token") and cfg.get("tg_chat") or cfg.get("hook")):
         return []
+    cooldown_min = max(float(cooldown_min or 0), MIN_ALERT_COOLDOWN_MIN)
     now_ts = time.time()
     state = _load_json(ALERT_FILE, {})
     state = {k: v for k, v in state.items() if now_ts - float(v) < ALERT_STATE_KEEP_SEC}
     if now_ts - float(state.get(key, 0)) < cooldown_min * 60:
         return []
+    # Reserve the key BEFORE sending so a second session/tab rerunning at the same moment skips it.
+    state[key] = now_ts
+    _save_json(ALERT_FILE, state)
     res = send_alert(text, cfg.get("tg_token", ""), cfg.get("tg_chat", ""), cfg.get("hook", ""))
-    if delivery_succeeded(res, cfg):
-        state[key] = now_ts
-        _save_json(ALERT_FILE, state)
-    else:
+    if not delivery_succeeded(res, cfg):
+        # Release the reservation; the retry queue will resend (and re-mark the key on success).
+        state = _load_json(ALERT_FILE, {})
+        if state.get(key) == now_ts:
+            state.pop(key, None)
+            _save_json(ALERT_FILE, state)
         queue_failed_alert(key, text, "; ".join(msg for _, ok, msg in res if not ok) or "delivery failed")
     return res
 
@@ -2272,6 +2728,8 @@ def signal_alert_text(r):
     sl = f"{r['sl']:,.0f}" if r.get("sl") else "-"
     rr = f"1:{r['rr']:.2f}" if r.get("rr") else "-"
     kind_label = "✅ VALIDATED OPTION-BUY SIGNAL" if r["kind"] == "VALIDATED" else "❌ REJECTED SIGNAL (NOT ACTIONABLE)"
+    if r.get("playbook"):
+        kind_label += f" [EXPIRY PLAYBOOK {r['playbook']} | time stop {r.get('time_stop_min')} min | HALF SIZE]"
     reason_txt = f"\nReason: {r['reason']}" if r.get("reason") else ""
     if r.get("kind") == "VALIDATED" and r.get("option_strike") is not None:
         action = "BUY CALL" if r.get("option_type") == "CALL" else "BUY PUT"
@@ -2415,7 +2873,7 @@ def make_record(kind, idx_name, expiry, m, sig, ai, tone, now):
     ready = bool(ex.get("ready"))
     own = (ex["buyer"] if direction == "BUY" else ex["seller"]) if ready else None
     note = sig["note"] if kind == "REJECTED" else ""
-    buyer_plan = select_buyer_contract(m, direction) if kind == "VALIDATED" and direction in ("BUY", "SELL") else None
+    buyer_plan = select_buyer_contract(m, direction, xctx_allowed(m, direction)) if kind == "VALIDATED" and direction in ("BUY", "SELL") else None
     trade_key = f"{idx_name}|{str(expiry)[:10]}|{direction}|{buyer_plan.get('option_type') if buyer_plan else 'NA'}|{buyer_plan.get('strike') if buyer_plan else 'NA'}"
     return {
         "id": hashlib.sha256(f"{now.timestamp()}|{trade_key}|{kind}".encode()).hexdigest()[:12], "trade_key": trade_key,
@@ -2435,6 +2893,9 @@ def make_record(kind, idx_name, expiry, m, sig, ai, tone, now):
         "exh_buyer": ex["buyer"]["score"] if ready else None, "exh_seller": ex["seller"]["score"] if ready else None,
         "exh_own_flag": own["flag"] if own else None, "tone": tone, "news_score": ai.get("news_score"),
         "reason": note,
+        "playbook": sig.get("playbook") if kind == "VALIDATED" else None,
+        "expiry_day": bool(sig.get("expiry_day")),
+        "time_stop_min": sig.get("time_stop_min") if kind == "VALIDATED" else None,
         "s15": None, "s30": None, "s60": None, "sclose": None, "first_touch": None, "mfe": 0.0, "mae": 0.0,
         "samples": 0, "last_sample_ts": None, "max_gap_min": 0.0, "resolved": False, "outcome": "OPEN",
         "touch_alerted": False,
@@ -2811,7 +3272,7 @@ def esc(x):
 # SIDEBAR
 # ============================================================
 with st.sidebar:
-    st.markdown("### BBG // BUYER TERMINAL v15.0")
+    st.markdown("### BBG // BUYER TERMINAL v15.1 HARDENED")
     dhan_token = clean(get_secret("DHAN_ACCESS_TOKEN", DEFAULT_DHAN_TOKEN))
     client_id = clean(get_secret("DHAN_CLIENT_ID", DEFAULT_CLIENT_ID))
     groq_key = get_secret("GROQ_API_KEY", DEFAULT_GROQ_KEY).strip()
@@ -2847,7 +3308,14 @@ with st.sidebar:
     r1.number_input("CAPITAL ₹", min_value=1000, value=PARAM_DEFAULTS["capital"], step=10000, key="p_capital")
     r2.number_input("MAX RISK %", min_value=0.5, max_value=5.0, value=float(PARAM_DEFAULTS["max_risk"]), step=0.5, key="p_max_risk")
     st.selectbox("FUTURES FOOTPRINT FILTER", ["VETO AGAINST", "REQUIRE ALIGNED", "OFF"], index=0, key="p_fp_mode",
-                 help="VETO AGAINST: block a signal that trades against the index-futures flow. REQUIRE ALIGNED: also block when the flow is neutral/unavailable. OFF: advisory only.")
+                 help="VETO AGAINST (v16 default) only blocks opposing futures flow and does not fail if footprint data is missing. REQUIRE ALIGNED blocks signals unless futures flow is aligned and available (the old v15 default). OFF disables the filter.")
+    st.toggle("ENGINE-LED SIGNALS (AI advisory only)", value=bool(PARAM_DEFAULTS["engine_led"]), key="p_engine_led",
+              help="ON (v16): direction comes from the option-chain engine and the AI council only comments. OFF: original v15 behaviour where the AI must say BUY/SELL and approve.")
+    st.selectbox("REGIME GATE", ["SOFT (block against trend)", "STRICT (trend only)", "OFF"], index=0, key="p_regime_gate",
+                 help="STRICT is the old v15 rule (needs a clear trend). SOFT only blocks trades that fight a clear trend. OFF is advisory.")
+    st.toggle("SESSION GUARD (no entries first 10 min / last 25 min)", value=bool(PARAM_DEFAULTS["session_guard"]), key="p_session_guard")
+    st.toggle("EXPIRY MODE (auto on expiry day: half size, 2 trades, 2:30 pm cut-off, playbooks A/B/C)", value=bool(PARAM_DEFAULTS["expiry_mode"]), key="p_expiry_mode",
+              help="Switches on by itself when the selected expiry is today. Edit EXPIRY_* constants near the top of the Expiry Mode block to change the numbers.")
     st.number_input("MAX TARGET DISTANCE (daily σ)", min_value=0.2, max_value=3.0, value=float(PARAM_DEFAULTS["target_cap"]), step=0.1, key="p_target_cap",
                     help="Targets farther than this from entry are trimmed, so a distant OI wall cannot inflate R:R.")
 
@@ -2901,6 +3369,7 @@ m["rr_shift"] = round(m["rr_25"] - _rr0, 2) if _rr0 is not None else 0.0
 m["exh"] = exhaustion(hist, m, prev_close, exh_lookback)
 m["exh_flag"] = exh_flag(m["exh"])
 m["market_regime"] = classify_market_regime(hist, m["spot"], info["step"], daily_sigma(m))
+m["iv_pct"] = log_iv_and_percentile(idx_name, m["atm_iv"], now_ist, data_ok)
 
 m["fp"] = {"ok": False, "why": "footprint.py not loaded: " + FP_IMPORT_ERR, "bias": "UNAVAILABLE"}
 fp_pc = {"ok": False}
@@ -2908,7 +3377,7 @@ if FP is not None and is_trading_day(now_ist):
     try:
         _day = now_ist.date().isoformat()
         _fut = _fp_future(idx_name, get_secret(f"FUT_ID_{FP.UNDERLYING.get(idx_name, idx_name)}", "").strip(), _day)
-        _bars = _fp_candles(_fut["security_id"], dhan_token, client_id, _day)
+        _bars = _fp_candles(_fut["security_id"], dhan_token, client_id, _day, _fut.get("segment", "NSE_FNO"))
         m["fp"] = FP.compute_footprint(_bars, daily_sigma(m), prev_close)
         m["fp"]["future"] = _fut
     except Exception as _e:
@@ -2958,7 +3427,12 @@ if run_ai:
     else:
         err = ai["error"]
         cached = valid_cached_verdict(_ai_key)
-        ai = cached if cached else ai
+        if cached:
+            ai = dict(cached)
+            ai["_stale_fallback"] = True
+            ai["_fallback_error"] = str(err)[:180]
+        else:
+            ai = {"error": str(err)[:180]}
         gate_label = f"AI ERROR: {err}"
 else:
     ai = valid_cached_verdict(_ai_key) or {
@@ -2968,7 +3442,14 @@ else:
     gate_label = (f"PAUSED ({gate_reason})" if not data_ok else f"CACHED {t.strftime('%H:%M:%S') if t else ''}")
 
 ai_ok = not ("error" in ai and "signal" not in ai)
-sig = build_signal(m, ai, data_ok, gate_reason) if ai_ok else None
+_xi = []
+if m.get("dte") == 0 and P("expiry_mode") and is_trading_day(now_ist):
+    try:
+        _xi = fetch_intraday_candles(info["scrip"], info["seg"], dhan_token, client_id)
+    except Exception:
+        _xi = []
+m["xctx"] = expiry_context(m, _xi, hist, now_ist)
+sig = build_signal(m, ai, data_ok, gate_reason) if (ai_ok or P("engine_led")) else None
 scan, smeta = premium_scanner(m, horizon_days, iv_shock, skew=use_skew)
 
 try:
@@ -3027,7 +3508,7 @@ if alerts_on and tg_token and tg_chat:
             f"bigmove_{idx_name}_{now_ist.date().isoformat()}_{int(abs(move['pct']))}",
             f"⚠️ LARGE MOVE: {idx_name} is {move['pct']:+.2f}% vs previous close "
             f"({prev_close:,.0f} → {spot:,.0f}). Review any open positions. Analysis only, not trading advice.",
-            0, alert_cfg)
+            24 * 60, alert_cfg)
     # Retry previously failed Telegram/webhook deliveries on subsequent app reruns.
     alert_results += process_alert_queue(alert_cfg)
 
@@ -3053,8 +3534,8 @@ for _row in health_rows:
     _hc[_row["Status"]] += 1
 st.caption(f"DATA HEALTH: {_hc['OK']} OK · {_hc['WARN']} warn · {_hc['FAIL']} fail")
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
-    "📊 Dashboard & Engine", "📐 Day Levels", "🧭 Exhaustion", "🎯 Premium Scanner",
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
+    "🛡️ Trade Desk", "📊 Dashboard & Engine", "📐 Day Levels", "🧭 Exhaustion", "🎯 Premium Scanner",
     "🤖 AI Council & News", "📋 Option Chain", "📒 Scorecard", "🩺 Data Health", "📈 GEX & Skew", "🧾 Manual Trades", "🏦 Footprint"])
 
 with tab1:
@@ -3209,7 +3690,7 @@ with tab5:
                     hide_index=True)
         if sig["signal"] in ("BUY", "SELL") and sig.get("buyer_plan"):
             _bp = sig["buyer_plan"]
-            _risk_budget = P("capital") * P("max_risk") / 100.0
+            _risk_budget = P("capital") * effective_max_risk(m) / 100.0
             _loss_unit = max(0.01, _bp["entry_ref"] - _bp["stop_premium"])
             _max_units = max(0, int(_risk_budget // _loss_unit))
             k1, k2, k3 = st.columns(3)
@@ -3257,6 +3738,10 @@ with tab7:
         if _fp_rows:
             st.markdown("##### Futures footprint vs 60-min outcome (does trading against it lose?)")
             show_df(group_table(_fp_rows, lambda r: "AGAINST footprint" if r.get("fp_against") else "WITH / neutral footprint"), hide_index=True)
+        _pb_rows = [r for r in recs if r.get("playbook")]
+        if _pb_rows:
+            st.markdown("##### Expiry-day playbook vs 60-min outcome (A morning scalp, B wall break, C late wall break)")
+            show_df(group_table(_pb_rows, lambda r: "Playbook " + str(r.get("playbook"))), hide_index=True)
         st.markdown("##### Rejection Reason Breakdown")
         show_df(rejection_breakdown_table(recs), hide_index=True)
         st.markdown("##### Recent Records")
@@ -3483,3 +3968,178 @@ with tab11:
         st.info(f"Participant OI not available ({fp_pc.get('why', 'not fetched')}). NSE may block automated downloads; the footprint filter does not depend on it.")
     st.caption("How to read this: build-ups (price and OI move together) are fresh positions; short-covering / long-unwinding (OI falling) are exits and fade. "
                "Institutions cannot be identified directly from public data; this is a rule-based proxy and is validated only by your scorecard.")
+
+
+# ============================================================
+# v16 TRADE DESK TAB
+# ============================================================
+with tab0:
+    st.markdown("#### 🛡️ TRADE DESK: where is the battlefield, what regime is this, and is buying options worth it right now")
+    st.caption("Levels are likely reaction zones, not predictions. Everything here is advisory and unproven until your scorecard says otherwise.")
+
+    _xc = m.get("xctx") or {}
+    _phase, _blocks, _pnote = session_phase(now_ist, bool(_xc.get("active")))
+    _locked, _lock_why, _risk = daily_lock_status(now_ist, EXPIRY_MAX_TRADES if _xc.get("active") else None)
+    _today_iso = now_ist.date().isoformat()
+    _rv = realized_vol(candles_pre, _today_iso, 10)
+    _ivp = m.get("iv_pct") or {"pct": None, "n": 0}
+    _sd_pts = daily_sigma(m)
+    _atm_i = (m["df"]["Strike"] - spot).abs().idxmin()
+    _straddle = float(m["df"].loc[_atm_i, "CE_LTP"]) + float(m["df"].loc[_atm_i, "PE_LTP"])
+    _lv = level_map(m, candles_pre, _today_iso)
+
+    if _locked:
+        st.error(f"DAILY RISK LOCK ACTIVE: {_lock_why}. New signals are blocked. Stop trading for today.")
+    elif _blocks:
+        st.warning(f"SESSION GUARD: {_phase}. {_pnote}")
+
+    # ---- 1. Signal + contract plan
+    _s = sig
+    if _s is None:
+        st.info("No signal object (AI errored and engine-led mode is off).")
+    else:
+        _col = "#00e676" if _s["signal"] == "BUY" else "#ff1744" if _s["signal"] == "SELL" else "#ffab00"
+        _lead = "ENGINE-LED" if P("engine_led") else "AI-LED"
+        st.markdown(f"<div style='border:2px solid {_col};border-radius:6px;padding:10px 14px;'>"
+                    f"<span style='font-size:1.4rem;color:{_col};font-weight:700;'>{esc(_s['signal'])}</span> "
+                    f"&nbsp; <span style='color:#aaa;'>{_lead} | chain agreement {_s['lean']:+d} | AI says {esc(_s['ai_signal'])} ({_s['confidence']}%)</span></div>",
+                    unsafe_allow_html=True)
+        if _s.get("note"):
+            st.caption(_s["note"])
+        _bp = _s.get("buyer_plan")
+        if _bp:
+            b1, b2, b3, b4 = st.columns(4)
+            b1.metric("CONTRACT", f"{int(_bp['strike'])} {_bp['option_type']}", f"delta {_bp['delta']:+.2f}", delta_color="off")
+            b2.metric("ENTRY REF (ask)", f"{_bp['entry_ref']:,.2f}", f"spread {_bp['spread_pct']:.1f}%", delta_color="off")
+            b3.metric("STOP (premium)", f"{_bp['stop_premium']:,.2f}")
+            b4.metric("TARGETS", f"{_bp['target1_premium']:,.2f} / {_bp['target2_premium']:,.2f}")
+
+    # ---- 2. Session and regime
+    st.markdown("##### Session and regime")
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("SESSION", _phase)
+    r2.metric("DAYS TO EXPIRY", f"{m['dte']}", "EXPIRY DAY: size down" if m["dte"] == 0 else None, delta_color="off")
+    r3.metric("MARKET REGIME", (m.get("market_regime") or {}).get("label", "—"))
+    r4.metric("DEALER GAMMA (assumed)", m["gex_regime"])
+
+    # ---- 2b. Expiry Desk
+    st.markdown("##### Expiry Desk")
+    if not _xc.get("active"):
+        st.caption(f"Expiry Mode is idle: the selected expiry is {m['dte']} day(s) away"
+                   + ("" if P("expiry_mode") else " (and Expiry Mode is switched off in the sidebar)") + ". It switches on by itself on expiry day.")
+    else:
+        e1, e2, e3, e4 = st.columns(4)
+        e1.metric("RISK PER TRADE", f"{effective_max_risk(m):.2f}%", f"half of {P('max_risk'):.1f}%", delta_color="off")
+        e2.metric("TRADES LEFT TODAY", f"{max(0, EXPIRY_MAX_TRADES - _risk['trades'])}", f"cap {EXPIRY_MAX_TRADES}", delta_color="off")
+        e3.metric("NEW ENTRIES UNTIL", "2:30 pm", "ATM or 1 strike ITM only", delta_color="off")
+        e4.metric("PIN (max pain)", f"{_xc['pin']:,.0f}", "PINNED: do not buy decay" if _xc.get("pinned") else f"{m['spot'] - _xc['pin']:+,.0f} vs spot", delta_color="off")
+        _a, _b = _xc.get("A", {}), _xc.get("B", {})
+        _dirtxt = {1: "UP", -1: "DOWN", 0: "none"}
+        _pbrows = [
+            {"Playbook": "A  Morning scalp (9:30-11:00)", "Window open": "YES" if _xc.get("a_window") else "no",
+             "Trigger": _dirtxt[_a.get("dir", 0)], "Reading": _a.get("state", "")},
+            {"Playbook": "B  Wall break (9:30-1:30)", "Window open": "YES" if (_xc.get("b_window") and not _xc.get("late")) else "no",
+             "Trigger": _dirtxt[_b.get("dir", 0)] + (" (confirmed)" if _b.get("confirmed") else ""), "Reading": _b.get("state", "")},
+            {"Playbook": "C  Late wall break + pin guard (1:30-2:30)", "Window open": "YES" if (_xc.get("b_window") and _xc.get("late")) else "no",
+             "Trigger": _dirtxt[_b.get("dir", 0)] + (" (confirmed)" if _b.get("confirmed") else ""),
+             "Reading": ("PINNED near max pain: no buying" if _xc.get("pinned") else _b.get("state", ""))},
+        ]
+        show_df(pd.DataFrame(_pbrows), hide_index=True)
+        if _s and _s.get("playbook"):
+            st.success(f"Active playbook {_s['playbook']}: time stop {_s['time_stop_min']} min, half size, exit by the time stop even if the stop has not been hit.")
+        _be = (_s or {}).get("breakeven")
+        if _be:
+            st.caption(f"Expiry breakeven for the planned contract: index at {_be['breakeven']:,.0f}, a move of {_be['required_move']:,.0f} pts "
+                       f"({(_be['vs_expected_left'] or 0):.2f}x the {m['exp_move']:,.0f} pts still expected today). Scalps exit earlier, so this is a measure of how expensive the premium is.")
+        st.caption("Playbooks are rules of thumb, tagged on every signal so your scorecard can show which (if any) has an edge. "
+                   "Opening-range, wall-break and pin triggers need intraday candles and about 10 minutes of OI history.")
+
+    # ---- 3. Is it worth buying options now?
+    st.markdown("##### Option price check (is buying expensive right now?)")
+    v1, v2, v3, v4 = st.columns(4)
+    v1.metric("ATM IV", f"{m['atm_iv']:.1f}%",
+              f"{_ivp['pct']}th pct of last 30d ({_ivp['n']} samples)" if _ivp["pct"] is not None
+              else f"percentile building ({_ivp['n']}/30 samples)", delta_color="off")
+    v2.metric("REALISED VOL (10d)", f"{_rv:.1f}%" if _rv else "n/a",
+              f"IV minus RV {m['atm_iv'] - _rv:+.1f} pts" if _rv else None, delta_color="off")
+    v3.metric("ATM STRADDLE", f"{_straddle:,.0f}", f"expected daily move ±{_sd_pts:,.0f} pts", delta_color="off")
+    v4.metric("EXPECTED MOVE TO EXPIRY (±)", f"{m['exp_move']:,.0f}", f"{m['lower_1sigma']:,.0f} to {m['upper_1sigma']:,.0f}", delta_color="off")
+    st.caption("When IV is well above recent realised volatility, buyers need a bigger move than the market has recently delivered just to break even. "
+               "The percentile is built from samples this app records while it is open, so it needs weeks to become meaningful; keep BBG_DATA_DIR on a persistent disk.")
+
+    # ---- 4. Level map
+    st.markdown("##### Level map (confluence zones)")
+    if _lv.empty:
+        st.info("No levels available yet.")
+    else:
+        _above = _lv[_lv["Dist pts"] > 0].head(4)
+        _below = _lv[_lv["Dist pts"] <= 0].head(4)
+        show_df(pd.concat([_above.sort_values("Dist pts", ascending=False), _below]), hide_index=True)
+        st.caption("Score adds up how many independent sources meet in a zone (OI walls and gamma flip count double). STRONG = 5 or more. "
+                   "Use zones to judge room to run before your target and where price may stall or reverse; wait for rejection or acceptance before acting.")
+
+    # ---- 5. Daily risk lock
+    st.markdown("##### Daily risk lock")
+    k1, k2, k3, k4 = st.columns(4)
+    _pnl_in = k1.number_input("REALISED P&L TODAY ₹", value=float(_risk["pnl"]), step=500.0, key="dr_pnl")
+    _tr_in = k2.number_input("TRADES TAKEN TODAY", min_value=0, value=int(_risk["trades"]), step=1, key="dr_trades")
+    _ml_in = k3.number_input("DAILY MAX LOSS ₹", min_value=0.0, value=float(_risk["max_loss"]), step=500.0, key="dr_maxloss")
+    _mt_in = k4.number_input("MAX TRADES / DAY", min_value=1, value=int(_risk["max_trades"]), step=1, key="dr_maxtrades")
+    if st.button("SAVE DAILY RISK", key="dr_save"):
+        save_daily_risk({"date": _today_iso, "pnl": float(_pnl_in), "trades": int(_tr_in),
+                         "max_loss": float(_ml_in), "max_trades": int(_mt_in)})
+        st.success("Saved. The lock applies to new signals on the next refresh.")
+    st.caption("Defaults: max loss = 2 x your per-trade risk, 3 trades a day. The lock only blocks new signals here; it cannot stop orders you place elsewhere.")
+
+    # ---- 6. Pre-trade checklist
+    st.markdown("##### Pre-trade checklist")
+    _rows = []
+
+    def _chk(name, status, detail):
+        _rows.append({"Check": name, "Status": status, "Detail": detail})
+
+    _chk("Data gate", "PASS" if data_ok else "FAIL", "open" if data_ok else gate_reason)
+    _chk("Signal", "PASS" if (_s and _s["signal"] != "WAIT") else "FAIL",
+         _s["signal"] if _s else "none")
+    _chk("Session", "FAIL" if _blocks else ("WARN" if _pnote else "PASS"), f"{_phase}. {_pnote}".strip())
+    _chk("Daily risk lock", "FAIL" if _locked else "PASS", _lock_why or "within limits")
+    _fpd = m.get("fp") or {}
+    _chk("Futures footprint", "PASS" if _fpd.get("ok") else "WARN",
+         f"bias {_fpd.get('bias')}" if _fpd.get("ok") else f"unavailable ({str(_fpd.get('why', ''))[:70]})")
+    _bp2 = _s.get("buyer_plan") if _s else None
+    _chk("Contract liquidity", "PASS" if _bp2 else "FAIL",
+         f"spread {_bp2['spread_pct']:.1f}%, volume {_bp2['volume']:,}" if _bp2 else "no contract passed spread/volume/delta filters")
+    if _ivp["pct"] is None:
+        _chk("IV level", "WARN", f"history still building ({_ivp['n']}/30 samples)")
+    else:
+        _chk("IV level", "WARN" if _ivp["pct"] >= 85 else "PASS", f"{_ivp['pct']}th percentile of the last 30 days")
+    if _rv:
+        _gap = m["atm_iv"] - _rv
+        _chk("IV vs realised vol", "WARN" if _gap > 5 else "PASS", f"IV is {_gap:+.1f} pts vs 10-day realised")
+    _chk("Expiry day", "WARN" if m["dte"] == 0 else "PASS",
+         "gamma and theta are extreme: size down, keep it short" if m["dte"] == 0 else f"{m['dte']} days to expiry")
+    if _xc.get("active"):
+        _chk("Expiry playbook", "PASS" if (_s and _s.get("playbook")) else "FAIL",
+             f"playbook {_s['playbook']}, time stop {_s['time_stop_min']} min" if (_s and _s.get("playbook")) else "no confirmed trigger in your direction")
+    if _s and _s["signal"] in ("BUY", "SELL") and not _lv.empty and _sd_pts:
+        _want_up = _s["signal"] == "BUY"
+        _blk = _lv[(_lv["Dist pts"] > 0) & (_lv["Strength"] == "STRONG")] if _want_up else _lv[(_lv["Dist pts"] < 0) & (_lv["Strength"] == "STRONG")]
+        _blk = _blk[_blk["Dist σ"].fillna(9) <= 0.25]
+        _chk("Room to run", "WARN" if len(_blk) else "PASS",
+             (f"STRONG zone {int(_blk.iloc[0]['Zone'])} within 0.25 σ in your direction" if len(_blk) else "no STRONG zone within 0.25 σ ahead"))
+    _event = st.checkbox("A major event is scheduled today (RBI / Fed / Budget / results)", key="td_event")
+    _chk("Event risk", "WARN" if _event else "PASS", "expect IV crush and gaps" if _event else "none flagged by you")
+    show_df(pd.DataFrame(_rows), hide_index=True)
+
+    _m1 = st.checkbox("I know my exit (stop premium AND a time stop) before I enter", key="td_exit")
+    _m2 = st.checkbox("Position size keeps my loss within my max risk", key="td_size")
+    _fails = [r for r in _rows if r["Status"] == "FAIL"]
+    _warns = [r for r in _rows if r["Status"] == "WARN"]
+    if _fails:
+        st.error("NO-GO: " + ", ".join(r["Check"] for r in _fails))
+    elif not (_m1 and _m2):
+        st.warning("Tick both confirmations above before entering.")
+    elif _warns:
+        st.warning("CAUTION: " + ", ".join(r["Check"] for r in _warns) + ". Entry is your call; consider smaller size.")
+    else:
+        st.success("GO: all checks pass. Execute manually and respect your stop.")
