@@ -2697,28 +2697,19 @@ def process_alert_queue(cfg, max_per_run=4):
     return results
 
 
-MIN_ALERT_COOLDOWN_MIN = 5   # safety floor: a cooldown of 0 would resend on every 30s autorefresh
-
-
 def fire_alert(key, text, cooldown_min, cfg):
     if not cfg.get("enabled") or not (cfg.get("tg_token") and cfg.get("tg_chat") or cfg.get("hook")):
         return []
-    cooldown_min = max(float(cooldown_min or 0), MIN_ALERT_COOLDOWN_MIN)
     now_ts = time.time()
     state = _load_json(ALERT_FILE, {})
     state = {k: v for k, v in state.items() if now_ts - float(v) < ALERT_STATE_KEEP_SEC}
     if now_ts - float(state.get(key, 0)) < cooldown_min * 60:
         return []
-    # Reserve the key BEFORE sending so a second session/tab rerunning at the same moment skips it.
-    state[key] = now_ts
-    _save_json(ALERT_FILE, state)
     res = send_alert(text, cfg.get("tg_token", ""), cfg.get("tg_chat", ""), cfg.get("hook", ""))
-    if not delivery_succeeded(res, cfg):
-        # Release the reservation; the retry queue will resend (and re-mark the key on success).
-        state = _load_json(ALERT_FILE, {})
-        if state.get(key) == now_ts:
-            state.pop(key, None)
-            _save_json(ALERT_FILE, state)
+    if delivery_succeeded(res, cfg):
+        state[key] = now_ts
+        _save_json(ALERT_FILE, state)
+    else:
         queue_failed_alert(key, text, "; ".join(msg for _, ok, msg in res if not ok) or "delivery failed")
     return res
 
@@ -3508,7 +3499,7 @@ if alerts_on and tg_token and tg_chat:
             f"bigmove_{idx_name}_{now_ist.date().isoformat()}_{int(abs(move['pct']))}",
             f"⚠️ LARGE MOVE: {idx_name} is {move['pct']:+.2f}% vs previous close "
             f"({prev_close:,.0f} → {spot:,.0f}). Review any open positions. Analysis only, not trading advice.",
-            24 * 60, alert_cfg)
+            0, alert_cfg)
     # Retry previously failed Telegram/webhook deliveries on subsequent app reruns.
     alert_results += process_alert_queue(alert_cfg)
 
