@@ -1,5 +1,5 @@
 """
-VIPUL OPTIONS BUYER SIGNAL TERMINAL v16.0 (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
+VIPUL OPTIONS BUYER SIGNAL TERMINAL v16.1 (reliability fixes: candidate logging, field-aware scorecard merge, retryable close capture)
 v15.1 adds an INSTITUTIONAL FOOTPRINT layer (needs footprint.py next to this file):
  - Index-futures price / volume / open-interest flow + session VWAP decide whether money is really moving your way
  - Footprint filter: VETO AGAINST (default) / REQUIRE ALIGNED / OFF; blocked signals are still logged with footprint fields
@@ -64,7 +64,7 @@ try:
 except ImportError:
     Groq = None
 
-st.set_page_config(page_title="Vipul Options Buyer Terminal v16.0", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Vipul Options Buyer Terminal v16.1", layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
 # CSS
@@ -1673,11 +1673,14 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
     notes = []
     sl_buf = SL_BUFFER * m["step"] / 50.0
     engine_led = bool(P("engine_led"))
+    engine_signal = {1: "BUY", -1: "SELL", 0: "WAIT"}[
+        1 if lean >= min_confirm else -1 if lean <= -min_confirm else 0
+    ]
     if engine_led:
-        # v16: the numeric chain engine decides direction; the AI council is advisory only.
+        # The deterministic chain engine decides direction; the AI council is advisory only.
         direction = 1 if lean >= min_confirm else -1 if lean <= -min_confirm else 0
         net = lean * direction
-        sig = {1: "BUY", -1: "SELL", 0: "WAIT"}[direction]
+        sig = engine_signal
         if sig == "WAIT":
             notes.append(f"Engine-led: option-chain agreement {lean:+d} is inside ±{min_confirm}, so there is no direction yet.")
         elif ai_sig in ("BUY", "SELL") and ai_sig != sig:
@@ -1686,6 +1689,10 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
             notes.append("Advisory: AI council says WAIT.")
     else:
         sig = ai_sig
+    # Freeze the candidate before expiry/data/risk/contract gates can turn it into WAIT.
+    # In AI-led mode the AI direction is the candidate; in engine-led mode it is the
+    # deterministic engine direction. Expiry playbook overrides update it explicitly below.
+    candidate_signal = sig
     target, sl, rr = None, None, None
 
     # v16 expiry mode: on expiry day a trade needs a playbook trigger that matches its direction.
@@ -1708,6 +1715,7 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
             sig = "BUY" if trig_b["dir"] > 0 else "SELL"
             direction = trig_b["dir"]
             net, b_lead, playbook = lean * direction, True, tag_b
+            candidate_signal = sig
             notes.append(f"Expiry playbook {playbook} leads: {trig_b['state']}. Chain agreement is only {lean:+d}, so size down further.")
         if sig != "WAIT" and xc.get("pinned") and playbook not in ("B", "C"):
             notes.append(f"{sig} rejected: price is pinned near max pain {xc.get('pin', 0):,.0f} with a compressed range. Do not buy decay.")
@@ -1878,7 +1886,8 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
             sig, target, sl, rr, buyer_plan, playbook = "WAIT", None, None, None, None, None
         elif be_info["vs_avg30"] is not None and be_info["vs_avg30"] > 1.5:
             notes.append(f"Caution: breakeven needs {be_info['required_move']:,.0f} pts, {be_info['vs_avg30']:.1f}x today's typical 30-minute range.")
-    return {"signal": sig, "ai_signal": ai_sig, "entry": entry, "target": target, "sl": sl, "rr": rr,
+    return {"signal": sig, "candidate_signal": candidate_signal, "engine_signal": engine_signal,
+            "ai_signal": ai_sig, "entry": entry, "target": target, "sl": sl, "rr": rr,
             "confidence": conf, "note": " ".join(notes), "checks": checks, "net": net, "lean": lean,
             "families": families, "direction": direction, "buyer_plan": buyer_plan,
             "playbook": playbook, "time_stop_min": time_stop, "expiry_day": bool(xc.get("active")), "breakeven": be_info}
@@ -2697,19 +2706,28 @@ def process_alert_queue(cfg, max_per_run=4):
     return results
 
 
+MIN_ALERT_COOLDOWN_MIN = 5   # safety floor: a cooldown of 0 would resend on every 30s autorefresh
+
+
 def fire_alert(key, text, cooldown_min, cfg):
     if not cfg.get("enabled") or not (cfg.get("tg_token") and cfg.get("tg_chat") or cfg.get("hook")):
         return []
+    cooldown_min = max(float(cooldown_min or 0), MIN_ALERT_COOLDOWN_MIN)
     now_ts = time.time()
     state = _load_json(ALERT_FILE, {})
     state = {k: v for k, v in state.items() if now_ts - float(v) < ALERT_STATE_KEEP_SEC}
     if now_ts - float(state.get(key, 0)) < cooldown_min * 60:
         return []
+    # Reserve the key BEFORE sending so a second session/tab rerunning at the same moment skips it.
+    state[key] = now_ts
+    _save_json(ALERT_FILE, state)
     res = send_alert(text, cfg.get("tg_token", ""), cfg.get("tg_chat", ""), cfg.get("hook", ""))
-    if delivery_succeeded(res, cfg):
-        state[key] = now_ts
-        _save_json(ALERT_FILE, state)
-    else:
+    if not delivery_succeeded(res, cfg):
+        # Release the reservation; the retry queue will resend (and re-mark the key on success).
+        state = _load_json(ALERT_FILE, {})
+        if state.get(key) == now_ts:
+            state.pop(key, None)
+            _save_json(ALERT_FILE, state)
         queue_failed_alert(key, text, "; ".join(msg for _, ok, msg in res if not ok) or "delivery failed")
     return res
 
@@ -2769,20 +2787,74 @@ def load_scorecard():
 
 
 def _merge_rec(a, b):
-    """Combine two copies of the same record written by different sessions without losing progress."""
+    """Merge two session copies without discarding measurement or manual-trade progress."""
+    a = dict(a or {})
+    b = dict(b or {})
+    state_rank = {"NO_CONTRACT": 0, "SIGNAL_ONLY": 1, "CANCELLED": 2, "POSITION_OPEN": 3, "EXITED": 4}
+
+    def lifecycle_rank(r):
+        state = state_rank.get(str(r.get("trade_state") or ""), 0)
+        if r.get("manual_entry_confirmed") is True:
+            state = max(state, 3)
+        if r.get("actual_exit_ts") is not None or r.get("actual_net_pnl") is not None:
+            state = max(state, 4)
+        return (state, float(r.get("actual_exit_ts") or 0), float(r.get("actual_entry_ts") or 0),
+                float(r.get("updated_at") or r.get("ts") or 0))
+
+    preferred, other = (b, a) if lifecycle_rank(b) > lifecycle_rank(a) else (a, b)
     if b.get("resolved") and not a.get("resolved"):
-        base, other = dict(b), a
+        base, fallback = dict(b), a
     elif a.get("resolved") and not b.get("resolved"):
-        base, other = dict(a), b
-    elif (a.get("samples") or 0) >= (b.get("samples") or 0):
-        base, other = dict(a), b
+        base, fallback = dict(a), b
     else:
-        base, other = dict(b), a
+        base, fallback = (dict(b), a) if (b.get("samples") or 0) > (a.get("samples") or 0) else (dict(a), b)
+
+    for k, v in fallback.items():
+        if (base.get(k) is None or base.get(k) == "") and v is not None and v != "":
+            base[k] = v
+
     for k in ("mfe", "mae", "max_gap_min", "samples"):
-        base[k] = max(base.get(k) or 0, other.get(k) or 0)
+        vals = [x for x in (a.get(k), b.get(k)) if isinstance(x, (int, float)) and math.isfinite(x)]
+        if vals:
+            base[k] = max(vals)
+
     for k in ("s15", "s30", "s60", "sclose", "first_touch"):
-        if base.get(k) is None and other.get(k) is not None:
-            base[k] = other[k]
+        av, bv = a.get(k), b.get(k)
+        if av is None and bv is not None:
+            base[k] = bv
+        elif bv is None and av is not None:
+            base[k] = av
+        elif av is not None and bv is not None:
+            if k == "first_touch":
+                base[k] = "STOP" if "STOP" in (av, bv) else av
+            else:
+                base[k] = av if a.get("ts", 0) <= b.get("ts", 0) else bv
+
+    lifecycle_fields = (
+        "manual_entry_confirmed", "trade_state", "actual_entry_price", "actual_entry_qty",
+        "actual_entry_ts", "actual_exit_price", "actual_exit_ts", "actual_fees",
+        "actual_net_pnl", "option_event_state", "option_last_mark", "option_stop",
+        "option_target1", "option_target2"
+    )
+    for k in lifecycle_fields:
+        pv, ov = preferred.get(k), other.get(k)
+        if pv is not None and pv != "":
+            base[k] = pv
+        elif ov is not None and ov != "":
+            base[k] = ov
+    # Fees are cumulative across entry and exit; never reduce them during a merge.
+    fee_values = [x for x in (a.get("actual_fees"), b.get("actual_fees"))
+                  if isinstance(x, (int, float)) and math.isfinite(x)]
+    if fee_values:
+        base["actual_fees"] = max(fee_values)
+
+    if preferred.get("manual_entry_confirmed") is True:
+        base["manual_entry_confirmed"] = True
+    if base.get("actual_net_pnl") is not None and base.get("actual_exit_ts") is not None:
+        base["trade_state"] = "EXITED"
+    elif base.get("manual_entry_confirmed") is True and base.get("actual_exit_ts") is None:
+        base["trade_state"] = "POSITION_OPEN"
+
     base["touch_alerted"] = bool(a.get("touch_alerted") or b.get("touch_alerted"))
     if base.get("resolved") and base.get("first_touch") in ("TARGET", "STOP") and base.get("outcome") in ("TIMEOUT", "RESOLVED", "OPEN"):
         base["outcome"] = base["first_touch"]
@@ -2859,7 +2931,7 @@ def fp_fields(m, direction):
 
 
 def make_record(kind, idx_name, expiry, m, sig, ai, tone, now):
-    direction = sig["signal"] if kind == "VALIDATED" else sig["ai_signal"]
+    direction = sig["signal"] if kind == "VALIDATED" else sig.get("candidate_signal", sig.get("ai_signal", "WAIT"))
     ex = m.get("exh") or {}
     ready = bool(ex.get("ready"))
     own = (ex["buyer"] if direction == "BUY" else ex["seller"]) if ready else None
@@ -2869,7 +2941,12 @@ def make_record(kind, idx_name, expiry, m, sig, ai, tone, now):
     return {
         "id": hashlib.sha256(f"{now.timestamp()}|{trade_key}|{kind}".encode()).hexdigest()[:12], "trade_key": trade_key,
         "kind": kind, "ts": now.timestamp(), "date": now.date().isoformat(), "time": now.strftime("%H:%M:%S"),
-        "index": idx_name, "expiry": str(expiry)[:10], "signal": direction, "entry": round(float(m["spot"]), 2),
+        "index": idx_name, "expiry": str(expiry)[:10], "signal": direction,
+        "candidate_signal": sig.get("candidate_signal", direction),
+        "engine_direction": sig.get("engine_signal", "WAIT"),
+        "ai_direction": sig.get("ai_signal", "WAIT"),
+        "final_direction": sig.get("signal", "WAIT"),
+        "entry": round(float(m["spot"]), 2),
         "target": sig["target"] if kind == "VALIDATED" else None, "sl": sig["sl"] if kind == "VALIDATED" else None,
         "rr": sig["rr"] if kind == "VALIDATED" else None, "confidence": sig["confidence"], "net": sig["net"],
         "lean": sig["lean"], "checks": {c["name"]: c["v"] for c in sig["checks"]},
@@ -2932,8 +3009,13 @@ def maybe_log_signal(recs, idx_name, expiry, m, sig, ai, tone, now):
     if sig["signal"] in ("BUY", "SELL"):
         if not recent("VALIDATED", sig["signal"]):
             new.append(make_record("VALIDATED", idx_name, expiry, m, sig, ai, tone, now))
-    elif sig["ai_signal"] in ("BUY", "SELL"):
-        if not recent("REJECTED", sig["ai_signal"]):
+    else:
+        candidate = sig.get("candidate_signal")
+        if candidate not in ("BUY", "SELL"):
+            # Backward compatibility for older callers/records, but never substitute
+            # an AI opinion for an engine-led WAIT decision.
+            candidate = sig.get("ai_signal") if not bool(P("engine_led")) else "WAIT"
+        if candidate in ("BUY", "SELL") and not recent("REJECTED", candidate):
             new.append(make_record("REJECTED", idx_name, expiry, m, sig, ai, tone, now))
     recs.extend(new)
     return new
@@ -3025,17 +3107,24 @@ def update_outcomes(recs, idx_name, spot, now, candles, intraday=None, option_df
         if past_close:
             if r["date"] in closes:
                 r["sclose"] = round(float(closes[r["date"]]), 2)
-            r["resolved"] = True
             if r["first_touch"] in ("TARGET", "STOP"):
                 r["outcome"] = r["first_touch"]
-            elif r.get("sclose") is not None and r["target"] is not None:
+                r["resolved"] = True
+            elif r.get("sclose") is not None and r.get("target") is not None:
                 r["outcome"] = "TIMEOUT"
-            elif r["target"] is not None:
-                r["outcome"] = "DATA_GAP"
+                r["resolved"] = True
+            elif r.get("target") is not None:
+                # Keep retryable: a later historical-candle fetch can recover the close.
+                r["outcome"] = "CLOSE_NOT_CAPTURED"
+                r["close_capture_missing"] = True
+                r["resolved"] = False
+                r["close_capture_last_checked"] = now.timestamp()
             else:
                 r["outcome"] = "RESOLVED"
+                r["resolved"] = True
             changed = True
-            resolved_now.append({**r, "resolved_time": stamp})
+            if r["resolved"]:
+                resolved_now.append({**r, "resolved_time": stamp})
     return changed, resolved_now, touched_now
 
 
@@ -3179,11 +3268,24 @@ def records_from_df(df):
 
 
 def merge_scorecard(existing, incoming):
-    have = {r["id"] for r in existing}
-    added = [r for r in incoming if isinstance(r, dict) and r.get("id") and r["id"] not in have]
-    existing.extend(added)
-    existing.sort(key=lambda r: r["ts"])
-    return len(added)
+    """Merge imported scorecard rows by ID, reconciling progress instead of dropping updates."""
+    by_id = {r.get("id"): i for i, r in enumerate(existing) if isinstance(r, dict) and r.get("id")}
+    changed = 0
+    for row in incoming:
+        if not isinstance(row, dict) or not row.get("id"):
+            continue
+        i = by_id.get(row["id"])
+        if i is None:
+            existing.append(dict(row))
+            by_id[row["id"]] = len(existing) - 1
+            changed += 1
+        else:
+            merged = _merge_rec(existing[i], row)
+            if merged != existing[i]:
+                existing[i] = merged
+                changed += 1
+    existing.sort(key=lambda r: r.get("ts", 0))
+    return changed
 
 
 # ---------------- data health ----------------
@@ -3263,7 +3365,7 @@ def esc(x):
 # SIDEBAR
 # ============================================================
 with st.sidebar:
-    st.markdown("### BBG // BUYER TERMINAL v15.1 HARDENED")
+    st.markdown("### BBG // BUYER TERMINAL v16.1 RELIABILITY")
     dhan_token = clean(get_secret("DHAN_ACCESS_TOKEN", DEFAULT_DHAN_TOKEN))
     client_id = clean(get_secret("DHAN_CLIENT_ID", DEFAULT_CLIENT_ID))
     groq_key = get_secret("GROQ_API_KEY", DEFAULT_GROQ_KEY).strip()
@@ -3499,7 +3601,7 @@ if alerts_on and tg_token and tg_chat:
             f"bigmove_{idx_name}_{now_ist.date().isoformat()}_{int(abs(move['pct']))}",
             f"⚠️ LARGE MOVE: {idx_name} is {move['pct']:+.2f}% vs previous close "
             f"({prev_close:,.0f} → {spot:,.0f}). Review any open positions. Analysis only, not trading advice.",
-            0, alert_cfg)
+            24 * 60, alert_cfg)
     # Retry previously failed Telegram/webhook deliveries on subsequent app reruns.
     alert_results += process_alert_queue(alert_cfg)
 
