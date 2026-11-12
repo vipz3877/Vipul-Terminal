@@ -2013,19 +2013,24 @@ def fetch_daily_candles(scrip, seg, token, client_id):
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_intraday_candles(scrip, seg, token, client_id):
-    """Today's 1-minute index candles (used so target/stop touches and MFE/MAE see intrabar wicks)."""
-    today = datetime.now(IST).date().isoformat()
-    r = requests.post(f"{BASE_URL}/charts/intraday", headers=auth_headers(token, client_id),
-                      json={"securityId": str(scrip), "exchangeSegment": seg, "instrument": "INDEX",
-                            "interval": "1", "fromDate": f"{today} 09:15:00", "toDate": f"{today} 15:30:00"},
-                      timeout=12)
-    check(r)
-    d = r.json()
-    n = len(d.get("close", []))
-    if n == 0:
-        raise RuntimeError("empty intraday response")
-    return [{"ts": _epoch(d["timestamp"][i]), "h": float(d["high"][i]), "l": float(d["low"][i]),
-             "c": float(d["close"][i])} for i in range(n)]
+    """Today's 1-minute index candles (with prior-session fallback between 00:00 and 09:15 IST)."""
+    now = datetime.now(IST)
+    today_dt = now.date()
+    days_try = [today_dt.isoformat()] if (now.hour * 60 + now.minute) >= (9 * 60 + 16) else []
+    days_try += [(today_dt - timedelta(days=k)).isoformat() for k in range(1, 5)]
+    for day_iso in days_try:
+        r = requests.post(f"{BASE_URL}/charts/intraday", headers=auth_headers(token, client_id),
+                          json={"securityId": str(scrip), "exchangeSegment": seg, "instrument": "INDEX",
+                                "interval": "1", "fromDate": f"{day_iso} 09:15:00", "toDate": f"{day_iso} 15:30:00"},
+                          timeout=12)
+        if not r.ok:
+            continue
+        d = r.json() or {}
+        n = len(d.get("close", []))
+        if n > 0:
+            return [{"ts": _epoch(d["timestamp"][i]), "h": float(d["high"][i]), "l": float(d["low"][i]),
+                     "c": float(d["close"][i])} for i in range(n)]
+    raise RuntimeError("empty intraday response")
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
@@ -2035,7 +2040,56 @@ def _fp_future(idx_name, override, day):
 
 @st.cache_data(ttl=25, show_spinner=False)
 def _fp_candles(sec_id, token, client_id, day, segment="NSE_FNO"):
-    return FP.fetch_future_candles(sec_id, token, client_id, segment=segment)
+    try:
+        return FP.fetch_future_candles(sec_id, token, client_id, segment=segment)
+    except Exception as first_err:
+        # Off-hours / post-midnight fallback: walk back up to 5 prior calendar days if today's session hasn't opened yet
+        today_dt = datetime.now(IST).date()
+        for d_back in range(1, 6):
+            prev_iso = (today_dt - timedelta(days=d_back)).isoformat()
+            for f_dt, t_dt in ((f"{prev_iso} 09:15:00", f"{prev_iso} 15:30:00"), (prev_iso, prev_iso)):
+                try:
+                    r = requests.post(
+                        f"{BASE_URL}/charts/intraday",
+                        headers=auth_headers(token, client_id),
+                        json={
+                            "securityId": str(sec_id),
+                            "exchangeSegment": segment,
+                            "instrument": "FUTIDX",
+                            "interval": "1",
+                            "oi": True,
+                            "fromDate": f_dt,
+                            "toDate": t_dt,
+                        },
+                        timeout=12,
+                    )
+                    if not r.ok:
+                        continue
+                    d = r.json() or {}
+                    if "data" in d and isinstance(d["data"], dict):
+                        d = d["data"]
+                    closes = d.get("close") or []
+                    n = len(closes)
+                    if n == 0:
+                        continue
+                    ts_arr = d.get("timestamp") or [0] * n
+                    opens = d.get("open") or closes
+                    highs = d.get("high") or closes
+                    lows = d.get("low") or closes
+                    vols = d.get("volume") or [0.0] * n
+                    ois = d.get("open_interest") or d.get("oi") or [0.0] * n
+                    return [{
+                        "ts": _epoch(ts_arr[i]) if ts_arr[i] else time.time(),
+                        "o": float(opens[i] or 0.0),
+                        "h": float(highs[i] or 0.0),
+                        "l": float(lows[i] or 0.0),
+                        "c": float(closes[i] or 0.0),
+                        "v": float(vols[i] or 0.0),
+                        "oi": float(ois[i] or 0.0),
+                    } for i in range(n)]
+                except Exception:
+                    continue
+        raise first_err
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
