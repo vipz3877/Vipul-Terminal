@@ -1,5 +1,5 @@
 """
-VIPUL OPTIONS BUYER SIGNAL TERMINAL v16.3 (PRE-CHART IGNITION + FULL BUY/SELL SYMMETRY + DYNAMIC POCKET STOP) (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
+VIPUL OPTIONS BUYER SIGNAL TERMINAL v16.4 (PRE-CHART IGNITION + TWO-WAY TREND REVERSAL RADAR + FULL SYMMETRY) (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
 v15.1 adds an INSTITUTIONAL FOOTPRINT layer (needs footprint.py next to this file):
  - Index-futures price / volume / open-interest flow + session VWAP decide whether money is really moving your way
  - Footprint filter: VETO AGAINST (default) / REQUIRE ALIGNED / OFF; blocked signals are still logged with footprint fields
@@ -64,7 +64,7 @@ try:
 except ImportError:
     Groq = None
 
-st.set_page_config(page_title="Vipul Options Buyer Terminal v16.3", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Vipul Options Buyer Terminal v16.4", layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
 # CSS
@@ -1850,29 +1850,39 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
                 notes.append(f"{sig} rejected: futures footprint is stale ({fp_age:.0f}s old; maximum 180s).")
                 sig = "WAIT"
 
-    # Regime gate (v16.3: STRICT allows Pre-Chart Ignition >= 3/4 to catch the birth of a rally before 12 spot snapshots trend).
+    # Regime gate (v16.4: supports Pre-Chart Ignition for range breakouts AND Institutional Reversal override for top/bottom turns).
     if sig != "WAIT":
         regime_info = m.get("market_regime") or {}
         regime = str(regime_info.get("label", "UNAVAILABLE")).upper()
         mode = str(P("regime_gate"))
         ign = m.get("ignition") or {}
+        rev = m.get("reversal") or {}
         ign_aligned = (sig == "BUY" and ign.get("dir") == 1 and ign.get("score", 0) >= 2) or (
             sig == "SELL" and ign.get("dir") == -1 and ign.get("score", 0) >= 2)
+        rev_aligned = (sig == "BUY" and rev.get("dir") == 1) or (sig == "SELL" and rev.get("dir") == -1)
         against = (sig == "BUY" and regime == "TRENDING DOWN") or (sig == "SELL" and regime == "TRENDING UP")
         if mode.startswith("STRICT"):
             if against:
-                notes.append(f"{sig} rejected: signal direction conflicts with market regime {regime}.")
-                sig = "WAIT"
+                if rev_aligned:
+                    notes.append(f"Institutional Reversal override ({rev.get('label')}): catching turn at {rev.get('level'):,.0f} before {regime} regime flips.")
+                else:
+                    notes.append(f"{sig} rejected: signal direction conflicts with market regime {regime} (no reversal footprint at wall).")
+                    sig = "WAIT"
             elif regime not in ("TRENDING UP", "TRENDING DOWN"):
-                if ign_aligned:
+                if rev_aligned:
+                    notes.append(f"Institutional Reversal override ({rev.get('label')}): entering turn at {rev.get('level'):,.0f}.")
+                elif ign_aligned:
                     notes.append(f"Pre-Chart Ignition override ({ign.get('label')}): entering early before spot-history regime flips.")
                 else:
-                    notes.append(f"{sig} rejected: market regime is {regime} and no Pre-Chart Ignition override is active (STRICT regime gate).")
+                    notes.append(f"{sig} rejected: market regime is {regime} and no Pre-Chart Ignition / Reversal override is active (STRICT regime gate).")
                     sig = "WAIT"
         elif mode.startswith("SOFT"):
             if against:
-                notes.append(f"{sig} rejected: it fights a clear trend (regime {regime}).")
-                sig = "WAIT"
+                if rev_aligned:
+                    notes.append(f"Institutional Reversal override ({rev.get('label')}): catching counter-trend turn at {rev.get('level'):,.0f}.")
+                else:
+                    notes.append(f"{sig} rejected: it fights a clear trend (regime {regime}) without a reversal footprint.")
+                    sig = "WAIT"
             elif regime not in ("TRENDING UP", "TRENDING DOWN"):
                 notes.append(f"Caution: regime is {regime}, not a clear trend; expect chop and keep size small.")
         elif against:
@@ -2271,6 +2281,87 @@ def pre_chart_ignition(m, hist, lookback_min=15):
         out.update({"dir": 1, "score": bull_pts, "label": f"⚡ BULLISH PRE-CHART IGNITION ({bull_pts}/4)"})
     elif bear_pts >= 2 and bear_pts > bull_pts:
         out.update({"dir": -1, "score": bear_pts, "label": f"⚡ BEARISH PRE-CHART IGNITION ({bear_pts}/4)"})
+    return out
+
+
+def detect_institutional_reversal(m, hist):
+    """Detects two-way pre-chart institutional trend reversals at key structural levels (XYZ):
+    - UPTREND -> BEARISH REVERSAL (Top Trap at Resistance Wall -> BUY PUT)
+    - DOWNTREND -> BULLISH REVERSAL (Bottom Trap at Support Wall -> BUY CALL)
+    Fires BEFORE the 12-snapshot spot-price regime flips."""
+    out = {"dir": 0, "type": "NONE", "level": None, "label": "NONE", "reasons": [], "action": "WAIT"}
+    if not hist or len(hist) < 3:
+        return out
+
+    spot = float(m["spot"])
+    sd = max(daily_sigma(m), 1.0)
+    prev_close = float(m.get("prev_close") or spot)
+    h_high = max(float(h.get("spot", spot)) for h in hist)
+    h_low = min(float(h.get("spot", spot)) for h in hist)
+
+    up_ext = max(spot - h_low, spot - prev_close, 0.0) / sd
+    dn_ext = max(h_high - spot, prev_close - spot, 0.0) / sd
+
+    regime = str((m.get("market_regime") or {}).get("label", "")).upper()
+    ign = m.get("ignition") or {}
+    exh = m.get("exh") or {}
+    jobber = m.get("jobber") or {}
+    mt = str(jobber.get("micro_turn", ""))
+    res = (m.get("struct") or {}).get("res")
+    sup = (m.get("struct") or {}).get("sup")
+
+    # --- 1. Check UPTREND -> BEARISH REVERSAL (Top Trap at Resistance XYZ) ---
+    was_uptrend = (regime == "TRENDING UP") or (up_ext >= 0.35)
+    res_lvl = float(res["level"]) if res else float(m.get("call_wall") or spot)
+    near_res = abs(res_lvl - spot) / sd <= 0.38
+    b_exh_score = int(((exh.get("buyer") or {}).get("score")) or 0) if exh.get("ready") else 0
+    bear_absorb = ("BEARISH" in mt) or (b_exh_score >= 50) or (near_res and res and float(res.get("chg") or 0) > 0)
+
+    if was_uptrend and bear_absorb and ign.get("dir") == -1 and ign.get("score", 0) >= 2:
+        reasons = [f"extended +{up_ext:.2f}σ / {regime or 'UP'}"]
+        if near_res:
+            reasons.append(f"testing CE wall {res_lvl:,.0f}")
+        if b_exh_score >= 50:
+            reasons.append(f"buyer exhaustion {b_exh_score}/100")
+        if "BEARISH" in mt:
+            reasons.append(mt)
+        reasons.extend(ign.get("reasons", [])[:2])
+        out.update({
+            "dir": -1,
+            "type": "TOP_REVERSAL_BEARISH",
+            "level": res_lvl,
+            "action": "BUY PUT (Reversal)",
+            "label": f"🔄 BEARISH REVERSAL AT {res_lvl:,.0f} (Top Trap)",
+            "reasons": reasons,
+        })
+        return out
+
+    # --- 2. Check DOWNTREND -> BULLISH REVERSAL (Bottom Trap at Support XYZ) ---
+    was_downtrend = (regime == "TRENDING DOWN") or (dn_ext >= 0.35)
+    sup_lvl = float(sup["level"]) if sup else float(m.get("put_wall") or spot)
+    near_sup = abs(spot - sup_lvl) / sd <= 0.38
+    s_exh_score = int(((exh.get("seller") or {}).get("score")) or 0) if exh.get("ready") else 0
+    bull_absorb = ("BULLISH" in mt) or (s_exh_score >= 50) or (near_sup and sup and float(sup.get("chg") or 0) > 0)
+
+    if was_downtrend and bull_absorb and ign.get("dir") == 1 and ign.get("score", 0) >= 2:
+        reasons = [f"dropped -{dn_ext:.2f}σ / {regime or 'DOWN'}"]
+        if near_sup:
+            reasons.append(f"defending PE wall {sup_lvl:,.0f}")
+        if s_exh_score >= 50:
+            reasons.append(f"seller exhaustion {s_exh_score}/100")
+        if "BULLISH" in mt:
+            reasons.append(mt)
+        reasons.extend(ign.get("reasons", [])[:2])
+        out.update({
+            "dir": 1,
+            "type": "BOTTOM_REVERSAL_BULLISH",
+            "level": sup_lvl,
+            "action": "BUY CALL (Reversal)",
+            "label": f"🔄 BULLISH REVERSAL AT {sup_lvl:,.0f} (Bottom Trap)",
+            "reasons": reasons,
+        })
+        return out
+
     return out
 
 
@@ -2912,6 +3003,10 @@ def signal_alert_text(r):
     sl = f"{r['sl']:,.0f}" if r.get("sl") else "-"
     rr = f"1:{r['rr']:.2f}" if r.get("rr") else "-"
     kind_label = "✅ VALIDATED OPTION-BUY SIGNAL" if r["kind"] == "VALIDATED" else "❌ REJECTED SIGNAL (NOT ACTIONABLE)"
+    if r.get("reversal_label") and r.get("reversal_label") != "NONE":
+        kind_label += f" [{r['reversal_label']}]"
+    elif r.get("ignition_label") and r.get("ignition_label") != "NONE":
+        kind_label += f" [{r['ignition_label']}]"
     if r.get("playbook"):
         kind_label += f" [EXPIRY PLAYBOOK {r['playbook']} | time stop {r.get('time_stop_min')} min | HALF SIZE]"
     reason_txt = f"\nReason: {r['reason']}" if r.get("reason") else ""
@@ -2925,7 +3020,13 @@ def signal_alert_text(r):
                   f"\nMax planned loss/unit ≈ ₹{(r.get('option_entry_ref') or 0) - (r.get('option_stop') or 0):.2f}")
     else:
         action, option = ("BUY CALL" if r.get("signal") == "BUY" else "BUY PUT"), "\nNo approved option contract; do not trade."
+    pre_txt = ""
+    if r.get("reversal_label") and r.get("reversal_label") != "NONE":
+        pre_txt = f"Pre-Chart Reversal: {r['reversal_label']} ({r.get('reversal_reasons', '')})\n"
+    elif r.get("ignition_label") and r.get("ignition_label") != "NONE":
+        pre_txt = f"Pre-Chart Ignition: {r['ignition_label']} ({r.get('ignition_reasons', '')})\n"
     return (f"{kind_label}\n{r['index']} | {action} | Underlying {r['entry']:,.2f}\n"
+            f"{pre_txt}"
             f"Underlying confirmation levels: target {tgt} | invalidation/stop {sl} | R:R {rr}\n"
             f"Regime: {r.get('market_regime', 'not classified')} (advisory) | Futures footprint: {r.get('fp_bias') or 'n/a'}\n"
             f"AI confidence {r['confidence']}% | Chain agreement {r['net']:+d}{option}{reason_txt}\n"
@@ -3077,6 +3178,10 @@ def make_record(kind, idx_name, expiry, m, sig, ai, tone, now):
         "exh_buyer": ex["buyer"]["score"] if ready else None, "exh_seller": ex["seller"]["score"] if ready else None,
         "exh_own_flag": own["flag"] if own else None, "tone": tone, "news_score": ai.get("news_score"),
         "reason": note,
+        "ignition_label": (m.get("ignition") or {}).get("label"),
+        "ignition_reasons": ", ".join((m.get("ignition") or {}).get("reasons", [])),
+        "reversal_label": (m.get("reversal") or {}).get("label"),
+        "reversal_reasons": ", ".join((m.get("reversal") or {}).get("reasons", [])),
         "playbook": sig.get("playbook") if kind == "VALIDATED" else None,
         "expiry_day": bool(sig.get("expiry_day")),
         "time_stop_min": sig.get("time_stop_min") if kind == "VALIDATED" else None,
@@ -3470,7 +3575,7 @@ def esc(x):
 # SIDEBAR
 # ============================================================
 with st.sidebar:
-    st.markdown("### BBG // BUYER TERMINAL v16.3 PRE-CHART EDITION")
+    st.markdown("### BBG // BUYER TERMINAL v16.4 PRE-CHART + REVERSAL")
     dhan_token = clean(get_secret("DHAN_ACCESS_TOKEN", DEFAULT_DHAN_TOKEN))
     client_id = clean(get_secret("DHAN_CLIENT_ID", DEFAULT_CLIENT_ID))
     groq_key = get_secret("GROQ_API_KEY", DEFAULT_GROQ_KEY).strip()
@@ -3569,6 +3674,7 @@ m["ignition"] = pre_chart_ignition(m, hist)
 m["exh"] = exhaustion(hist, m, prev_close, exh_lookback)
 m["exh_flag"] = exh_flag(m["exh"])
 m["market_regime"] = classify_market_regime(hist, m["spot"], info["step"], daily_sigma(m))
+m["reversal"] = detect_institutional_reversal(m, hist)
 m["iv_pct"] = log_iv_and_percentile(idx_name, m["atm_iv"], now_ist, data_ok)
 
 m["fp"] = {"ok": False, "why": "footprint.py not loaded: " + FP_IMPORT_ERR, "bias": "UNAVAILABLE"}
@@ -3709,6 +3815,25 @@ if alerts_on and tg_token and tg_chat:
             f"⚠️ LARGE MOVE: {idx_name} is {move['pct']:+.2f}% vs previous close "
             f"({prev_close:,.0f} → {spot:,.0f}). Review any open positions. Analysis only, not trading advice.",
             0, alert_cfg)
+    _rev_now = m.get("reversal") or {}
+    if _rev_now.get("dir", 0) != 0 and market_open_now(now_ist):
+        _rev_lvl = int(_rev_now.get("level") or spot)
+        _rev_key = f"rev_{idx_name}_{now_ist.date().isoformat()}_{_rev_now['type']}_{_rev_lvl}"
+        _rev_plan = select_buyer_contract(m, "BUY" if _rev_now["dir"] == 1 else "SELL", xctx_allowed(m, "BUY" if _rev_now["dir"] == 1 else "SELL"))
+        _rev_opt_txt = (
+            f"\nCandidate Contract: {idx_name} {_rev_plan['strike']:g} {_rev_plan['option_type']} exp {expiry} "
+            f"(Ask ₹{_rev_plan['ask']:.2f} | SL ₹{_rev_plan['stop_premium']:.2f} | T1 ₹{_rev_plan['target1_premium']:.2f})"
+            if _rev_plan else ""
+        )
+        _rev_msg = (
+            f"🚨 PRE-CHART TREND REVERSAL ALERT\n"
+            f"{idx_name} | {_rev_now['label']}\n"
+            f"Spot: {spot:,.2f} | Structural Wall: {_rev_lvl:,} | Action: {_rev_now['action']}\n"
+            f"Footprints: {', '.join(_rev_now.get('reasons', []))}"
+            f"{_rev_opt_txt}\n"
+            f"If holding an existing {'CALL' if _rev_now['dir'] == -1 else 'PUT'}, tighten stop / book profit. {now_ist.strftime('%H:%M:%S')} IST."
+        )
+        alert_results += fire_alert(_rev_key, _rev_msg, 30, alert_cfg)
     # Retry previously failed Telegram/webhook deliveries on subsequent app reruns.
     alert_results += process_alert_queue(alert_cfg)
 
@@ -4221,7 +4346,12 @@ with tab0:
     r2.metric("DAYS TO EXPIRY", f"{m['dte']}", "EXPIRY DAY: size down" if m["dte"] == 0 else None, delta_color="off")
     r3.metric("MARKET REGIME", (m.get("market_regime") or {}).get("label", "—"))
     _ign = m.get("ignition") or {}
-    r4.metric("PRE-CHART IGNITION", _ign.get("label", "NONE"), ", ".join(_ign.get("reasons", []))[:60] or "awaiting basis/skew surge", delta_color="off")
+    _rev = m.get("reversal") or {}
+    if _rev.get("dir", 0) != 0:
+        r4.metric("REVERSAL / IGNITION", _rev.get("label", "NONE"), ", ".join(_rev.get("reasons", []))[:65], delta_color="off")
+        st.warning(f"**{_rev['label']}** — Institutional footprints detected at **{_rev['level']:,.0f}** ({', '.join(_rev.get('reasons', []))}). Suggested action: **{_rev['action']}**.")
+    else:
+        r4.metric("PRE-CHART IGNITION", _ign.get("label", "NONE"), ", ".join(_ign.get("reasons", []))[:60] or "awaiting basis/skew surge", delta_color="off")
 
     # ---- 2b. Expiry Desk
     st.markdown("##### Expiry Desk")
