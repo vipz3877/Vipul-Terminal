@@ -1,5 +1,5 @@
 """
-VIPUL OPTIONS BUYER SIGNAL TERMINAL v16.2 (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
+VIPUL OPTIONS BUYER SIGNAL TERMINAL v16.3 (PRE-CHART IGNITION + FULL BUY/SELL SYMMETRY + DYNAMIC POCKET STOP) (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
 v15.1 adds an INSTITUTIONAL FOOTPRINT layer (needs footprint.py next to this file):
  - Index-futures price / volume / open-interest flow + session VWAP decide whether money is really moving your way
  - Footprint filter: VETO AGAINST (default) / REQUIRE ALIGNED / OFF; blocked signals are still logged with footprint fields
@@ -64,7 +64,7 @@ try:
 except ImportError:
     Groq = None
 
-st.set_page_config(page_title="Vipul Options Buyer Terminal v16.2", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Vipul Options Buyer Terminal v16.3", layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
 # CSS
@@ -231,7 +231,7 @@ GEX_BAND_PCT = 5.0
 GEX_WINDOWS = (4, 8, 16)
 BASIS_MIN_PTS = 8.0
 SURF_CHECK_NAME = "Synthetic basis vs fair carry"
-USE_SURFACE_CHECK = _SessionFlag("surface_check", False)
+USE_SURFACE_CHECK = _SessionFlag("surface_check", True)
 SURFACE_KEYS = ("syn_fut", "fair_fwd", "carry", "basis", "excess_basis", "surface_ok", "iv_25c", "iv_25p", "rr_25", "bf_25",
                 "net_gex", "gross_gex", "gex_regime", "gex_regime_label", "regime_stable", "regime_by_window", "crossover",
                 "zero_gamma", "total_gex_at_spot", "net_vex", "net_cex")
@@ -756,14 +756,15 @@ def compute_bias(dce, dpe, ce_tot, pe_tot, spot, prev_close, pcr, basis, rr_25, 
     score = 50
     dce_p = dce / ce_tot * 100.0 if ce_tot > 0 else 0.0
     dpe_p = dpe / pe_tot * 100.0 if pe_tot > 0 else 0.0
+    flow_diff = dpe_p - dce_p
     (su, sb), (mu, mb) = BIAS_STRONG, BIAS_MILD
-    if dce_p < -su and dpe_p > sb:
+    if (dce_p < -su and dpe_p > sb) or flow_diff >= 2.0:
         score += 25
-    elif dce_p < -mu and dpe_p > mb:
+    elif (dce_p < -mu and dpe_p > mb) or flow_diff >= 1.0:
         score += 15
-    elif dpe_p < -su and dce_p > sb:
+    elif (dpe_p < -su and dce_p > sb) or flow_diff <= -2.0:
         score -= 25
-    elif dpe_p < -mu and dce_p > mb:
+    elif (dpe_p < -mu and dce_p > mb) or flow_diff <= -1.0:
         score -= 15
 
     if prev_close and prev_close > 0 and sd > 0:
@@ -785,7 +786,7 @@ def compute_bias(dce, dpe, ce_tot, pe_tot, spot, prev_close, pcr, basis, rr_25, 
         score -= 5
 
     score = max(0, min(100, score))
-    label = "BULLISH" if score > 55 else "BEARISH" if score < 45 else "NEUTRAL"
+    label = "BULLISH" if score >= 55 else "BEARISH" if score <= 45 else "NEUTRAL"
     return score, label
 
 
@@ -869,12 +870,20 @@ def detect_gamma_blast(near):
         return ("CONFLICTED", "WAIT",
                 f"Opposing flows both active (bull force {e['bull_force']:.1f} vs bear {e['bear_force']:.1f}). Stand aside.")
     if base_bear:
+        if e["bear_force"] >= 2.2 * max(e["bull_force"], 0.1) and e["ce_net_flow"] > abs(e["pe_net_flow"]):
+            return ("BEARISH GAMMA BLAST", "SELL",
+                    f"Dominant call writing ({e['ce_build_pct']:.1f}%) + put exits ({e['pe_exit_pct']:.1f}%) overpowering put additions; "
+                    f"bear force {e['bear_force']:.1f} vs bull {e['bull_force']:.1f}.")
         if bear_dom:
             return ("RESISTANCE BUILD (bearish lean)", "WAIT",
                     f"Heavy call writing ({e['ce_build_pct']:.1f}% of near OI) but put writers are still NET adding "
                     f"({pe_net_pct:+.1f}%), so there is no capitulation yet. Not a blast.")
         return ("CONFLICTED", "WAIT", "Put exits and call builds present, but no clear winner. Stand aside.")
     if base_bull:
+        if e["bull_force"] >= 2.2 * max(e["bear_force"], 0.1) and e["pe_net_flow"] > abs(e["ce_net_flow"]):
+            return ("BULLISH GAMMA BLAST", "BUY",
+                    f"Dominant put writing ({e['pe_build_pct']:.1f}%) + call exits ({e['ce_exit_pct']:.1f}%) overpowering call additions; "
+                    f"bull force {e['bull_force']:.1f} vs bear {e['bear_force']:.1f}.")
         if bull_dom:
             return ("SUPPORT BUILD (bullish lean)", "WAIT",
                     f"Heavy put writing ({e['pe_build_pct']:.1f}% of near OI) but call writers are still NET adding "
@@ -958,10 +967,15 @@ def compute_metrics(df, spot, prev_close, expiry_str, step):
     df = df.copy()
     df["CE_OI_Chg"] = df["CE_OI"] - df["CE_PrevOI"]
     df["PE_OI_Chg"] = df["PE_OI"] - df["PE_PrevOI"]
-    # premium change vs previous close (NaN when the previous close or today's LTP is missing)
+    # Delta-adjusted premium change vs previous close (removes underlying index move confounder so gap-ups don't fake 100% put writing)
+    spot_chg_day = (spot - prev_close) if (prev_close and prev_close > 0) else 0.0
     for s in ("CE", "PE"):
         ok = (df[f"{s}_PrevLTP"] > 0) & (df[f"{s}_LTP"] > 0)
-        df[f"{s}_PxChg"] = np.where(ok, df[f"{s}_LTP"] - df[f"{s}_PrevLTP"], np.nan)
+        raw_px_chg = df[f"{s}_LTP"] - df[f"{s}_PrevLTP"]
+        default_d = 0.5 if s == "CE" else -0.5
+        d_col = np.where(df[f"{s}_Delta"].abs() > 0, df[f"{s}_Delta"], default_d)
+        delta_move = np.clip(d_col, -0.99, 0.99) * spot_chg_day
+        df[f"{s}_PxChg"] = np.where(ok, raw_px_chg - delta_move, np.nan)
 
     ce_tot_all, pe_tot_all = float(df["CE_OI"].sum()), float(df["PE_OI"].sum())
     pcr = pe_tot_all / ce_tot_all if ce_tot_all > 0 else 1.0
@@ -1282,7 +1296,7 @@ def chain_checks(m):
     li = j["ladder_imbalance"]
     add("Ladder OI imbalance", 1 if li >= 0.10 else -1 if li <= -0.10 else 0, f"{li:+.3f} (PE-heavy is +)", "positioning")
     add("PCR (whole chain)", 1 if m["pcr"] > 1.2 else -1 if m["pcr"] < 0.8 else 0, f"{m['pcr']:.2f}", "positioning")
-    add("Bias score", 1 if m["score"] > 55 else -1 if m["score"] < 45 else 0, f"{m['score']}/100 {m['bias']}", "positioning")
+    add("Bias score", 1 if m["score"] >= 55 else -1 if m["score"] <= 45 else 0, f"{m['score']}/100 {m['bias']}", "positioning")
 
     if m["dte"] > 2:
         add("Spot vs max pain", 0, f"{m['dte']}d to expiry: max-pain pull is weak, neutral", "volatility")
@@ -1293,12 +1307,23 @@ def chain_checks(m):
 
     thr = max(BASIS_MIN_PTS, 0.0004 * m["spot"])
     ex_b = m.get("excess_basis", 0.0)
-    sv = 1 if (m.get("surface_ok") and ex_b >= thr) else -1 if (m.get("surface_ok") and ex_b <= -thr) else 0
+    rr_25 = m.get("rr_25", 0.0)
+    sv = 0
+    if m.get("surface_ok"):
+        if ex_b >= thr or (ex_b >= 0 and rr_25 >= 0.5):
+            sv = 1
+        elif ex_b <= -thr or (ex_b <= 0 and rr_25 <= -1.5):
+            sv = -1
     on = USE_SURFACE_CHECK["on"]
     checks.append({"name": SURF_CHECK_NAME, "v": sv, "counted": on, "family": "volatility",
                    "detail": (f"F_syn {m['syn_fut']:,.1f} vs fair {m['fair_fwd']:,.1f} (excess {ex_b:+.1f}, needs ±{thr:.0f}) | "
-                              f"RR25 {m.get('rr_25', 0):+.2f}" + ("" if on else " [observe only]")) if m.get("surface_ok")
+                              f"RR25 {rr_25:+.2f}" + ("" if on else " [observe only]")) if m.get("surface_ok")
                    else "no balanced near-ATM call/put mids [observe only]"})
+
+    ign = m.get("ignition") or {}
+    if ign.get("dir", 0) != 0:
+        checks.append({"name": "Pre-Chart Ignition (15m velocity)", "v": int(ign["dir"]), "counted": True, "family": "volatility",
+                       "detail": f"{ign.get('label')}: {', '.join(ign.get('reasons', []))}"})
     return checks
 
 
@@ -1825,19 +1850,25 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
                 notes.append(f"{sig} rejected: futures footprint is stale ({fp_age:.0f}s old; maximum 180s).")
                 sig = "WAIT"
 
-    # Regime gate (v16: three modes). STRICT = original behaviour, SOFT = only block against a clear trend, OFF = advisory.
+    # Regime gate (v16.3: STRICT allows Pre-Chart Ignition >= 3/4 to catch the birth of a rally before 12 spot snapshots trend).
     if sig != "WAIT":
         regime_info = m.get("market_regime") or {}
         regime = str(regime_info.get("label", "UNAVAILABLE")).upper()
         mode = str(P("regime_gate"))
+        ign = m.get("ignition") or {}
+        ign_aligned = (sig == "BUY" and ign.get("dir") == 1 and ign.get("score", 0) >= 2) or (
+            sig == "SELL" and ign.get("dir") == -1 and ign.get("score", 0) >= 2)
         against = (sig == "BUY" and regime == "TRENDING DOWN") or (sig == "SELL" and regime == "TRENDING UP")
         if mode.startswith("STRICT"):
-            if regime not in ("TRENDING UP", "TRENDING DOWN"):
-                notes.append(f"{sig} rejected: market regime is {regime}. Wait for a clearer directional regime (STRICT regime gate).")
-                sig = "WAIT"
-            elif against or (sig == "BUY" and regime != "TRENDING UP") or (sig == "SELL" and regime != "TRENDING DOWN"):
+            if against:
                 notes.append(f"{sig} rejected: signal direction conflicts with market regime {regime}.")
                 sig = "WAIT"
+            elif regime not in ("TRENDING UP", "TRENDING DOWN"):
+                if ign_aligned:
+                    notes.append(f"Pre-Chart Ignition override ({ign.get('label')}): entering early before spot-history regime flips.")
+                else:
+                    notes.append(f"{sig} rejected: market regime is {regime} and no Pre-Chart Ignition override is active (STRICT regime gate).")
+                    sig = "WAIT"
         elif mode.startswith("SOFT"):
             if against:
                 notes.append(f"{sig} rejected: it fights a clear trend (regime {regime}).")
@@ -1885,11 +1916,23 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
         else:
             target, sl = sup["level"], res["level"] + sl_buf
         if sig != "WAIT":
-            cap = float(P("target_cap")) * daily_sigma(m)
+            sd_now = daily_sigma(m)
+            cap = float(P("target_cap")) * sd_now
             if cap > 0 and abs(target - entry) > cap:
                 new_t = entry + cap if sig == "BUY" else entry - cap
                 notes.append(f"Target trimmed from {target:,.0f} to {new_t:,.0f} (more than {P('target_cap'):.1f} daily sigma away is not a realistic intraday target).")
                 target = new_t
+            max_sl_dist = 0.38 * sd_now
+            if abs(entry - sl) > max_sl_dist and max_sl_dist > 0:
+                pocket = float((m.get("jobber") or {}).get("pocket_support") or 0.0)
+                if sig == "BUY" and (entry - max_sl_dist) <= pocket < entry:
+                    new_sl = pocket - sl_buf * 0.5
+                elif sig == "SELL" and entry < pocket <= (entry + max_sl_dist):
+                    new_sl = pocket + sl_buf * 0.5
+                else:
+                    new_sl = (entry - max_sl_dist) if sig == "BUY" else (entry + max_sl_dist)
+                notes.append(f"Stop tightened from stale OI wall {sl:,.0f} to {new_sl:,.0f} (0.38σ / pocket-flow stop).")
+                sl = new_sl
 
     if sig != "WAIT":
         risk = abs(entry - sl)
@@ -2163,6 +2206,108 @@ def lb_flows(then, now, spot, window):
             out["ce_build" if dc > 0 else "ce_unw"] += abs(dc)
             out["pe_build" if dp > 0 else "pe_unw"] += abs(dp)
     return out
+
+
+def pre_chart_ignition(m, hist, lookback_min=15):
+    """Detects pre-chart institutional accumulation/distribution from rolling basis, skew, and OI velocity
+    BEFORE spot price breaks out on the chart."""
+    out = {"dir": 0, "score": 0, "label": "NONE", "reasons": [], "age_min": 0.0, "fl_edge": 0.0}
+    if not hist or len(hist) < 2:
+        return out
+    now_snap = hist[-1]
+    ref = _nearest(hist[:-1], now_snap["ts"] - lookback_min * 60)
+    age_min = (now_snap["ts"] - ref["ts"]) / 60.0
+    if age_min < 3.0:
+        return out
+    out["age_min"] = round(age_min, 1)
+
+    b_now, b_ref = m.get("excess_basis"), ref.get("excess_basis")
+    b_shift = (b_now - b_ref) if (b_now is not None and b_ref is not None) else 0.0
+
+    rr_now, rr_ref = m.get("rr_25"), ref.get("rr_25")
+    rr_shift = (rr_now - rr_ref) if (rr_now is not None and rr_ref is not None) else 0.0
+
+    fl = lb_flows(ref, now_snap, m["spot"], near_window(m["spot"], m["step"]))
+    bull_fl = fl["pe_build"] + fl["ce_unw"]
+    bear_fl = fl["ce_build"] + fl["pe_unw"]
+    fl_ratio = (bull_fl / bear_fl) if bear_fl > 0 else (9.9 if bull_fl > 0 else 1.0)
+    inv_ratio = (bear_fl / bull_fl) if bull_fl > 0 else (9.9 if bear_fl > 0 else 1.0)
+    pe_net_r = (fl["pe_build"] - fl["pe_unw"]) / fl["pe_base"] * 100.0 if fl["pe_base"] > 0 else 0.0
+    ce_net_r = (fl["ce_build"] - fl["ce_unw"]) / fl["ce_base"] * 100.0 if fl["ce_base"] > 0 else 0.0
+    out["fl_edge"] = round(pe_net_r - ce_net_r, 2)
+
+    pcr_shift = float(now_snap.get("pcr", 1.0)) - float(ref.get("pcr", 1.0))
+
+    bull_pts, bear_pts = 0, 0
+    if b_shift >= 8.0:
+        bull_pts += 1
+        out["reasons"].append(f"basis +{b_shift:.1f} pts/{age_min:.0f}m")
+    elif b_shift <= -8.0:
+        bear_pts += 1
+        out["reasons"].append(f"basis {b_shift:.1f} pts/{age_min:.0f}m")
+
+    if rr_shift >= 0.25:
+        bull_pts += 1
+        out["reasons"].append(f"25Δ skew +{rr_shift:.2f}")
+    elif rr_shift <= -0.25:
+        bear_pts += 1
+        out["reasons"].append(f"25Δ skew {rr_shift:.2f}")
+
+    if fl_ratio >= 1.5 and bull_fl > 0:
+        bull_pts += 1
+        out["reasons"].append(f"rolling OI flow {fl_ratio:.1f}x bull")
+    elif inv_ratio >= 1.5 and bear_fl > 0:
+        bear_pts += 1
+        out["reasons"].append(f"rolling OI flow {inv_ratio:.1f}x bear")
+
+    if pcr_shift >= 0.05:
+        bull_pts += 1
+        out["reasons"].append(f"PCR +{pcr_shift:.3f}")
+    elif pcr_shift <= -0.05:
+        bear_pts += 1
+        out["reasons"].append(f"PCR {pcr_shift:.3f}")
+
+    if bull_pts >= 2 and bull_pts > bear_pts:
+        out.update({"dir": 1, "score": bull_pts, "label": f"⚡ BULLISH PRE-CHART IGNITION ({bull_pts}/4)"})
+    elif bear_pts >= 2 and bear_pts > bull_pts:
+        out.update({"dir": -1, "score": bear_pts, "label": f"⚡ BEARISH PRE-CHART IGNITION ({bear_pts}/4)"})
+    return out
+
+
+def apply_rolling_flow_blend(m, hist, lookback_min=15, rolling_weight=0.6):
+    """Blends 60% rolling 15-minute OI change with 40% full-day OI change once >=10 min of snapshots exist,
+    so midday reversals flip the Dual-Force Engine within minutes instead of lagging behind morning OI."""
+    if not hist or len(hist) < 3:
+        return
+    now_snap = hist[-1]
+    ref = _nearest(hist[:-1], now_snap["ts"] - lookback_min * 60)
+    age_min = (now_snap["ts"] - ref["ts"]) / 60.0
+    if age_min < 8.0:
+        return
+    ref_oi = ref.get("oi") or {}
+    if not ref_oi:
+        return
+    near = m["near"].copy()
+    r_ce, r_pe = [], []
+    for _, row in near.iterrows():
+        k = str(int(row["Strike"]))
+        if k in ref_oi:
+            c0, p0 = ref_oi[k]
+            r_ce.append(float(row["CE_OI"]) - float(c0))
+            r_pe.append(float(row["PE_OI"]) - float(p0))
+        else:
+            r_ce.append(float(row["CE_OI_Chg"]))
+            r_pe.append(float(row["PE_OI_Chg"]))
+    # Scale rolling 15m delta to comparable magnitude and blend 60/40 with full-day change
+    near["CE_OI_Chg"] = rolling_weight * (np.array(r_ce) * 2.5) + (1.0 - rolling_weight) * near["CE_OI_Chg"].to_numpy(float)
+    near["PE_OI_Chg"] = rolling_weight * (np.array(r_pe) * 2.5) + (1.0 - rolling_weight) * near["PE_OI_Chg"].to_numpy(float)
+    m["near"] = near
+    m["status"], m["engine_signal"], m["desc"] = detect_gamma_blast(near)
+    m["engine"] = engine_sums(near)
+    m["jobber"] = calculate_jobber_microstructure(m["df"].assign(
+        CE_OI_Chg=m["df"]["Strike"].map(dict(zip(near["Strike"], near["CE_OI_Chg"]))).fillna(m["df"]["CE_OI_Chg"]),
+        PE_OI_Chg=m["df"]["Strike"].map(dict(zip(near["Strike"], near["PE_OI_Chg"]))).fillna(m["df"]["PE_OI_Chg"]),
+    ), m["spot"])
 
 
 def exhaustion(hist, m, prev_close, lb_min):
@@ -3325,7 +3470,7 @@ def esc(x):
 # SIDEBAR
 # ============================================================
 with st.sidebar:
-    st.markdown("### BBG // BUYER TERMINAL v16.2 HARDENED")
+    st.markdown("### BBG // BUYER TERMINAL v16.3 PRE-CHART EDITION")
     dhan_token = clean(get_secret("DHAN_ACCESS_TOKEN", DEFAULT_DHAN_TOKEN))
     client_id = clean(get_secret("DHAN_CLIENT_ID", DEFAULT_CLIENT_ID))
     groq_key = get_secret("GROQ_API_KEY", DEFAULT_GROQ_KEY).strip()
@@ -3390,7 +3535,7 @@ groq_model = GROQ_MODELS[0]
 live_news = True
 news = st.session_state.get("macro_note", "")      # optional note typed in the AI Council tab
 horizon_days, iv_shock, use_skew = 0.25, 15, True  # premium-scanner scenario settings
-USE_SURFACE_CHECK["on"] = False                    # synthetic-basis check is observe-only
+USE_SURFACE_CHECK["on"] = True                     # active: synthetic-basis & 25d skew vote in volatility family
 TIME_BASIS["mode"] = "calendar"
 exh_lookback = 15
 weekly_alert = True
@@ -3419,6 +3564,8 @@ vel = update_oi_velocity(m, key=f"{idx_name}|{expiry}")
 hist = record_snapshot(m, f"{idx_name}|{expiry}", store=data_ok)
 _rr0 = next((h.get("rr_25") for h in hist if h.get("rr_25") is not None), None)
 m["rr_shift"] = round(m["rr_25"] - _rr0, 2) if _rr0 is not None else 0.0
+apply_rolling_flow_blend(m, hist)
+m["ignition"] = pre_chart_ignition(m, hist)
 m["exh"] = exhaustion(hist, m, prev_close, exh_lookback)
 m["exh_flag"] = exh_flag(m["exh"])
 m["market_regime"] = classify_market_regime(hist, m["spot"], info["step"], daily_sigma(m))
@@ -4073,7 +4220,8 @@ with tab0:
     r1.metric("SESSION", _phase)
     r2.metric("DAYS TO EXPIRY", f"{m['dte']}", "EXPIRY DAY: size down" if m["dte"] == 0 else None, delta_color="off")
     r3.metric("MARKET REGIME", (m.get("market_regime") or {}).get("label", "—"))
-    r4.metric("DEALER GAMMA (assumed)", m["gex_regime"])
+    _ign = m.get("ignition") or {}
+    r4.metric("PRE-CHART IGNITION", _ign.get("label", "NONE"), ", ".join(_ign.get("reasons", []))[:60] or "awaiting basis/skew surge", delta_color="off")
 
     # ---- 2b. Expiry Desk
     st.markdown("##### Expiry Desk")
