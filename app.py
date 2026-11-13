@@ -1,5 +1,5 @@
 """
-VIPUL OPTIONS BUYER SIGNAL TERMINAL v16.4 (PRE-CHART IGNITION + TWO-WAY TREND REVERSAL RADAR + FULL SYMMETRY) (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
+VIPUL OPTIONS BUYER SIGNAL TERMINAL v16.5 (ROLLING BIAS SYNC + 2-OF-4 IGNITION + BREAKEVEN TRAIL + ENGINE LOG FIX) (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
 v15.1 adds an INSTITUTIONAL FOOTPRINT layer (needs footprint.py next to this file):
  - Index-futures price / volume / open-interest flow + session VWAP decide whether money is really moving your way
  - Footprint filter: VETO AGAINST (default) / REQUIRE ALIGNED / OFF; blocked signals are still logged with footprint fields
@@ -64,7 +64,7 @@ try:
 except ImportError:
     Groq = None
 
-st.set_page_config(page_title="Vipul Options Buyer Terminal v16.4", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Vipul Options Buyer Terminal v16.5", layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
 # CSS
@@ -1967,7 +1967,8 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
             sig, target, sl, rr, buyer_plan, playbook = "WAIT", None, None, None, None, None
         elif be_info["vs_avg30"] is not None and be_info["vs_avg30"] > 1.5:
             notes.append(f"Caution: breakeven needs {be_info['required_move']:,.0f} pts, {be_info['vs_avg30']:.1f}x today's typical 30-minute range.")
-    return {"signal": sig, "ai_signal": ai_sig, "entry": entry, "target": target, "sl": sl, "rr": rr,
+    proposed_sig = ({1: "BUY", -1: "SELL", 0: "WAIT"}[direction]) if engine_led else ai_sig
+    return {"signal": sig, "ai_signal": ai_sig, "proposed_signal": proposed_sig, "entry": entry, "target": target, "sl": sl, "rr": rr,
             "confidence": conf, "note": " ".join(notes), "checks": checks, "net": net, "lean": lean,
             "families": families, "direction": direction, "buyer_plan": buyer_plan,
             "playbook": playbook, "time_stop_min": time_stop, "expiry_day": bool(xc.get("active")), "breakeven": be_info}
@@ -2324,17 +2325,27 @@ def pre_chart_ignition(m, hist, lookback_min=15):
         bear_pts += 1
         out["reasons"].append(f"rolling OI flow {inv_ratio:.1f}x bear")
 
-    if pcr_shift >= 0.05:
+    if pcr_shift >= 0.035:
         bull_pts += 1
         out["reasons"].append(f"PCR +{pcr_shift:.3f}")
-    elif pcr_shift <= -0.05:
+    elif pcr_shift <= -0.035:
         bear_pts += 1
         out["reasons"].append(f"PCR {pcr_shift:.3f}")
 
+    fp = m.get("fp") or {}
+    if fp.get("ok"):
+        q30 = str(fp.get("quad30", ""))
+        if q30 == "LONG BUILD-UP" and float(fp.get("vwap_dist") or 0) > 0:
+            bull_pts += 1
+            out["reasons"].append("fut LONG BUILD-UP")
+        elif q30 == "SHORT BUILD-UP" and float(fp.get("vwap_dist") or 0) < 0.20:
+            bear_pts += 1
+            out["reasons"].append("fut SHORT BUILD-UP")
+
     if bull_pts >= 2 and bull_pts > bear_pts:
-        out.update({"dir": 1, "score": bull_pts, "label": f"⚡ BULLISH PRE-CHART IGNITION ({bull_pts}/4)"})
+        out.update({"dir": 1, "score": bull_pts, "label": f"⚡ BULLISH PRE-CHART IGNITION ({bull_pts}/5)"})
     elif bear_pts >= 2 and bear_pts > bull_pts:
-        out.update({"dir": -1, "score": bear_pts, "label": f"⚡ BEARISH PRE-CHART IGNITION ({bear_pts}/4)"})
+        out.update({"dir": -1, "score": bear_pts, "label": f"⚡ BEARISH PRE-CHART IGNITION ({bear_pts}/5)"})
     return out
 
 
@@ -2449,10 +2460,20 @@ def apply_rolling_flow_blend(m, hist, lookback_min=15, rolling_weight=0.6):
     m["near"] = near
     m["status"], m["engine_signal"], m["desc"] = detect_gamma_blast(near)
     m["engine"] = engine_sums(near)
-    m["jobber"] = calculate_jobber_microstructure(m["df"].assign(
+    blended_df = m["df"].assign(
         CE_OI_Chg=m["df"]["Strike"].map(dict(zip(near["Strike"], near["CE_OI_Chg"]))).fillna(m["df"]["CE_OI_Chg"]),
         PE_OI_Chg=m["df"]["Strike"].map(dict(zip(near["Strike"], near["PE_OI_Chg"]))).fillna(m["df"]["PE_OI_Chg"]),
-    ), m["spot"])
+    )
+    m["jobber"] = calculate_jobber_microstructure(blended_df, m["spot"])
+    # Sync Bias Score with blended near-spot rolling OI flow so midday reversals flip positioning vote immediately
+    ce_near_tot = max(float(near["CE_OI"].sum()), 1.0)
+    pe_near_tot = max(float(near["PE_OI"].sum()), 1.0)
+    dce_blended = float(near["CE_OI_Chg"].sum())
+    dpe_blended = float(near["PE_OI_Chg"].sum())
+    m["score"], m["bias"] = compute_bias(
+        dce_blended, dpe_blended, ce_near_tot, pe_near_tot,
+        m["spot"], m.get("prev_close"), m["pcr"], m.get("excess_basis", 0.0), m.get("rr_25", 0.0), daily_sigma(m)
+    )
 
 
 def exhaustion(hist, m, prev_close, lb_min):
@@ -3207,7 +3228,7 @@ def fp_fields(m, direction):
 
 
 def make_record(kind, idx_name, expiry, m, sig, ai, tone, now):
-    direction = sig["signal"] if kind == "VALIDATED" else sig["ai_signal"]
+    direction = sig["signal"] if kind == "VALIDATED" else (sig.get("proposed_signal") if sig.get("proposed_signal") in ("BUY", "SELL") else sig["ai_signal"])
     ex = m.get("exh") or {}
     ready = bool(ex.get("ready"))
     own = (ex["buyer"] if direction == "BUY" else ex["seller"]) if ready else None
@@ -3280,11 +3301,12 @@ def maybe_log_signal(recs, idx_name, expiry, m, sig, ai, tone, now):
                    and now.timestamp() - r.get("ts", 0) < SIGNAL_DEDUP_MIN * 60 for r in recs)
 
     new = []
+    rej_dir = sig.get("proposed_signal") if sig.get("proposed_signal") in ("BUY", "SELL") else sig["ai_signal"]
     if sig["signal"] in ("BUY", "SELL"):
         if not recent("VALIDATED", sig["signal"]):
             new.append(make_record("VALIDATED", idx_name, expiry, m, sig, ai, tone, now))
-    elif sig["ai_signal"] in ("BUY", "SELL"):
-        if not recent("REJECTED", sig["ai_signal"]):
+    elif rej_dir in ("BUY", "SELL"):
+        if not recent("REJECTED", rej_dir):
             new.append(make_record("REJECTED", idx_name, expiry, m, sig, ai, tone, now))
     recs.extend(new)
     return new
@@ -3350,12 +3372,14 @@ def update_outcomes(recs, idx_name, spot, now, candles, intraday=None, option_df
                 r["mfe"] = round(max(r["mfe"], best), 2)
                 r["mae"] = round(max(r["mae"], worst), 2)
                 if r["first_touch"] is None and has_levels:
+                    req_t1_pts = max(0.55 * abs(r["target"] - r["entry"]), 0.32 * float(r.get("sd") or 200.0))
                     hit_t = (b["h"] >= r["target"]) if d > 0 else (b["l"] <= r["target"])
                     hit_s = (b["l"] <= r["sl"]) if d > 0 else (b["h"] >= r["sl"])
-                    if hit_s:
-                        r["first_touch"] = "STOP"
-                    elif hit_t:
+                    if hit_t:
                         r["first_touch"] = "TARGET"
+                    elif hit_s:
+                        # If trade already achieved >= 55% of target (+0.32 sigma, hitting Option T1) before reversing hours later, lock as TARGET (T1 hit)
+                        r["first_touch"] = "TARGET" if r["mfe"] >= req_t1_pts else "STOP"
                 b_el = (b["ts"] - r["ts"]) / 60.0
                 for h in OUTCOME_HORIZONS:
                     if r[f"s{h}"] is None and h <= b_el <= h + HORIZON_TOL_MIN:
@@ -3629,7 +3653,7 @@ def esc(x):
 # SIDEBAR
 # ============================================================
 with st.sidebar:
-    st.markdown("### BBG // BUYER TERMINAL v16.4 PRE-CHART + REVERSAL")
+    st.markdown("### BBG // BUYER TERMINAL v16.5 PRE-CHART + REVERSAL")
     dhan_token = clean(get_secret("DHAN_ACCESS_TOKEN", DEFAULT_DHAN_TOKEN))
     client_id = clean(get_secret("DHAN_CLIENT_ID", DEFAULT_CLIENT_ID))
     groq_key = get_secret("GROQ_API_KEY", DEFAULT_GROQ_KEY).strip()
@@ -3723,13 +3747,6 @@ vel = update_oi_velocity(m, key=f"{idx_name}|{expiry}")
 hist = record_snapshot(m, f"{idx_name}|{expiry}", store=data_ok)
 _rr0 = next((h.get("rr_25") for h in hist if h.get("rr_25") is not None), None)
 m["rr_shift"] = round(m["rr_25"] - _rr0, 2) if _rr0 is not None else 0.0
-apply_rolling_flow_blend(m, hist)
-m["ignition"] = pre_chart_ignition(m, hist)
-m["exh"] = exhaustion(hist, m, prev_close, exh_lookback)
-m["exh_flag"] = exh_flag(m["exh"])
-m["market_regime"] = classify_market_regime(hist, m["spot"], info["step"], daily_sigma(m))
-m["reversal"] = detect_institutional_reversal(m, hist)
-m["iv_pct"] = log_iv_and_percentile(idx_name, m["atm_iv"], now_ist, data_ok)
 
 m["fp"] = {"ok": False, "why": "footprint.py not loaded: " + FP_IMPORT_ERR, "bias": "UNAVAILABLE"}
 fp_pc = {"ok": False}
@@ -3747,6 +3764,14 @@ if FP is not None and is_trading_day(now_ist):
     except Exception:
         fp_pc = {"ok": False}
 m["fp_text"] = FP.footprint_text(m["fp"], fp_pc) if FP is not None else "- Futures footprint: unavailable"
+
+apply_rolling_flow_blend(m, hist)
+m["ignition"] = pre_chart_ignition(m, hist)
+m["exh"] = exhaustion(hist, m, prev_close, exh_lookback)
+m["exh_flag"] = exh_flag(m["exh"])
+m["market_regime"] = classify_market_regime(hist, m["spot"], info["step"], daily_sigma(m))
+m["reversal"] = detect_institutional_reversal(m, hist)
+m["iv_pct"] = log_iv_and_percentile(idx_name, m["atm_iv"], now_ist, data_ok)
 
 news_items, news_status, news_stale = [], ["LIVE NEWS: off"], False
 if live_news:
