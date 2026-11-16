@@ -1,5 +1,5 @@
 """
-VIPUL OPTIONS BUYER SIGNAL TERMINAL v16.7 (0DTE GAMMA-TO-THETA ENGINE + GAMMA FLIP BREAKOUT + GREEK CONTRACT RANKING) (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
+VIPUL OPTIONS BUYER SIGNAL TERMINAL v16.8 (AUTO OPTION-PREMIUM TRACKING + MANUAL TRADES TAB REMOVED + 0DTE GAMMA ENGINE) (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
 v15.1 adds an INSTITUTIONAL FOOTPRINT layer (needs footprint.py next to this file):
  - Index-futures price / volume / open-interest flow + session VWAP decide whether money is really moving your way
  - Footprint filter: VETO AGAINST (default) / REQUIRE ALIGNED / OFF; blocked signals are still logged with footprint fields
@@ -64,7 +64,7 @@ try:
 except ImportError:
     Groq = None
 
-st.set_page_config(page_title="Vipul Options Buyer Terminal v16.7", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Vipul Options Buyer Terminal v16.8", layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
 # CSS
@@ -3372,9 +3372,11 @@ def make_record(kind, idx_name, expiry, m, sig, ai, tone, now):
         "option_target2": buyer_plan.get("target2_premium") if buyer_plan else None,
         "option_last_mark": buyer_plan.get("ltp") if buyer_plan else None,
         "option_event_state": "SIGNAL_VALIDATED" if buyer_plan else None,
-        # Manual-trading lifecycle: a signal is not a position until the user confirms an actual fill.
-        "manual_entry_confirmed": False,
-        "trade_state": "SIGNAL_ONLY" if buyer_plan else "NO_CONTRACT",
+        # Auto-monitoring lifecycle (v16.8): validated signals automatically track option SL/T1/T2 without manual confirmation.
+        "manual_entry_confirmed": bool(kind == "VALIDATED" and buyer_plan is not None),
+        "trade_state": "POSITION_OPEN" if (kind == "VALIDATED" and buyer_plan is not None) else ("SIGNAL_ONLY" if buyer_plan else "NO_CONTRACT"),
+        "option_mfe_pct": 0.0,
+        "option_mae_pct": 0.0,
         "actual_entry_price": None,
         "actual_entry_qty": None,
         "actual_entry_ts": None,
@@ -3430,28 +3432,33 @@ def update_outcomes(recs, idx_name, spot, now, candles, intraday=None, option_df
         el = (now.timestamp() - r["ts"]) / 60.0
         same_day = r["date"] == today
         has_levels = r["target"] is not None and r["sl"] is not None
-        # Premium-based option events use the latest option-chain LTP snapshot only. This is polling,
-        # not tick-level surveillance; quote gaps can miss intrabar touches.
-        if (r.get("kind") == "VALIDATED" and r.get("manual_entry_confirmed") is True and
-                r.get("trade_state") == "POSITION_OPEN" and r.get("option_strike") is not None and
+        # Auto option-premium tracking (v16.8): every open VALIDATED signal automatically monitors option SL, T1, and T2
+        if (r.get("kind") == "VALIDATED" and r.get("option_strike") is not None and
                 r.get("option_expiry") == str(current_expiry)[:10] and option_df is not None and not option_df.empty and live):
             match = option_df[option_df["Strike"].astype(float).sub(float(r["option_strike"])).abs() < 0.001]
             side = r.get("option_side") or ("CE" if r.get("option_type") == "CALL" else "PE")
             if not match.empty:
-                # For a long option, the bid is the more realistic immediate exit-side quote.
                 mark = _n(match.iloc[0].get(f"{side}_Bid"))
                 if mark <= 0:
                     mark = _n(match.iloc[0].get(f"{side}_LTP"))
                 if mark > 0:
                     r["option_last_mark"] = round(mark, 2)
+                    eref = _n(r.get("option_entry_ref"))
+                    if eref > 0:
+                        ret_pct = (mark - eref) / eref * 100.0
+                        r["option_mfe_pct"] = round(max(float(r.get("option_mfe_pct") or 0.0), ret_pct), 2)
+                        r["option_mae_pct"] = round(max(float(r.get("option_mae_pct") or 0.0), -ret_pct), 2)
                     event = None
-                    if mark <= _n(r.get("option_stop")) and r.get("option_event_state") not in ("STOP_LOSS", "TARGET_2", "EXITED") and r.get("trade_state") == "POSITION_OPEN":
-                        event = "OPTION_STOP_LOSS"
-                        r["option_event_state"] = "STOP_LOSS"
-                    elif mark >= _n(r.get("option_target2")) and r.get("option_event_state") not in ("TARGET_2", "STOP_LOSS", "EXITED") and r.get("trade_state") == "POSITION_OPEN":
+                    cur_ev = r.get("option_event_state")
+                    if mark <= _n(r.get("option_stop")) and cur_ev not in ("STOP_LOSS", "TARGET_2", "EXITED"):
+                        # If T1 was already hit earlier, lock as T1 trail instead of full stop loss
+                        if cur_ev != "TARGET_1":
+                            event = "OPTION_STOP_LOSS"
+                            r["option_event_state"] = "STOP_LOSS"
+                    elif mark >= _n(r.get("option_target2")) and cur_ev not in ("TARGET_2", "STOP_LOSS", "EXITED"):
                         event = "OPTION_TARGET_2"
                         r["option_event_state"] = "TARGET_2"
-                    elif mark >= _n(r.get("option_target1")) and r.get("option_event_state") not in ("TARGET_1", "TARGET_2", "STOP_LOSS", "EXITED") and r.get("trade_state") == "POSITION_OPEN":
+                    elif mark >= _n(r.get("option_target1")) and cur_ev not in ("TARGET_1", "TARGET_2", "STOP_LOSS", "EXITED"):
                         event = "OPTION_TARGET_1"
                         r["option_event_state"] = "TARGET_1"
                     if event:
@@ -3746,7 +3753,7 @@ def esc(x):
 # SIDEBAR
 # ============================================================
 with st.sidebar:
-    st.markdown("### BBG // BUYER TERMINAL v16.7 0DTE GAMMA EDITION")
+    st.markdown("### BBG // BUYER TERMINAL v16.8 AUTO-TRACK EDITION")
     dhan_token = clean(get_secret("DHAN_ACCESS_TOKEN", DEFAULT_DHAN_TOKEN))
     client_id = clean(get_secret("DHAN_CLIENT_ID", DEFAULT_CLIENT_ID))
     groq_key = get_secret("GROQ_API_KEY", DEFAULT_GROQ_KEY).strip()
@@ -4016,7 +4023,7 @@ st.markdown(f"## {idx_name} // SPOT {spot:,.2f}" + (f"  ({spot - prev_close:+,.2
 
 _mkt = "OPEN" if market_open_now(now_ist) else "CLOSED"
 st.caption(f"{now_ist.strftime('%a %d %b %Y %H:%M:%S')} IST | market {_mkt} | regime {(m.get('market_regime') or {}).get('label', '—')} (advisory) | futures footprint {(m.get('fp') or {}).get('bias', '—')} | assumption-based GEX {m['gex_regime']} | AI: {gate_label}")
-st.info("OPTION-BUYER MODE: BUY CALL / BUY PUT / WAIT only. Manual execution only. Premium monitoring starts only after you confirm an actual entry in Manual Trades. Alerts and monitoring are best-effort while the app refreshes; do not rely on them as your only risk control.")
+st.info("OPTION-BUYER MODE: BUY CALL / BUY PUT / WAIT only. Validated signals automatically monitor live option premium SL / T1 / T2 and push alerts to Telegram while the app refreshes.")
 
 if not data_ok:
     st.warning(f"DATA GATE CLOSED: {gate_reason}. Figures below may be stale or off-hours; the AI council, history snapshots "
@@ -4031,9 +4038,9 @@ for _row in health_rows:
     _hc[_row["Status"]] += 1
 st.caption(f"DATA HEALTH: {_hc['OK']} OK · {_hc['WARN']} warn · {_hc['FAIL']} fail")
 
-tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
     "🛡️ Trade Desk", "📊 Dashboard & Engine", "📐 Day Levels", "🧭 Exhaustion", "🎯 Premium Scanner",
-    "🤖 AI Council & News", "📋 Option Chain", "📒 Scorecard", "🩺 Data Health", "📈 GEX & Skew", "🧾 Manual Trades", "🏦 Footprint"])
+    "🤖 AI Council & News", "📋 Option Chain", "📒 Scorecard", "🩺 Data Health", "📈 GEX & Skew", "🏦 Footprint"])
 
 with tab1:
     status = m["status"]
@@ -4344,96 +4351,6 @@ with tab9:
                 st.caption("Biases aligned across indices." if _b.nunique() == 1 else "Biases diverge across indices.")
 
 with tab10:
-    st.markdown("#### 🧾 MANUAL OPTION TRADE JOURNAL")
-    st.caption("A validated signal is not a position. Confirm only after your manual order actually fills. Monitoring remains best-effort and depends on the app refreshing.")
-    _records = st.session_state.get("scorecard", [])
-    _eligible = [r for r in _records if r.get("kind") == "VALIDATED" and r.get("option_strike") is not None
-                 and not r.get("manual_entry_confirmed") and r.get("trade_state", "SIGNAL_ONLY") not in ("EXITED", "CANCELLED")
-                 and 0 <= time.time() - float(r.get("ts", 0)) <= 30 * 60]
-    if _eligible:
-        st.markdown("##### Confirm an actual entry")
-        for _r in _eligible[-10:][::-1]:
-            _label = f"{_r.get('index')} {_r.get('option_strike')} {_r.get('option_type')} exp {_r.get('option_expiry')} — signal {_r.get('time')} IST — ref ₹{_r.get('option_entry_ref') or 0:.2f}"
-            with st.expander(_label):
-                with st.form(f"confirm_trade_{_r['id']}"):
-                    _fill = st.number_input("Actual average entry premium ₹", min_value=0.05, value=float(_r.get("option_entry_ref") or 1.0), step=0.05, key=f"fill_{_r['id']}")
-                    _qty = st.number_input("Quantity in option units (not lots)", min_value=1, value=1, step=1, key=f"qty_{_r['id']}")
-                    _fees_est = st.number_input("Estimated total entry fees ₹ (optional)", min_value=0.0, value=0.0, step=1.0, key=f"fees_{_r['id']}")
-                    _confirmed = st.form_submit_button("CONFIRM MANUAL ENTRY")
-                if _confirmed:
-                    _r["manual_entry_confirmed"] = True
-                    _r["trade_state"] = "POSITION_OPEN"
-                    _r["actual_entry_price"] = round(float(_fill), 2)
-                    _r["actual_entry_qty"] = int(_qty)
-                    _r["actual_entry_ts"] = time.time()
-                    _r["actual_fees"] = float(_fees_est)
-                    _r["option_stop"] = round(max(0.05, float(_fill) * (1 - BUYER_STOP_PCT / 100.0)), 2)
-                    _r["option_target1"] = round(float(_fill) * (1 + BUYER_TARGET1_PCT / 100.0), 2)
-                    _r["option_target2"] = round(float(_fill) * (1 + BUYER_TARGET2_PCT / 100.0), 2)
-                    _r["option_event_state"] = "POSITION_OPEN"
-                    save_scorecard(_records)
-                    _entry_msg = (f"🟢 MANUAL ENTRY CONFIRMED\n{_r.get('index')} {('BUY CALL' if _r.get('option_type') == 'CALL' else 'BUY PUT')} "
-                                  f"{_r.get('option_strike')} {_r.get('option_type')} exp {_r.get('option_expiry')}\n"
-                                  f"Actual entry ₹{float(_fill):.2f} × {int(_qty)} units | premium SL ₹{_r['option_stop']:.2f} | "
-                                  f"T1 ₹{_r['option_target1']:.2f} | T2 ₹{_r['option_target2']:.2f}\n"
-                                  "Manual tracking only; verify live prices and contract lot size.")
-                    if alerts_on and tg_token and tg_chat:
-                        _ar = fire_alert(f"manual_entry_{_r['id']}", _entry_msg, 24*60, alert_cfg)
-                        st.caption(f"Entry alert delivery result: {_ar or 'queued / cooldown / not sent'}")
-                    st.success("Entry recorded. Premium monitoring will begin on subsequent refreshes.")
-                    st.rerun()
-                if st.button("CANCEL / DID NOT ENTER", key=f"cancel_trade_{_r['id']}"):
-                    _r["trade_state"] = "CANCELLED"
-                    _r["manual_entry_confirmed"] = False
-                    save_scorecard(_records)
-                    st.info("Signal marked as not entered; premium monitoring will not run for it.")
-                    st.rerun()
-    else:
-        st.info("No unconfirmed validated option signals are available to confirm. New validated signals will appear here.")
-
-    _open_positions = [r for r in _records if r.get("trade_state") == "POSITION_OPEN" and r.get("manual_entry_confirmed")]
-    st.markdown("##### Open positions")
-    if _open_positions:
-        st.warning("This dashboard refreshes one selected index/expiry at a time. For reliable quote updates, keep the currently monitored position's index and expiry selected. Switching away can pause its premium monitoring; this is not an independent background monitor.")
-        for _r in _open_positions[::-1]:
-            if _r.get("index") != idx_name or str(_r.get("option_expiry")) != str(expiry)[:10]:
-                st.warning(f"Monitoring paused for {_r.get('index')} {_r.get('option_strike')} {_r.get('option_type')} exp {_r.get('option_expiry')}: select that index and expiry to refresh its option quote.")
-            _last = float(_r.get("option_last_mark") or 0.0)
-            _ent = float(_r.get("actual_entry_price") or 0.0)
-            _qty = int(_r.get("actual_entry_qty") or 0)
-            _u_pnl = (_last - _ent) * _qty if _last > 0 and _ent > 0 else None
-            st.write(f"**{_r.get('index')} { _r.get('option_strike')} {_r.get('option_type')} exp {_r.get('option_expiry')}** | entry ₹{_ent:.2f} × {_qty} | last observed bid/LTP ₹{_last:.2f} | indicative gross P&L " + (f"₹{_u_pnl:+,.2f}" if _u_pnl is not None else "n/a"))
-            with st.form(f"close_trade_{_r['id']}"):
-                _exit = st.number_input("Actual average exit premium ₹", min_value=0.05, value=float(_last if _last > 0 else _ent), step=0.05, key=f"exit_{_r['id']}")
-                _exit_fees = st.number_input("Total fees for whole trade ₹", min_value=0.0, value=0.0, step=1.0, key=f"exitfees_{_r['id']}")
-                _close = st.form_submit_button("RECORD EXIT / CLOSE POSITION")
-            if _close:
-                _r["actual_exit_price"] = round(float(_exit), 2)
-                _r["actual_exit_ts"] = time.time()
-                _r["actual_fees"] = float(_r.get("actual_fees") or 0.0) + float(_exit_fees)
-                _r["actual_net_pnl"] = round((float(_exit) - _ent) * _qty - float(_r["actual_fees"]), 2)
-                _r["trade_state"] = "EXITED"
-                _r["option_event_state"] = "EXITED"
-                save_scorecard(_records)
-                _exit_msg = (f"🏁 MANUAL POSITION CLOSED\n{_r.get('index')} {_r.get('option_strike')} {_r.get('option_type')} exp {_r.get('option_expiry')}\n"
-                             f"Entry ₹{_ent:.2f} | exit ₹{float(_exit):.2f} | units {_qty} | fees ₹{_r['actual_fees']:.2f} | NET P&L ₹{_r['actual_net_pnl']:+,.2f}")
-                if alerts_on and tg_token and tg_chat:
-                    fire_alert(f"manual_exit_{_r['id']}", _exit_msg, 24*60, alert_cfg)
-                st.success(f"Exit recorded. Net P&L ₹{_r['actual_net_pnl']:+,.2f}")
-                st.rerun()
-    else:
-        st.info("No manually confirmed open positions.")
-
-    _closed = [r for r in _records if r.get("trade_state") == "EXITED" and r.get("actual_net_pnl") is not None]
-    if _closed:
-        st.markdown("##### Closed trade results")
-        _closed_df = pd.DataFrame([{"Time": r.get("time"), "Index": r.get("index"), "Contract": f"{r.get('option_strike')} {r.get('option_type')}", "Entry ₹": r.get("actual_entry_price"), "Exit ₹": r.get("actual_exit_price"), "Units": r.get("actual_entry_qty"), "Fees ₹": r.get("actual_fees"), "Net P&L ₹": r.get("actual_net_pnl")} for r in _closed])
-        show_df(_closed_df, hide_index=True)
-        st.metric("REALIZED NET P&L (RECORDED TRADES)", f"₹{sum(float(r.get('actual_net_pnl') or 0) for r in _closed):+,.2f}")
-        st.caption("This is only as accurate as the entry, exit and fee values you record. It is not a backtest or a forecast.")
-
-
-with tab11:
     st.markdown("#### Institutional footprint: index futures (price, volume, open interest) and session VWAP")
     _fp = m.get("fp") or {}
     if not _fp.get("ok"):
