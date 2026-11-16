@@ -1,5 +1,5 @@
 """
-VIPUL OPTIONS BUYER SIGNAL TERMINAL v16.6 (ANTI-CHASE WALL GUARD + TRUE PRE-CHART IGNITION + T1 OUTCOME LOCK) (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
+VIPUL OPTIONS BUYER SIGNAL TERMINAL v16.7 (0DTE GAMMA-TO-THETA ENGINE + GAMMA FLIP BREAKOUT + GREEK CONTRACT RANKING) (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
 v15.1 adds an INSTITUTIONAL FOOTPRINT layer (needs footprint.py next to this file):
  - Index-futures price / volume / open-interest flow + session VWAP decide whether money is really moving your way
  - Footprint filter: VETO AGAINST (default) / REQUIRE ALIGNED / OFF; blocked signals are still logged with footprint fields
@@ -64,7 +64,7 @@ try:
 except ImportError:
     Groq = None
 
-st.set_page_config(page_title="Vipul Options Buyer Terminal v16.6", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Vipul Options Buyer Terminal v16.7", layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
 # CSS
@@ -1332,21 +1332,29 @@ VETO_RE = re.compile(r"\b(REJECT|REJECTED|VETO|VETOED|DENY|DENIED|DECLINE|DECLIN
 
 
 def select_buyer_contract(m, direction, allowed=None, target_spot=None, sl_spot=None, hold_min=30.0):
-    """Choose a liquid, near-ATM long option with asymmetric Call/Put targets (calls face up-move IV crush; puts get vega expansion)."""
+    """Choose a liquid, near-ATM long option ranked by Gamma-per-Rupee + Delta + Spread (especially on 0DTE expiry day)."""
     df = m.get("df")
     if df is None or df.empty or direction not in ("BUY", "SELL"):
         return None
     side = "CE" if direction == "BUY" else "PE"
     is_call = side == "CE"
+    is_0dte = int(m.get("dte", 99)) == 0
+    sd = max(daily_sigma(m), 1.0)
+    impulse_pts = 0.25 * sd  # standard 15-min gamma impulse test
+    T0 = max(float(m.get("t_years") or 1 / 365.0), 1e-5)
+    dt_15m = 15.0 / (252.0 * 375.0)
+    T_15m = max(1e-6, T0 - dt_15m)
+
     rows = []
     for _, r in df.iterrows():
         strike = _n(r.get("Strike"))
         ltp = _n(r.get(f"{side}_LTP"))
         bid, ask = _n(r.get(f"{side}_Bid")), _n(r.get(f"{side}_Ask"))
         delta = _n(r.get(f"{side}_Delta"))
+        gamma = abs(_n(r.get(f"{side}_Gamma")))
         iv = _n(r.get(f"{side}_IV"))
         oi, vol = _n(r.get(f"{side}_OI")), _n(r.get(f"{side}_Vol"))
-        if not all(math.isfinite(x) for x in (strike, ltp, bid, ask, delta, iv, oi, vol)):
+        if not all(math.isfinite(x) for x in (strike, ltp, bid, ask, delta, gamma, iv, oi, vol)):
             continue
         if allowed is not None and strike not in allowed:
             continue
@@ -1355,26 +1363,50 @@ def select_buyer_contract(m, direction, allowed=None, target_spot=None, sl_spot=
         mid = (bid + ask) / 2.0
         spread_pct = (ask - bid) / mid * 100.0 if mid > 0 else 999.0
         abs_delta = abs(delta)
-        if not (0.30 <= abs_delta <= 0.70) or spread_pct > MAX_OPTION_SPREAD_PCT or vol <= 0:
+        if not (0.30 <= abs_delta <= 0.75) or spread_pct > MAX_OPTION_SPREAD_PCT or vol <= 0:
             continue
-        score = abs(abs_delta - 0.50) * 3.0 + spread_pct / 100.0 + abs(strike - m["spot"]) / max(m["step"], 1) * 0.025
+
+        # Gamma-to-Theta Efficiency Ratio:
+        # 1) Expected option gain on a 0.25σ underlying impulse: Δ*dS + 0.5*Γ*(dS^2)
+        gamma_burst_pts = abs_delta * impulse_pts + 0.5 * gamma * (impulse_pts ** 2)
+        # 2) Expected 15-minute Theta decay at flat spot
+        iv_use = iv if iv > 0 else float(m.get("atm_iv") or 12.0)
+        p_now = bs_price(m["spot"], strike, T0, iv_use, is_call)
+        p_15m = bs_price(m["spot"], strike, T_15m, iv_use, is_call)
+        theta_15m_pts = max(0.05, (p_now - p_15m) * (ask / p_now) if p_now > 0.1 else ask * 0.03)
+        gamma_theta_ratio = gamma_burst_pts / max(theta_15m_pts, 0.1)
+        gamma_per_rs = (gamma * 10000.0) / max(ask, 1.0)
+
+        # On 0DTE expiry, reward high Gamma-per-Rupee and high Gamma/Theta ratio; on normal days, standard delta/spread score
+        if is_0dte:
+            score = abs(abs_delta - 0.52) * 2.2 + spread_pct / 80.0 - min(gamma_per_rs, 1.5) * 0.45
+        else:
+            score = abs(abs_delta - 0.50) * 3.0 + spread_pct / 100.0 + abs(strike - m["spot"]) / max(m["step"], 1) * 0.025
+
         rows.append({"option_type": "CALL" if is_call else "PUT", "side": side,
                      "strike": strike, "expiry": str(m.get("expiry", "")), "ltp": ltp,
                      "bid": bid, "ask": ask, "mid": mid, "spread_pct": spread_pct,
-                     "delta": delta, "iv": iv, "oi": int(oi), "volume": int(vol), "score": score})
+                     "delta": delta, "gamma": round(gamma, 6), "gamma_per_rs": round(gamma_per_rs, 3),
+                     "theta_15m": round(theta_15m_pts, 2), "gamma_burst_pts": round(gamma_burst_pts, 2),
+                     "gamma_theta_ratio": round(gamma_theta_ratio, 2),
+                     "iv": iv, "oi": int(oi), "volume": int(vol), "score": score})
     if not rows:
         return None
     best = min(rows, key=lambda x: x["score"])
     premium = best["ask"]
     best["entry_ref"] = round(premium, 2)
-    # Asymmetric target scaling: Calls use tighter T1/T2 (25%/45%) to beat up-move IV crush; Puts use (35%/60%)
-    t1_pct = 25.0 if is_call else BUYER_TARGET1_PCT
-    t2_pct = 45.0 if is_call else BUYER_TARGET2_PCT
-    stop_pct = 20.0 if is_call else BUYER_STOP_PCT
+    # On 0DTE expiry day, Gamma convexity allows faster T1/T2 expansion with tighter stop-loss against theta bleed
+    if is_0dte:
+        t1_pct = 30.0 if is_call else 40.0
+        t2_pct = 65.0 if is_call else 80.0
+        stop_pct = 18.0 if is_call else 20.0
+    else:
+        t1_pct = 25.0 if is_call else BUYER_TARGET1_PCT
+        t2_pct = 45.0 if is_call else BUYER_TARGET2_PCT
+        stop_pct = 20.0 if is_call else BUYER_STOP_PCT
     best["stop_premium"] = round(max(0.05, premium * (1 - stop_pct / 100.0)), 2)
     best["target1_premium"] = round(premium * (1 + t1_pct / 100.0), 2)
     best["target2_premium"] = round(premium * (1 + t2_pct / 100.0), 2)
-    T0 = max(float(m.get("t_years") or 1 / 365.0), 1e-5)
     T1 = max(1e-5, T0 - (hold_min / (252.0 * 375.0)))
     iv0 = best["iv"] or float(m.get("atm_iv") or 12.0)
     if target_spot and sl_spot:
@@ -1383,7 +1415,11 @@ def select_buyer_contract(m, direction, allowed=None, target_spot=None, sl_spot=
         best["model_target_premium"] = round(mod_t, 2) if mod_t else None
         best["model_stop_premium"] = round(mod_sl, 2) if mod_sl else None
     best["max_loss_per_unit"] = round(premium - best["stop_premium"], 2)
-    best["risk_note"] = f"Asymmetric plan ({'CALL 20% SL / 25% T1' if is_call else 'PUT 25% SL / 35% T1'}). Re-check live bid/ask before entry."
+    best["risk_note"] = (
+        f"{'0DTE GAMMA PLAN' if is_0dte else 'Asymmetric plan'} "
+        f"({'CALL ' + str(int(stop_pct)) + '% SL / +' + str(int(t1_pct)) + '% T1' if is_call else 'PUT ' + str(int(stop_pct)) + '% SL / +' + str(int(t1_pct)) + '% T1'} | "
+        f"Γ/Θ ratio {best['gamma_theta_ratio']:.1f}x, 15m Θ ≈ -₹{best['theta_15m']:.1f})."
+    )
     return best
 
 
@@ -1677,6 +1713,33 @@ def expiry_context(m, intraday, hist, now):
                 b = {**best, "state": f"price beyond the {best['side']} wall {best['level']:,.0f} but OI changed {best['oi_chg_pct']:+.1f}%, not confirmed"}
     xc["B"] = b
 
+    # Playbook G (0DTE Gamma Blast): Spot breaking away from Peak-Gamma Strike (`gamma_strike`) or Zero-Gamma Flip (`zero_gamma`)
+    # backed by Pre-Chart Ignition (Basis/Skew/15m OI velocity) + Futures Footprint alignment!
+    g_strike = float(m.get("gamma_strike") or atm)
+    z_gamma = float(m.get("zero_gamma") or g_strike)
+    ign = m.get("ignition") or {}
+    rev = m.get("reversal") or {}
+    fp_bias = str((m.get("fp") or {}).get("bias", "NEUTRAL"))
+    g_pb = {"dir": 0, "confirmed": False, "level": g_strike, "state": f"awaiting gamma unpin from {g_strike:,.0f}"}
+    if 9 * 60 + 25 <= t < EXPIRY_CUTOFF_MIN:
+        # Check if Pre-Chart Ignition (>=2/5) or Institutional Reversal is firing on expiry day with non-opposing futures
+        if (ign.get("dir") == 1 and ign.get("score", 0) >= 2 and fp_bias != "BEARISH") or (rev.get("dir") == 1):
+            piv_lvl = z_gamma if abs(spot - z_gamma) <= 1.5 * step else g_strike
+            if spot >= piv_lvl - 0.25 * step:
+                g_pb = {
+                    "dir": 1, "confirmed": True, "level": piv_lvl,
+                    "state": f"0DTE Gamma Unpin UP from {piv_lvl:,.0f} ({ign.get('label') if ign.get('dir')==1 else rev.get('label')})"
+                }
+        elif (ign.get("dir") == -1 and ign.get("score", 0) >= 2 and fp_bias != "BULLISH") or (rev.get("dir") == -1):
+            piv_lvl = z_gamma if abs(spot - z_gamma) <= 1.5 * step else g_strike
+            if spot <= piv_lvl + 0.25 * step:
+                g_pb = {
+                    "dir": -1, "confirmed": True, "level": piv_lvl,
+                    "state": f"0DTE Gamma Unpin DOWN from {piv_lvl:,.0f} ({ign.get('label') if ign.get('dir')==-1 else rev.get('label')})"
+                }
+    xc["G"] = g_pb
+    xc["time_stops"]["G"] = 20
+
     # Pin guard (late day): spot sitting on max pain with a compressed range
     pin = float(m.get("max_pain") or spot)
     last30 = cs[-30:]
@@ -1754,7 +1817,7 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
     xc = m.get("xctx") or {}
     playbook, time_stop, b_lead, be_info = None, None, False, None
     if xc.get("active"):
-        trig_a, trig_b = xc.get("A", {}), xc.get("B", {})
+        trig_a, trig_b, trig_g = xc.get("A", {}), xc.get("B", {}), xc.get("G", {})
         d_eng = {"BUY": 1, "SELL": -1}.get(sig, 0)
         tag_b = "C" if xc.get("late") else "B"
         if d_eng != 0:
@@ -1762,9 +1825,11 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
                 playbook = tag_b
             elif xc.get("a_window") and trig_a.get("dir") == d_eng:
                 playbook = "A"
+            elif trig_g.get("confirmed") and trig_g.get("dir") == d_eng:
+                playbook = "G"
             if playbook is None:
                 notes.append(f"{sig} rejected: expiry day needs a playbook trigger in the same direction. "
-                             f"A (opening-range break): {trig_a.get('state', 'n/a')}. B/C (wall break): {trig_b.get('state', 'n/a')}.")
+                             f"A (ORB): {trig_a.get('state', 'n/a')}. B/C (wall): {trig_b.get('state', 'n/a')}. G (Gamma unpin): {trig_g.get('state', 'n/a')}.")
                 sig = "WAIT"
         elif xc.get("b_window") and trig_b.get("confirmed"):
             sig = "BUY" if trig_b["dir"] > 0 else "SELL"
@@ -1917,7 +1982,9 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
 
     if sig != "WAIT" and playbook:
         _unit = max(0.5 * float(m.get("exp_move") or 0.0), 0.6 * m["step"])
-        _lvl = (xc.get("or_high") if sig == "BUY" else xc.get("or_low")) if playbook == "A" else (xc.get("B") or {}).get("level")
+        _lvl = (xc.get("or_high") if sig == "BUY" else xc.get("or_low")) if playbook == "A" else (
+            (xc.get("G") or {}).get("level") if playbook == "G" else (xc.get("B") or {}).get("level")
+        )
         if _lvl is None:
             _lvl = entry
         _stop_dist = max(abs(entry - _lvl) + 0.2 * m["step"], 0.3 * _unit)
@@ -1974,6 +2041,11 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
             sig, target, sl, rr, buyer_plan, playbook = "WAIT", None, None, None, None, None
         elif be_info["vs_avg30"] is not None and be_info["vs_avg30"] > 1.5:
             notes.append(f"Caution: breakeven needs {be_info['required_move']:,.0f} pts, {be_info['vs_avg30']:.1f}x today's typical 30-minute range.")
+        gt_ratio = float(buyer_plan.get("gamma_theta_ratio") or 0.0)
+        if sig in ("BUY", "SELL") and gt_ratio > 0 and gt_ratio < 1.35:
+            notes.append(f"{sig} rejected: 0DTE Gamma/Theta efficiency ratio ({gt_ratio:.2f}x) is below 1.35x "
+                         f"(15m expected gamma burst +₹{buyer_plan.get('gamma_burst_pts', 0):.1f} vs 15m theta decay -₹{buyer_plan.get('theta_15m', 0):.1f}).")
+            sig, target, sl, rr, buyer_plan, playbook = "WAIT", None, None, None, None, None
     proposed_sig = ({1: "BUY", -1: "SELL", 0: "WAIT"}[direction]) if engine_led else ai_sig
     return {"signal": sig, "ai_signal": ai_sig, "proposed_signal": proposed_sig, "entry": entry, "target": target, "sl": sl, "rr": rr,
             "confidence": conf, "note": " ".join(notes), "checks": checks, "net": net, "lean": lean,
@@ -3674,7 +3746,7 @@ def esc(x):
 # SIDEBAR
 # ============================================================
 with st.sidebar:
-    st.markdown("### BBG // BUYER TERMINAL v16.6 ANTI-CHASE EDITION")
+    st.markdown("### BBG // BUYER TERMINAL v16.7 0DTE GAMMA EDITION")
     dhan_token = clean(get_secret("DHAN_ACCESS_TOKEN", DEFAULT_DHAN_TOKEN))
     client_id = clean(get_secret("DHAN_CLIENT_ID", DEFAULT_CLIENT_ID))
     groq_key = get_secret("GROQ_API_KEY", DEFAULT_GROQ_KEY).strip()
@@ -4464,7 +4536,7 @@ with tab0:
         e2.metric("TRADES LEFT TODAY", f"{max(0, EXPIRY_MAX_TRADES - _risk['trades'])}", f"cap {EXPIRY_MAX_TRADES}", delta_color="off")
         e3.metric("NEW ENTRIES UNTIL", "2:30 pm", "ATM or 1 strike ITM only", delta_color="off")
         e4.metric("PIN (max pain)", f"{_xc['pin']:,.0f}", "PINNED: do not buy decay" if _xc.get("pinned") else f"{m['spot'] - _xc['pin']:+,.0f} vs spot", delta_color="off")
-        _a, _b = _xc.get("A", {}), _xc.get("B", {})
+        _a, _b, _g = _xc.get("A", {}), _xc.get("B", {}), _xc.get("G", {})
         _dirtxt = {1: "UP", -1: "DOWN", 0: "none"}
         _pbrows = [
             {"Playbook": "A  Morning scalp (9:30-11:00)", "Window open": "YES" if _xc.get("a_window") else "no",
@@ -4474,6 +4546,8 @@ with tab0:
             {"Playbook": "C  Late wall break + pin guard (1:30-2:30)", "Window open": "YES" if (_xc.get("b_window") and _xc.get("late")) else "no",
              "Trigger": _dirtxt[_b.get("dir", 0)] + (" (confirmed)" if _b.get("confirmed") else ""),
              "Reading": ("PINNED near max pain: no buying" if _xc.get("pinned") else _b.get("state", ""))},
+            {"Playbook": "G  0DTE Gamma Unpin + Ignition (9:25-2:30)", "Window open": "YES" if not _xc.get("cutoff") else "no",
+             "Trigger": _dirtxt[_g.get("dir", 0)] + (" (confirmed)" if _g.get("confirmed") else ""), "Reading": _g.get("state", "")},
         ]
         show_df(pd.DataFrame(_pbrows), hide_index=True)
         if _s and _s.get("playbook"):
