@@ -1,5 +1,5 @@
 """
-VIPUL OPTIONS BUYER SIGNAL TERMINAL v16.5 (ROLLING BIAS SYNC + 2-OF-4 IGNITION + BREAKEVEN TRAIL + ENGINE LOG FIX) (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
+VIPUL OPTIONS BUYER SIGNAL TERMINAL v16.6 (ANTI-CHASE WALL GUARD + TRUE PRE-CHART IGNITION + T1 OUTCOME LOCK) (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
 v15.1 adds an INSTITUTIONAL FOOTPRINT layer (needs footprint.py next to this file):
  - Index-futures price / volume / open-interest flow + session VWAP decide whether money is really moving your way
  - Footprint filter: VETO AGAINST (default) / REQUIRE ALIGNED / OFF; blocked signals are still logged with footprint fields
@@ -64,7 +64,7 @@ try:
 except ImportError:
     Groq = None
 
-st.set_page_config(page_title="Vipul Options Buyer Terminal v16.5", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Vipul Options Buyer Terminal v16.6", layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
 # CSS
@@ -934,8 +934,9 @@ def calculate_jobber_microstructure(df, spot):
 
 def find_structure(df, spot, step, exp_move, call_wall, put_wall):
     reach = max(exp_move * 1.5, step * 4)
-    res_pool = df[(df["Strike"] >= spot + step) & (df["Strike"] <= spot + reach) & (df["CE_OI"] > 0)]
-    sup_pool = df[(df["Strike"] <= spot - step) & (df["Strike"] >= spot - reach) & (df["PE_OI"] > 0)]
+    min_gap = 0.12 * step
+    res_pool = df[(df["Strike"] >= spot + min_gap) & (df["Strike"] <= spot + reach) & (df["CE_OI"] > 0)]
+    sup_pool = df[(df["Strike"] <= spot - min_gap) & (df["Strike"] >= spot - reach) & (df["PE_OI"] > 0)]
 
     def pick(pool, col, chg_col, fallback, ok):
         if not pool.empty:
@@ -1814,10 +1815,15 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
             sig = "WAIT"
 
     exh = m.get("exh") or {}
+    rev_now = m.get("reversal") or {}
+    is_rev = (sig == "BUY" and rev_now.get("dir") == 1) or (sig == "SELL" and rev_now.get("dir") == -1)
     if sig != "WAIT" and exh.get("ready"):
         mine = exh["buyer"] if sig == "BUY" else exh["seller"]
         who = "buyer" if sig == "BUY" else "seller"
-        if mine["flag"] == "CONFIRMED" and P("exh_veto"):
+        if not is_rev and mine["score"] >= 35:
+            notes.append(f"{sig} rejected: anti-chase guard ({who} exhaustion is already {mine['score']}/100; do not chase an extended move without a reversal setup).")
+            sig = "WAIT"
+        elif mine["flag"] == "CONFIRMED" and P("exh_veto"):
             notes.append(f"{sig} rejected: {who} exhaustion confirmed ({mine['score']}/100), the move you would join is running out of fuel.")
             sig = "WAIT"
         elif mine["flag"] in ("CONFIRMED", "WATCH"):
@@ -1857,8 +1863,9 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
         mode = str(P("regime_gate"))
         ign = m.get("ignition") or {}
         rev = m.get("reversal") or {}
-        ign_aligned = (sig == "BUY" and ign.get("dir") == 1 and ign.get("score", 0) >= 2) or (
-            sig == "SELL" and ign.get("dir") == -1 and ign.get("score", 0) >= 2)
+        # Non-reversal breakouts in RANGE/CHOP or TRANSITION/MIXED require strong 3/5 Pre-Chart Ignition; Reversals at walls require 2/5
+        ign_aligned = (sig == "BUY" and ign.get("dir") == 1 and ign.get("score", 0) >= 3) or (
+            sig == "SELL" and ign.get("dir") == -1 and ign.get("score", 0) >= 3)
         rev_aligned = (sig == "BUY" and rev.get("dir") == 1) or (sig == "SELL" and rev.get("dir") == -1)
         against = (sig == "BUY" and regime == "TRENDING DOWN") or (sig == "SELL" and regime == "TRENDING UP")
         if mode.startswith("STRICT"):
@@ -2275,8 +2282,8 @@ def lb_flows(then, now, spot, window):
 
 def pre_chart_ignition(m, hist, lookback_min=15):
     """Detects pre-chart institutional accumulation/distribution from rolling basis, skew, and OI velocity
-    BEFORE spot price breaks out on the chart."""
-    out = {"dir": 0, "score": 0, "label": "NONE", "reasons": [], "age_min": 0.0, "fl_edge": 0.0}
+    BEFORE spot price breaks out on the chart (blocks late chasing after a >0.22σ 15m spot spike)."""
+    out = {"dir": 0, "score": 0, "label": "NONE", "reasons": [], "age_min": 0.0, "fl_edge": 0.0, "spot_move_sig": 0.0}
     if not hist or len(hist) < 2:
         return out
     now_snap = hist[-1]
@@ -2285,6 +2292,11 @@ def pre_chart_ignition(m, hist, lookback_min=15):
     if age_min < 3.0:
         return out
     out["age_min"] = round(age_min, 1)
+
+    sd = max(daily_sigma(m), 1.0)
+    spot_move = float(m["spot"]) - float(ref.get("spot", m["spot"]))
+    spot_move_sig = spot_move / sd
+    out["spot_move_sig"] = round(spot_move_sig, 3)
 
     b_now, b_ref = m.get("excess_basis"), ref.get("excess_basis")
     b_shift = (b_now - b_ref) if (b_now is not None and b_ref is not None) else 0.0
@@ -2304,48 +2316,58 @@ def pre_chart_ignition(m, hist, lookback_min=15):
     pcr_shift = float(now_snap.get("pcr", 1.0)) - float(ref.get("pcr", 1.0))
 
     bull_pts, bear_pts = 0, 0
+    bull_reasons, bear_reasons = [], []
     if b_shift >= 8.0:
         bull_pts += 1
-        out["reasons"].append(f"basis +{b_shift:.1f} pts/{age_min:.0f}m")
+        bull_reasons.append(f"basis +{b_shift:.1f} pts/{age_min:.0f}m")
     elif b_shift <= -8.0:
         bear_pts += 1
-        out["reasons"].append(f"basis {b_shift:.1f} pts/{age_min:.0f}m")
+        bear_reasons.append(f"basis {b_shift:.1f} pts/{age_min:.0f}m")
 
     if rr_shift >= 0.25:
         bull_pts += 1
-        out["reasons"].append(f"25Δ skew +{rr_shift:.2f}")
+        bull_reasons.append(f"25Δ skew +{rr_shift:.2f}")
     elif rr_shift <= -0.25:
         bear_pts += 1
-        out["reasons"].append(f"25Δ skew {rr_shift:.2f}")
+        bear_reasons.append(f"25Δ skew {rr_shift:.2f}")
 
     if fl_ratio >= 1.5 and bull_fl > 0:
         bull_pts += 1
-        out["reasons"].append(f"rolling OI flow {fl_ratio:.1f}x bull")
+        bull_reasons.append(f"rolling OI flow {fl_ratio:.1f}x bull")
     elif inv_ratio >= 1.5 and bear_fl > 0:
         bear_pts += 1
-        out["reasons"].append(f"rolling OI flow {inv_ratio:.1f}x bear")
+        bear_reasons.append(f"rolling OI flow {inv_ratio:.1f}x bear")
 
     if pcr_shift >= 0.035:
         bull_pts += 1
-        out["reasons"].append(f"PCR +{pcr_shift:.3f}")
+        bull_reasons.append(f"PCR +{pcr_shift:.3f}")
     elif pcr_shift <= -0.035:
         bear_pts += 1
-        out["reasons"].append(f"PCR {pcr_shift:.3f}")
+        bear_reasons.append(f"PCR {pcr_shift:.3f}")
 
     fp = m.get("fp") or {}
+    q30 = str(fp.get("quad30", "")) if fp.get("ok") else ""
     if fp.get("ok"):
-        q30 = str(fp.get("quad30", ""))
         if q30 == "LONG BUILD-UP" and float(fp.get("vwap_dist") or 0) > 0:
             bull_pts += 1
-            out["reasons"].append("fut LONG BUILD-UP")
+            bull_reasons.append("fut LONG BUILD-UP")
         elif q30 == "SHORT BUILD-UP" and float(fp.get("vwap_dist") or 0) < 0.20:
             bear_pts += 1
-            out["reasons"].append("fut SHORT BUILD-UP")
+            bear_reasons.append("fut SHORT BUILD-UP")
 
-    if bull_pts >= 2 and bull_pts > bear_pts:
-        out.update({"dir": 1, "score": bull_pts, "label": f"⚡ BULLISH PRE-CHART IGNITION ({bull_pts}/5)"})
-    elif bear_pts >= 2 and bear_pts > bull_pts:
-        out.update({"dir": -1, "score": bear_pts, "label": f"⚡ BEARISH PRE-CHART IGNITION ({bear_pts}/5)"})
+    # Anti-conflict & anti-chase guard:
+    # 1) Rolling OI flow must agree (>= 1.5x)
+    # 2) Futures must not be building in the opposite direction (SHORT BUILD-UP blocks Bull Ignition; LONG BUILD-UP blocks Bear Ignition)
+    # 3) Spot must not have already exhausted >0.22σ (~55 pts) in the same direction over the last 15m (unless it's a reversal)
+    bull_ok = (fl_ratio >= 1.5) and (q30 != "SHORT BUILD-UP") and (spot_move_sig <= 0.22)
+    bear_ok = (inv_ratio >= 1.5) and (q30 != "LONG BUILD-UP") and (spot_move_sig >= -0.22)
+
+    if bull_pts >= 2 and bull_pts > bear_pts and bull_ok:
+        out.update({"dir": 1, "score": bull_pts, "reasons": bull_reasons, "label": f"⚡ BULLISH PRE-CHART IGNITION ({bull_pts}/5)"})
+    elif bear_pts >= 2 and bear_pts > bull_pts and bear_ok:
+        out.update({"dir": -1, "score": bear_pts, "reasons": bear_reasons, "label": f"⚡ BEARISH PRE-CHART IGNITION ({bear_pts}/5)"})
+    else:
+        out["reasons"] = bull_reasons if bull_pts >= bear_pts else bear_reasons
     return out
 
 
@@ -3372,14 +3394,13 @@ def update_outcomes(recs, idx_name, spot, now, candles, intraday=None, option_df
                 r["mfe"] = round(max(r["mfe"], best), 2)
                 r["mae"] = round(max(r["mae"], worst), 2)
                 if r["first_touch"] is None and has_levels:
-                    req_t1_pts = max(0.55 * abs(r["target"] - r["entry"]), 0.32 * float(r.get("sd") or 200.0))
+                    req_t1_pts = min(0.55 * abs(r["target"] - r["entry"]), 0.26 * float(r.get("sd") or 230.0))
                     hit_t = (b["h"] >= r["target"]) if d > 0 else (b["l"] <= r["target"])
                     hit_s = (b["l"] <= r["sl"]) if d > 0 else (b["h"] >= r["sl"])
-                    if hit_t:
+                    if hit_t or r["mfe"] >= req_t1_pts:
                         r["first_touch"] = "TARGET"
                     elif hit_s:
-                        # If trade already achieved >= 55% of target (+0.32 sigma, hitting Option T1) before reversing hours later, lock as TARGET (T1 hit)
-                        r["first_touch"] = "TARGET" if r["mfe"] >= req_t1_pts else "STOP"
+                        r["first_touch"] = "STOP"
                 b_el = (b["ts"] - r["ts"]) / 60.0
                 for h in OUTCOME_HORIZONS:
                     if r[f"s{h}"] is None and h <= b_el <= h + HORIZON_TOL_MIN:
@@ -3653,7 +3674,7 @@ def esc(x):
 # SIDEBAR
 # ============================================================
 with st.sidebar:
-    st.markdown("### BBG // BUYER TERMINAL v16.5 PRE-CHART + REVERSAL")
+    st.markdown("### BBG // BUYER TERMINAL v16.6 ANTI-CHASE EDITION")
     dhan_token = clean(get_secret("DHAN_ACCESS_TOKEN", DEFAULT_DHAN_TOKEN))
     client_id = clean(get_secret("DHAN_CLIENT_ID", DEFAULT_CLIENT_ID))
     groq_key = get_secret("GROQ_API_KEY", DEFAULT_GROQ_KEY).strip()
