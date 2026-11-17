@@ -1,5 +1,5 @@
 """
-VIPUL OPTIONS BUYER SIGNAL TERMINAL v16.8 (AUTO OPTION-PREMIUM TRACKING + MANUAL TRADES TAB REMOVED + 0DTE GAMMA ENGINE) (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
+VIPUL OPTIONS BUYER SIGNAL TERMINAL v17.2 (REVERSAL PROFIT-PROTECTION EXIT + T2 CHANDELIER TRAIL + DYNAMIC LOT SPLIT) (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
 v15.1 adds an INSTITUTIONAL FOOTPRINT layer (needs footprint.py next to this file):
  - Index-futures price / volume / open-interest flow + session VWAP decide whether money is really moving your way
  - Footprint filter: VETO AGAINST (default) / REQUIRE ALIGNED / OFF; blocked signals are still logged with footprint fields
@@ -64,7 +64,7 @@ try:
 except ImportError:
     Groq = None
 
-st.set_page_config(page_title="Vipul Options Buyer Terminal v16.8", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Vipul Options Buyer Terminal v17.2", layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
 # CSS
@@ -1713,30 +1713,30 @@ def expiry_context(m, intraday, hist, now):
                 b = {**best, "state": f"price beyond the {best['side']} wall {best['level']:,.0f} but OI changed {best['oi_chg_pct']:+.1f}%, not confirmed"}
     xc["B"] = b
 
-    # Playbook G (0DTE Gamma Blast): Spot breaking away from Peak-Gamma Strike (`gamma_strike`) or Zero-Gamma Flip (`zero_gamma`)
-    # backed by Pre-Chart Ignition (Basis/Skew/15m OI velocity) + Futures Footprint alignment!
+    # Playbook G (0DTE Gamma Wall Reversal): Strictly catches institutional Top/Bottom Trap reversals at a major OI wall
+    # when opposite exhaustion >= 60/100 and Spot has NOT already moved > 45 pts away from the wall/high/low.
     g_strike = float(m.get("gamma_strike") or atm)
-    z_gamma = float(m.get("zero_gamma") or g_strike)
-    ign = m.get("ignition") or {}
     rev = m.get("reversal") or {}
+    exh = m.get("exh") or {}
     fp_bias = str((m.get("fp") or {}).get("bias", "NEUTRAL"))
-    g_pb = {"dir": 0, "confirmed": False, "level": g_strike, "state": f"awaiting gamma unpin from {g_strike:,.0f}"}
-    if 9 * 60 + 25 <= t < EXPIRY_CUTOFF_MIN:
-        # Check if Pre-Chart Ignition (>=2/5) or Institutional Reversal is firing on expiry day with non-opposing futures
-        if (ign.get("dir") == 1 and ign.get("score", 0) >= 2 and fp_bias != "BEARISH") or (rev.get("dir") == 1):
-            piv_lvl = z_gamma if abs(spot - z_gamma) <= 1.5 * step else g_strike
-            if spot >= piv_lvl - 0.25 * step:
-                g_pb = {
-                    "dir": 1, "confirmed": True, "level": piv_lvl,
-                    "state": f"0DTE Gamma Unpin UP from {piv_lvl:,.0f} ({ign.get('label') if ign.get('dir')==1 else rev.get('label')})"
-                }
-        elif (ign.get("dir") == -1 and ign.get("score", 0) >= 2 and fp_bias != "BULLISH") or (rev.get("dir") == -1):
-            piv_lvl = z_gamma if abs(spot - z_gamma) <= 1.5 * step else g_strike
-            if spot <= piv_lvl + 0.25 * step:
-                g_pb = {
-                    "dir": -1, "confirmed": True, "level": piv_lvl,
-                    "state": f"0DTE Gamma Unpin DOWN from {piv_lvl:,.0f} ({ign.get('label') if ign.get('dir')==-1 else rev.get('label')})"
-                }
+    h_high = max((float(h.get("spot", spot)) for h in (hist or [])), default=spot)
+    h_low = min((float(h.get("spot", spot)) for h in (hist or [])), default=spot)
+    b_exh = int(((exh.get("buyer") or {}).get("score")) or 0) if exh.get("ready") else 0
+    s_exh = int(((exh.get("seller") or {}).get("score")) or 0) if exh.get("ready") else 0
+    g_pb = {"dir": 0, "confirmed": False, "level": g_strike, "state": "awaiting confirmed wall reversal (exhaustion >= 60)"}
+    if 9 * 60 + 45 <= t < EXPIRY_CUTOFF_MIN:
+        if rev.get("dir") == -1 and b_exh >= 60 and fp_bias != "BULLISH" and (h_high - spot) <= 0.9 * step:
+            piv_lvl = float(rev.get("level") or g_strike)
+            g_pb = {
+                "dir": -1, "confirmed": True, "level": piv_lvl,
+                "state": f"0DTE Top-Trap Reversal DOWN from {piv_lvl:,.0f} ({rev.get('label')}, buyer exh {b_exh}/100)"
+            }
+        elif rev.get("dir") == 1 and s_exh >= 60 and fp_bias != "BEARISH" and (spot - h_low) <= 0.9 * step:
+            piv_lvl = float(rev.get("level") or g_strike)
+            g_pb = {
+                "dir": 1, "confirmed": True, "level": piv_lvl,
+                "state": f"0DTE Bottom-Trap Reversal UP from {piv_lvl:,.0f} ({rev.get('label')}, seller exh {s_exh}/100)"
+            }
     xc["G"] = g_pb
     xc["time_stops"]["G"] = 20
 
@@ -1987,10 +1987,16 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
         )
         if _lvl is None:
             _lvl = entry
-        _stop_dist = max(abs(entry - _lvl) + 0.2 * m["step"], 0.3 * _unit)
+        _stop_dist = max(min(abs(entry - _lvl) + 0.2 * m["step"], 0.8 * m["step"]), 0.45 * m["step"])
         target = entry + _unit if sig == "BUY" else entry - _unit
+        # If an unbroken OI wall sits closer than target (and we are not in a confirmed B/C wall-break of that wall), cap target at the wall
+        if playbook not in ("B", "C"):
+            if sig == "BUY" and res and entry < res["level"] < target:
+                target = res["level"]
+            elif sig == "SELL" and sup and target < sup["level"] < entry:
+                target = sup["level"]
         sl = entry - _stop_dist if sig == "BUY" else entry + _stop_dist
-        notes.append(f"Expiry playbook levels: target {target:,.0f} (half the remaining expected move), stop {sl:,.0f} (back through {_lvl:,.0f}).")
+        notes.append(f"Expiry playbook levels: target {target:,.0f}, stop {sl:,.0f} ( anchored to {_lvl:,.0f}).")
     if sig != "WAIT" and not playbook:
         if res is None or sup is None:
             notes.append(f"{sig} rejected: no usable OI wall on one side of spot.")
@@ -3020,6 +3026,505 @@ def kelly_sizing(sig, card, capital, max_risk_pct):
 # ============================================================
 # SCORECARD, ALERTS & DATA HEALTH
 # ============================================================
+# ============================================================
+# v17.1 AUTOMATED TRADE EXECUTION & DYNAMIC PARTIAL-SPLIT ENGINE
+# ============================================================
+AUTO_TRADES_FILE = os.path.join(DATA_DIR, "bbg_auto_trades_v17.json")
+AUTO_CONFIG_FILE = os.path.join(DATA_DIR, "bbg_auto_config_v17.json")
+SCRIP_MASTER_CSV_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
+
+DEFAULT_LOT_SIZES = {
+    "NIFTY 50": 75,
+    "NIFTY BANK": 30,
+    "FINNIFTY": 65,
+    "MIDCPNIFTY": 120,
+    "SENSEX": 20,
+}
+
+DEFAULT_AUTO_CFG = {
+    "enabled": False,
+    "mode": "PAPER (Simulated Live Quotes)",
+    "allowed_indices": ["NIFTY 50"],
+    "lots_by_index": {"NIFTY 50": 1, "NIFTY BANK": 1, "FINNIFTY": 1, "MIDCPNIFTY": 1, "SENSEX": 1},
+    "product_type": "INTRADAY",
+    "max_open_positions": 1,
+    "t1_rule": "AUTO_SPLIT",          # AUTO_SPLIT: 1 lot -> trail SL to cost till T2; >=2 lots -> book 50% lots at T1 & trail rest to T2
+    "exit_on_reversal": True,         # Immediately close open position when an opposite Reversal / Validated Signal fires
+    "t2_runner_rule": "CHANDELIER",   # CHANDELIER: once T2 is hit, lock SL at T2 & trail 15% below peak Bid until reversal/stop; BOOK_T2: exit 100% at T2
+    "t2_trail_pct": 15.0,
+}
+
+
+def load_auto_cfg():
+    cfg = _load_json(AUTO_CONFIG_FILE, {}) or {}
+    out = dict(DEFAULT_AUTO_CFG)
+    out.update({k: v for k, v in cfg.items() if k in out})
+    lots = dict(DEFAULT_AUTO_CFG["lots_by_index"])
+    if isinstance(cfg.get("lots_by_index"), dict):
+        for k, v in cfg["lots_by_index"].items():
+            try:
+                lots[k] = max(1, int(v))
+            except (TypeError, ValueError):
+                pass
+    out["lots_by_index"] = lots
+    if not isinstance(out.get("allowed_indices"), list):
+        out["allowed_indices"] = ["NIFTY 50"]
+    return out
+
+
+def save_auto_cfg(cfg):
+    _save_json(AUTO_CONFIG_FILE, cfg)
+
+
+def load_auto_trades():
+    rows = _load_json(AUTO_TRADES_FILE, [])
+    return rows if isinstance(rows, list) else []
+
+
+def save_auto_trades(rows):
+    _save_json(AUTO_TRADES_FILE, rows)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _load_optidx_master():
+    import io
+    r = requests.get(SCRIP_MASTER_CSV_URL, timeout=15)
+    r.raise_for_status()
+    cols = [
+        "SEM_EXM_EXCH_ID", "SEM_SEGMENT", "SEM_SMST_SECURITY_ID",
+        "SEM_INSTRUMENT_NAME", "SEM_TRADING_SYMBOL", "SEM_EXPIRY_DATE",
+        "SEM_STRIKE_PRICE", "SEM_OPTION_TYPE", "SEM_LOT_UNITS",
+    ]
+    df = pd.read_csv(io.StringIO(r.text), usecols=lambda c: c in cols, low_memory=False)
+    return df[df["SEM_INSTRUMENT_NAME"].astype(str).str.strip().isin(["OPTIDX", "OPTFUT"])].copy()
+
+
+def resolve_option_contract_dhan(idx_name, expiry_str, strike, side):
+    """Return {'security_id': str, 'lot_size': int, 'segment': str, 'symbol': str} for an index option."""
+    sym_map = {
+        "NIFTY 50": "NIFTY", "NIFTY BANK": "BANKNIFTY",
+        "FINNIFTY": "FINNIFTY", "MIDCPNIFTY": "MIDCPNIFTY", "SENSEX": "SENSEX",
+    }
+    root = sym_map.get(idx_name, idx_name)
+    seg = "BSE_FNO" if idx_name == "SENSEX" else "NSE_FNO"
+    lot_fallback = DEFAULT_LOT_SIZES.get(idx_name, 75)
+    exp_iso = str(expiry_str)[:10]
+    side_u = "CE" if str(side).upper().startswith("C") else "PE"
+    try:
+        df = _load_optidx_master()
+        tsym = df["SEM_TRADING_SYMBOL"].astype(str).str.strip().str.upper()
+        sub = df[tsym.str.startswith(root + "-") | tsym.str.startswith(root)].copy()
+        sub["exp_iso"] = sub["SEM_EXPIRY_DATE"].astype(str).str.slice(0, 10)
+        sub["stk_num"] = pd.to_numeric(sub["SEM_STRIKE_PRICE"], errors="coerce")
+        sub["opt_type"] = sub["SEM_OPTION_TYPE"].astype(str).str.strip().str.upper()
+        m_sub = sub[
+            (sub["exp_iso"] == exp_iso)
+            & ((sub["stk_num"] - float(strike)).abs() < 0.5)
+            & (sub["opt_type"] == side_u)
+        ]
+        if not m_sub.empty:
+            row = m_sub.iloc[0]
+            sec_id = str(int(float(row["SEM_SMST_SECURITY_ID"])))
+            lot_sz = int(float(row.get("SEM_LOT_UNITS") or lot_fallback))
+            return {
+                "security_id": sec_id,
+                "lot_size": max(1, lot_sz),
+                "segment": seg,
+                "symbol": str(row.get("SEM_TRADING_SYMBOL") or f"{root} {exp_iso} {int(strike)} {side_u}"),
+            }
+    except Exception:
+        pass
+    return {
+        "security_id": "",
+        "lot_size": lot_fallback,
+        "segment": seg,
+        "symbol": f"{root} {exp_iso} {int(strike)} {side_u}",
+    }
+
+
+def place_dhan_option_order(sec_id, segment, txn_type, qty, limit_price, product_type, token, client_id, tag=""):
+    """Submit a marketable LIMIT option order to Dhan v2 /orders API."""
+    if not sec_id:
+        return {"ok": False, "orderId": None, "error": "securityId could not be resolved from Dhan scrip master"}
+    tick_price = round(max(0.05, float(limit_price)) * 20.0) / 20.0
+    payload = {
+        "dhanClientId": str(client_id),
+        "correlationId": (tag or f"bbg_{int(time.time())}")[:24],
+        "transactionType": str(txn_type).upper(),
+        "exchangeSegment": str(segment),
+        "productType": str(product_type or "INTRADAY").upper(),
+        "orderType": "LIMIT",
+        "validity": "DAY",
+        "securityId": str(sec_id),
+        "quantity": int(qty),
+        "price": tick_price,
+    }
+    try:
+        r = requests.post(f"{BASE_URL}/orders", headers=auth_headers(token, client_id), json=payload, timeout=10)
+        data = r.json() if r.content else {}
+        if r.ok and (data.get("orderId") or data.get("orderStatus")):
+            return {"ok": True, "orderId": str(data.get("orderId", "")), "status": str(data.get("orderStatus", "SENT")), "error": ""}
+        return {"ok": False, "orderId": None, "error": f"HTTP {r.status_code}: {str(data)[:160]}"}
+    except Exception as e:
+        return {"ok": False, "orderId": None, "error": str(e)[:160]}
+
+
+def auto_initiate_from_signals(new_recs, auto_cfg, token, client_id, alert_cfg, now_ist):
+    """Automatically initiate an option trade when a new VALIDATED signal fires for an enabled index."""
+    if not auto_cfg.get("enabled"):
+        return []
+    trades = load_auto_trades()
+    open_trades = [t for t in trades if t.get("status") == "OPEN"]
+    max_open = int(auto_cfg.get("max_open_positions") or 1)
+    allowed_idx = set(auto_cfg.get("allowed_indices") or [])
+    existing_sig_ids = {t.get("signal_id") for t in trades}
+    initiated = []
+
+    for r in new_recs:
+        if r.get("kind") != "VALIDATED" or r.get("option_strike") is None:
+            continue
+        if r.get("id") in existing_sig_ids:
+            continue
+        idx_nm = r.get("index")
+        if idx_nm not in allowed_idx:
+            continue
+        if len(open_trades) >= max_open:
+            break
+
+        strike = float(r["option_strike"])
+        opt_type = str(r.get("option_type") or ("CALL" if r.get("signal") == "BUY" else "PUT"))
+        side = "CE" if opt_type == "CALL" else "PE"
+        exp_str = str(r.get("option_expiry") or r.get("expiry"))[:10]
+        c_info = resolve_option_contract_dhan(idx_nm, exp_str, strike, side)
+        lots = max(1, int((auto_cfg.get("lots_by_index") or {}).get(idx_nm, 1)))
+        lot_size = int(c_info["lot_size"])
+        qty = lots * lot_size
+        entry_ref = float(r.get("option_entry_ref") or r.get("option_ask") or 10.0)
+        limit_px = round(entry_ref * 1.01 * 20.0) / 20.0  # +1% marketable limit buffer
+
+        is_live_api = str(auto_cfg.get("mode", "")).startswith("LIVE")
+        if is_live_api:
+            ord_res = place_dhan_option_order(
+                c_info["security_id"], c_info["segment"], "BUY", qty, limit_px,
+                auto_cfg.get("product_type", "INTRADAY"), token, client_id, tag=f"ent_{r['id']}"
+            )
+            ord_id = ord_res.get("orderId") or "ERR"
+            ord_note = ord_res.get("status") if ord_res.get("ok") else f"ORDER ERROR: {ord_res.get('error')}"
+            if not ord_res.get("ok"):
+                t_rec = {
+                    "trade_id": f"AT_{r['id']}", "signal_id": r["id"], "date": r.get("date"),
+                    "entry_time": now_ist.strftime("%H:%M:%S"), "exit_time": now_ist.strftime("%H:%M:%S"),
+                    "entry_ts": now_ist.timestamp(), "index": idx_nm, "expiry": exp_str,
+                    "strike": strike, "option_type": opt_type, "side": side,
+                    "symbol": c_info["symbol"], "security_id": c_info["security_id"], "segment": c_info["segment"],
+                    "initial_lots": lots, "lots": 0, "lot_size": lot_size, "initial_qty": qty, "qty": 0, "mode": "LIVE",
+                    "entry_price": entry_ref, "last_price": entry_ref, "peak_price": entry_ref,
+                    "sl_price": float(r.get("option_stop") or entry_ref * 0.8),
+                    "t1_price": float(r.get("option_target1") or entry_ref * 1.25),
+                    "t2_price": float(r.get("option_target2") or entry_ref * 1.50),
+                    "t1_hit": False, "t1_booked_lots": 0, "t1_booked_qty": 0, "t1_booked_price": None,
+                    "partial_realized_pnl": 0.0, "time_stop_min": r.get("time_stop_min") or 30,
+                    "status": "ORDER_FAILED", "exit_price": None, "exit_reason": ord_note,
+                    "unrealized_pnl": 0.0, "realized_pnl": 0.0, "pnl_pct": 0.0, "entry_order_id": ord_id,
+                }
+                trades.append(t_rec)
+                save_auto_trades(trades)
+                continue
+        else:
+            ord_id = f"PAPER_{int(time.time())}"
+            ord_note = "PAPER_FILLED"
+
+        plan_txt = (
+            f"1-Lot Plan: Trail SL to Cost at T1 (₹{float(r.get('option_target1') or 0):.2f}) & Hold 100% for T2 (₹{float(r.get('option_target2') or 0):.2f})"
+            if lots == 1
+            else f"Multi-Lot Split Plan: Sell {lots // 2} of {lots} lots at T1 (₹{float(r.get('option_target1') or 0):.2f}) & Trail remaining {lots - (lots // 2)} lot(s) at Cost to T2 (₹{float(r.get('option_target2') or 0):.2f})"
+        )
+
+        t_rec = {
+            "trade_id": f"AT_{r['id']}", "signal_id": r["id"], "date": r.get("date"),
+            "entry_time": now_ist.strftime("%H:%M:%S"), "exit_time": None,
+            "entry_ts": now_ist.timestamp(), "index": idx_nm, "expiry": exp_str,
+            "strike": strike, "option_type": opt_type, "side": side,
+            "symbol": c_info["symbol"], "security_id": c_info["security_id"], "segment": c_info["segment"],
+            "initial_lots": lots, "lots": lots, "lot_size": lot_size, "initial_qty": qty, "qty": qty,
+            "mode": "LIVE" if is_live_api else "PAPER",
+            "entry_price": round(entry_ref, 2), "last_price": round(entry_ref, 2), "peak_price": round(entry_ref, 2),
+            "sl_price": round(float(r.get("option_stop") or entry_ref * 0.8), 2),
+            "t1_price": round(float(r.get("option_target1") or entry_ref * 1.25), 2),
+            "t2_price": round(float(r.get("option_target2") or entry_ref * 1.50), 2),
+            "t1_hit": False, "t1_booked_lots": 0, "t1_booked_qty": 0, "t1_booked_price": None,
+            "partial_realized_pnl": 0.0, "time_stop_min": r.get("time_stop_min") or 30,
+            "status": "OPEN", "exit_price": None, "exit_reason": "",
+            "unrealized_pnl": 0.0, "realized_pnl": 0.0, "pnl_pct": 0.0,
+            "entry_order_id": ord_id, "order_note": ord_note, "plan_summary": plan_txt,
+        }
+        trades.append(t_rec)
+        open_trades.append(t_rec)
+        initiated.append(t_rec)
+
+        if alert_cfg.get("enabled"):
+            msg = (
+                f"🤖 AUTO-TRADE INITIATED ({t_rec['mode']})\n"
+                f"{idx_nm} | BUY {t_rec['symbol']}\n"
+                f"Lots: {lots} ({qty} qty) @ ₹{t_rec['entry_price']:.2f} | Order ID: {ord_id}\n"
+                f"Auto SL: ₹{t_rec['sl_price']:.2f} | T1: ₹{t_rec['t1_price']:.2f} | T2: ₹{t_rec['t2_price']:.2f}\n"
+                f"Strategy: {plan_txt}"
+            )
+            fire_alert(f"auto_init_{t_rec['trade_id']}", msg, 60, alert_cfg)
+
+    if initiated:
+        save_auto_trades(trades)
+    return initiated
+
+
+def partial_book_at_t1(t, mark_px, auto_cfg, token, client_id, alert_cfg, now_ist):
+    """When lots >= 2 and T1 is hit: sell half the lots (cur_lots // 2) at T1 and trail remaining lots' SL to entry cost."""
+    cur_lots = int(t.get("lots") or 1)
+    lot_sz = int(t.get("lot_size") or 75)
+    ent = float(t.get("entry_price") or mark_px)
+    mark_px = round(max(0.05, float(mark_px)), 2)
+
+    # Trail stop-loss to entry cost (breakeven) for whatever lots remain
+    t["t1_hit"] = True
+    t["sl_price"] = round(max(float(t.get("sl_price") or 0.0), ent), 2)
+
+    if cur_lots < 2:
+        # 1 Lot rule: do not sell at T1; trail SL to entry cost and hold 100% for T2!
+        if alert_cfg.get("enabled"):
+            msg = (
+                f"🛡️ T1 HIT (1-LOT TRAIL ACTIVE) — {t.get('mode')}\n"
+                f"{t.get('index')} | {t.get('symbol')}\n"
+                f"Live ₹{mark_px:.2f} >= T1 ₹{t.get('t1_price', 0):.2f} | Holding 1 lot ({t.get('qty')} qty) for T2 ₹{t.get('t2_price', 0):.2f}\n"
+                f"Stop-Loss trailed to Entry Cost: ₹{t['sl_price']:.2f} (Risk-Free Runner)"
+            )
+            fire_alert(f"auto_t1_trail_{t['trade_id']}", msg, 60, alert_cfg)
+        return
+
+    # >= 2 Lots rule: sell half of the lots (cur_lots // 2) at T1 and trail the remaining lots to T2
+    lots_to_sell = max(1, cur_lots // 2)
+    qty_to_sell = lots_to_sell * lot_sz
+    rem_lots = cur_lots - lots_to_sell
+    rem_qty = rem_lots * lot_sz
+
+    if t.get("mode") == "LIVE" and t.get("security_id"):
+        lim_px = round(max(0.05, mark_px * 0.985) * 20.0) / 20.0
+        ord_res = place_dhan_option_order(
+            t["security_id"], t.get("segment", "NSE_FNO"), "SELL", qty_to_sell, lim_px,
+            auto_cfg.get("product_type", "INTRADAY"), token, client_id, tag=f"t1_{t['signal_id']}"
+        )
+        t["t1_order_id"] = ord_res.get("orderId") or f"ERR:{ord_res.get('error', '')[:40]}"
+    else:
+        t["t1_order_id"] = f"PAPER_T1_{int(time.time())}"
+
+    part_pnl = round((mark_px - ent) * qty_to_sell, 2)
+    t["t1_booked_lots"] = lots_to_sell
+    t["t1_booked_qty"] = qty_to_sell
+    t["t1_booked_price"] = mark_px
+    t["partial_realized_pnl"] = round(float(t.get("partial_realized_pnl") or 0.0) + part_pnl, 2)
+    t["realized_pnl"] = t["partial_realized_pnl"]
+    t["lots"] = rem_lots
+    t["qty"] = rem_qty
+    t["unrealized_pnl"] = round((mark_px - ent) * rem_qty, 2)
+
+    try:
+        dr = load_daily_risk(now_ist)
+        dr["pnl"] = round(float(dr.get("pnl", 0.0)) + part_pnl, 2)
+        save_daily_risk(dr)
+    except Exception:
+        pass
+
+    if alert_cfg.get("enabled"):
+        msg = (
+            f"🎯 T1 PARTIAL PROFIT BOOKED ({t.get('mode')})\n"
+            f"{t.get('index')} | {t.get('symbol')}\n"
+            f"Sold {lots_to_sell} of {cur_lots} lots ({qty_to_sell} qty) @ ₹{mark_px:.2f} | Banked P&L: ₹{part_pnl:+,.2f}\n"
+            f"Remaining Runner: {rem_lots} lot(s) ({rem_qty} qty) trailing at Cost SL ₹{t['sl_price']:.2f} → Target T2 ₹{t.get('t2_price', 0):.2f}"
+        )
+        fire_alert(f"auto_t1_part_{t['trade_id']}", msg, 60, alert_cfg)
+
+
+def close_auto_trade_record(t, exit_px, reason, auto_cfg, token, client_id, alert_cfg, now_ist):
+    """Close remaining open lots of an auto-trade (fires SELL order if in LIVE mode) and update total realized P&L."""
+    exit_px = round(max(0.05, float(exit_px)), 2)
+    rem_qty = int(t.get("qty") or 0)
+    if t.get("mode") == "LIVE" and t.get("security_id") and rem_qty > 0:
+        lim_px = round(max(0.05, exit_px * 0.985) * 20.0) / 20.0
+        ord_res = place_dhan_option_order(
+            t["security_id"], t.get("segment", "NSE_FNO"), "SELL", rem_qty, lim_px,
+            auto_cfg.get("product_type", "INTRADAY"), token, client_id, tag=f"ex_{t['signal_id']}"
+        )
+        t["exit_order_id"] = ord_res.get("orderId") or f"ERR:{ord_res.get('error', '')[:40]}"
+    else:
+        t["exit_order_id"] = f"PAPER_EX_{int(time.time())}"
+
+    ent = float(t.get("entry_price") or 0.0)
+    init_qty = int(t.get("initial_qty") or rem_qty or 1)
+    rem_pnl = round((exit_px - ent) * rem_qty, 2)
+    part_pnl = float(t.get("partial_realized_pnl") or 0.0)
+    total_pnl = round(part_pnl + rem_pnl, 2)
+    pnl_pct = round((total_pnl / (ent * init_qty) * 100.0) if (ent > 0 and init_qty > 0) else 0.0, 2)
+
+    t["status"] = "CLOSED"
+    t["exit_price"] = exit_px
+    t["last_price"] = exit_px
+    t["exit_time"] = now_ist.strftime("%H:%M:%S")
+    t["exit_reason"] = reason + (f" (after T1 partial +{t.get('t1_booked_lots')}L @ ₹{t.get('t1_booked_price'):.2f})" if t.get("t1_booked_lots") else "")
+    t["realized_pnl"] = total_pnl
+    t["unrealized_pnl"] = 0.0
+    t["pnl_pct"] = pnl_pct
+
+    try:
+        dr = load_daily_risk(now_ist)
+        dr["pnl"] = round(float(dr.get("pnl", 0.0)) + rem_pnl, 2)
+        dr["trades"] = int(dr.get("trades", 0)) + 1
+        save_daily_risk(dr)
+    except Exception:
+        pass
+
+    if alert_cfg.get("enabled"):
+        em = "🎯" if total_pnl > 0 else "🛑"
+        msg = (
+            f"{em} AUTO-TRADE CLOSED ({t.get('mode')}) — {t['exit_reason']}\n"
+            f"{t.get('index')} | {t.get('symbol')}\n"
+            f"Entry ₹{ent:.2f} → Exit ₹{exit_px:.2f} ({pnl_pct:+.1f}%) | Total Lots: {t.get('initial_lots', t.get('lots'))}\n"
+            f"Total Realized P&L: ₹{total_pnl:+,.2f}"
+        )
+        fire_alert(f"auto_cls_{t['trade_id']}_{int(time.time())}", msg, 1, alert_cfg)
+
+
+def check_opposite_reversal_exit(t, m, sig):
+    """Returns (should_exit, reason) if an opposite Institutional Reversal, opposite Validated Signal,
+    or confirmed Exhaustion + opposite Pre-Chart Ignition fires against an open position."""
+    if m is None:
+        return False, ""
+    side = t.get("side", "CE")  # "CE" (long Call) or "PE" (long Put)
+    rev = m.get("reversal") or {}
+    ign = m.get("ignition") or {}
+    exh = m.get("exh") or {}
+    val_sig = (sig or {}).get("signal", "WAIT")
+
+    if side == "CE":
+        if rev.get("dir") == -1:
+            return True, f"OPPOSITE REVERSAL EXIT ({rev.get('label')})"
+        if val_sig == "SELL":
+            return True, "OPPOSITE VALIDATED SELL SIGNAL"
+        b_exh = int(((exh.get("buyer") or {}).get("score")) or 0) if exh.get("ready") else 0
+        if b_exh >= 67 and ign.get("dir") == -1 and int(ign.get("score") or 0) >= 3:
+            return True, f"PROFIT PROTECT EXIT (Buyer Exhaustion {b_exh}/100 + {ign.get('label')})"
+    else:
+        if rev.get("dir") == 1:
+            return True, f"OPPOSITE REVERSAL EXIT ({rev.get('label')})"
+        if val_sig == "BUY":
+            return True, "OPPOSITE VALIDATED BUY SIGNAL"
+        s_exh = int(((exh.get("seller") or {}).get("score")) or 0) if exh.get("ready") else 0
+        if s_exh >= 67 and ign.get("dir") == 1 and int(ign.get("score") or 0) >= 3:
+            return True, f"PROFIT PROTECT EXIT (Seller Exhaustion {s_exh}/100 + {ign.get('label')})"
+
+    return False, ""
+
+
+def update_auto_trades_live(idx_name, current_expiry, option_df, auto_cfg, token, client_id, alert_cfg, now_ist, m=None, sig=None):
+    """Refresh live LTP/Bid, unrealized P&L, immediate Reversal Exit, 1-lot trail / multi-lot T1 split, T2 Chandelier trail, and auto-exits."""
+    trades = load_auto_trades()
+    changed = False
+    exp_iso = str(current_expiry)[:10]
+
+    for t in trades:
+        if t.get("status") != "OPEN":
+            continue
+        if t.get("index") == idx_name and str(t.get("expiry"))[:10] == exp_iso and option_df is not None and not option_df.empty:
+            match = option_df[option_df["Strike"].astype(float).sub(float(t["strike"])).abs() < 0.01]
+            if not match.empty:
+                side = t.get("side", "CE")
+                bid = _n(match.iloc[0].get(f"{side}_Bid"))
+                ltp = _n(match.iloc[0].get(f"{side}_LTP"))
+                mark = bid if bid > 0 else ltp
+                if mark > 0:
+                    ent = float(t.get("entry_price") or mark)
+                    rem_qty = int(t.get("qty") or 1)
+                    init_qty = int(t.get("initial_qty") or rem_qty or 1)
+                    part_pnl = float(t.get("partial_realized_pnl") or 0.0)
+                    t["last_price"] = round(mark, 2)
+                    t["peak_price"] = round(max(float(t.get("peak_price") or mark), mark), 2)
+                    t["unrealized_pnl"] = round((mark - ent) * rem_qty, 2)
+                    comb_pnl = part_pnl + t["unrealized_pnl"]
+                    t["pnl_pct"] = round((comb_pnl / (ent * init_qty) * 100.0) if (ent > 0 and init_qty > 0) else 0.0, 2)
+                    changed = True
+
+                    # 0. IMMEDIATE REVERSAL / OPPOSITE-SIGNAL EXIT (Protects profit & frees slot to wait for next validated signal)
+                    if auto_cfg.get("exit_on_reversal", True) and (now_ist.timestamp() - float(t.get("entry_ts") or 0)) >= 45:
+                        rev_exit, rev_why = check_opposite_reversal_exit(t, m, sig)
+                        if rev_exit:
+                            close_auto_trade_record(t, mark, rev_why, auto_cfg, token, client_id, alert_cfg, now_ist)
+                            continue
+
+                    # 1. Check T1 hit first (so multi-lot trades book 50% at T1 and trail SL to cost):
+                    if mark >= float(t.get("t1_price") or 999999.0) and not t.get("t1_hit"):
+                        if auto_cfg.get("t1_rule") == "BOOK_100_T1":
+                            t["t1_hit"] = True
+                            close_auto_trade_record(t, mark, "TARGET_1 FULL EXIT", auto_cfg, token, client_id, alert_cfg, now_ist)
+                            continue
+                        else:
+                            partial_book_at_t1(t, mark, auto_cfg, token, client_id, alert_cfg, now_ist)
+
+                    # 2. Check T2 hit & Chandelier High-Water-Mark Runner Trail:
+                    t2_px = float(t.get("t2_price") or 999999.0)
+                    if mark >= t2_px:
+                        if auto_cfg.get("t2_runner_rule", "CHANDELIER") == "BOOK_T2":
+                            close_auto_trade_record(t, mark, "TARGET_2 HIT", auto_cfg, token, client_id, alert_cfg, now_ist)
+                            continue
+                        else:
+                            trail_pct = float(auto_cfg.get("t2_trail_pct") or 15.0) / 100.0
+                            chandelier_sl = round(max(t2_px * 0.96, float(t["peak_price"]) * (1.0 - trail_pct)), 2)
+                            if chandelier_sl > float(t.get("sl_price") or 0.0):
+                                t["sl_price"] = chandelier_sl
+                            if not t.get("t2_hit"):
+                                t["t2_hit"] = True
+                                if alert_cfg.get("enabled"):
+                                    fire_alert(
+                                        f"auto_t2_trail_{t['trade_id']}",
+                                        f"🚀 T2 SURPASSED — CHANDELIER RUNNER ACTIVE ({t.get('mode')})\n"
+                                        f"{t.get('index')} | {t.get('symbol')} | Live ₹{mark:.2f} (Peak ₹{t['peak_price']:.2f})\n"
+                                        f"Trailing Stop locked at ₹{t['sl_price']:.2f} ({trail_pct*100:.0f}% below peak). Will auto-close on Reversal or Trail hit!",
+                                        60, alert_cfg,
+                                    )
+                    elif t.get("t2_hit"):
+                        trail_pct = float(auto_cfg.get("t2_trail_pct") or 15.0) / 100.0
+                        chandelier_sl = round(max(t2_px * 0.96, float(t["peak_price"]) * (1.0 - trail_pct)), 2)
+                        if chandelier_sl > float(t.get("sl_price") or 0.0):
+                            t["sl_price"] = chandelier_sl
+
+                    # 3. Check Stop-Loss (Initial SL, T1 Cost-Trail SL, or T2 Chandelier Trail SL)
+                    if mark <= float(t.get("sl_price") or 0.0):
+                        rsn = "T2 CHANDELIER TRAIL STOP" if t.get("t2_hit") else ("T1 COST-TRAIL STOP" if t.get("t1_hit") else "STOP_LOSS HIT")
+                        close_auto_trade_record(t, mark, rsn, auto_cfg, token, client_id, alert_cfg, now_ist)
+                        continue
+
+                    # 4. Check 15:20 IST intraday EOD square-off
+                    if market_open_now(now_ist) and (now_ist.hour * 60 + now_ist.minute) >= (15 * 60 + 20):
+                        close_auto_trade_record(t, mark, "EOD 15:20 AUTO SQUARE-OFF", auto_cfg, token, client_id, alert_cfg, now_ist)
+                        continue
+
+    if changed:
+        save_auto_trades(trades)
+    return trades
+
+
+def emergency_kill_all_auto_trades(auto_cfg, token, client_id, alert_cfg, now_ist):
+    """Turn OFF automation and immediately close all OPEN positions at latest mark price."""
+    auto_cfg["enabled"] = False
+    save_auto_cfg(auto_cfg)
+    trades = load_auto_trades()
+    closed_count = 0
+    for t in trades:
+        if t.get("status") == "OPEN":
+            px = float(t.get("last_price") or t.get("entry_price") or 0.05)
+            close_auto_trade_record(t, px, "EMERGENCY KILL-SWITCH (CLOSE ALL)", auto_cfg, token, client_id, alert_cfg, now_ist)
+            closed_count += 1
+    save_auto_trades(trades)
+    return closed_count
+
+
 SCORECARD_FILE = os.path.join(DATA_DIR, "bbg_scorecard_v14.json")
 ALERT_FILE = os.path.join(DATA_DIR, "bbg_alerts_sent_v15.json")
 SIGNAL_DEDUP_MIN = 30
@@ -3753,7 +4258,7 @@ def esc(x):
 # SIDEBAR
 # ============================================================
 with st.sidebar:
-    st.markdown("### BBG // BUYER TERMINAL v16.8 AUTO-TRACK EDITION")
+    st.markdown("### BBG // BUYER TERMINAL v17.2 REVERSAL-GUARD EDITION")
     dhan_token = clean(get_secret("DHAN_ACCESS_TOKEN", DEFAULT_DHAN_TOKEN))
     client_id = clean(get_secret("DHAN_CLIENT_ID", DEFAULT_CLIENT_ID))
     groq_key = get_secret("GROQ_API_KEY", DEFAULT_GROQ_KEY).strip()
@@ -4016,6 +4521,11 @@ if alerts_on and tg_token and tg_chat:
     # Retry previously failed Telegram/webhook deliveries on subsequent app reruns.
     alert_results += process_alert_queue(alert_cfg)
 
+auto_cfg = load_auto_cfg()
+update_auto_trades_live(idx_name, expiry, m["df"], auto_cfg, dhan_token, client_id, alert_cfg, now_ist, m=m, sig=sig)
+if new_recs and auto_cfg.get("enabled") and market_open_now(now_ist):
+    auto_initiate_from_signals(new_recs, auto_cfg, dhan_token, client_id, alert_cfg, now_ist)
+
 # ============================================================
 # DASHBOARD HEADER
 # ============================================================
@@ -4038,9 +4548,9 @@ for _row in health_rows:
     _hc[_row["Status"]] += 1
 st.caption(f"DATA HEALTH: {_hc['OK']} OK · {_hc['WARN']} warn · {_hc['FAIL']} fail")
 
-tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
     "🛡️ Trade Desk", "📊 Dashboard & Engine", "📐 Day Levels", "🧭 Exhaustion", "🎯 Premium Scanner",
-    "🤖 AI Council & News", "📋 Option Chain", "📒 Scorecard", "🩺 Data Health", "📈 GEX & Skew", "🏦 Footprint"])
+    "🤖 AI Council & News", "📋 Option Chain", "📒 Scorecard", "🩺 Data Health", "📈 GEX & Skew", "🏦 Footprint", "⚡ Auto Trade & P&L"])
 
 with tab1:
     status = m["status"]
@@ -4565,3 +5075,233 @@ with tab0:
         st.warning("CAUTION: " + ", ".join(r["Check"] for r in _warns) + ". Entry is your call; consider smaller size.")
     else:
         st.success("GO: all checks pass. Execute manually and respect your stop.")
+
+
+# ============================================================
+# v17.1 AUTO TRADE & LIVE P&L TAB
+# ============================================================
+with tab11:
+    st.markdown("#### ⚡ AUTOMATED TRADE EXECUTION & LIVE P&L DESK")
+    st.caption(
+        "Dynamic Lot-Split Rules: If Lot Size == 1, trails SL to Entry Cost at T1 and holds 100% until T2. "
+        "If Lot Size >= 2, automatically sells half your lots (lots // 2) at T1 and trails the remaining runner lots at Entry Cost until T2."
+    )
+
+    _acfg = load_auto_cfg()
+    _atrades = load_auto_trades()
+    _open_at = [t for t in _atrades if t.get("status") == "OPEN"]
+    _closed_at = [t for t in _atrades if t.get("status") == "CLOSED"]
+    _today_str = now_ist.date().isoformat()
+    _today_closed = [t for t in _closed_at if t.get("date") == _today_str]
+
+    _unreal_pnl = sum(float(t.get("unrealized_pnl") or 0.0) for t in _open_at)
+    _part_open_today = sum(float(t.get("partial_realized_pnl") or 0.0) for t in _open_at if t.get("date") == _today_str)
+    _real_today = sum(float(t.get("realized_pnl") or 0.0) for t in _today_closed) + _part_open_today
+    _total_today = _unreal_pnl + _real_today
+    _wins_today = sum(1 for t in _today_closed if float(t.get("realized_pnl") or 0.0) > 0)
+    _win_rate_td = (_wins_today / len(_today_closed) * 100.0) if _today_closed else 0.0
+
+    # ---- Top Banner: Automation Status + Emergency Kill-Switch Button
+    _st_col = "#00e676" if _acfg.get("enabled") else "#ff1744"
+    _st_txt = f"🟢 AUTOMATION ARMED ({_acfg.get('mode')})" if _acfg.get("enabled") else "🔴 AUTOMATION STOPPED (DISARMED)"
+    st.markdown(
+        f"<div style='border:2px solid {_st_col};background:#0f0f0f;padding:12px 16px;border-radius:6px;margin-bottom:12px;'>"
+        f"<span style='font-size:1.3rem;font-weight:800;color:{_st_col};'>{esc(_st_txt)}</span>"
+        f"&nbsp;&nbsp;|&nbsp;&nbsp;<span style='color:#ddd;'>Active Indices: <b>{esc(', '.join(_acfg.get('allowed_indices') or ['None']))}</b> "
+        f"| Open Trades: <b>{len(_open_at)}/{_acfg.get('max_open_positions', 1)}</b></span></div>",
+        unsafe_allow_html=True,
+    )
+
+    # ---- Live P&L Metrics Row
+    p1, p2, p3, p4, p5 = st.columns(5)
+    p1.metric("LIVE OPEN P&L ₹", f"₹{_unreal_pnl:+,.2f}", f"{len(_open_at)} active trade(s)", delta_color="off")
+    p2.metric("TODAY REALIZED P&L ₹", f"₹{_real_today:+,.2f}", f"{len(_today_closed)} closed (+T1 partial)", delta_color="off")
+    p3.metric("TODAY NET P&L ₹", f"₹{_total_today:+,.2f}", delta_color="off")
+    p4.metric("TODAY WIN RATE", f"{_win_rate_td:.1f}%" if _today_closed else "—", f"{_wins_today}/{len(_today_closed)} won", delta_color="off")
+    p5.metric("CURRENT INDEX LOT SIZE", f"{DEFAULT_LOT_SIZES.get(idx_name, 75)} units/lot", idx_name, delta_color="off")
+
+    st.markdown("---")
+
+    # ---- Controls: 1. Selecting Index, 2. Lot Sizes, 3. ON/OFF Switch & Emergency Close-All Kill-Switch
+    st.markdown("##### 🎛️ 1. Select Index · 2. Lot Sizes · 3. Master ON/OFF & Emergency Kill-Switch")
+    ctl_left, ctl_right = st.columns([2, 1])
+
+    with ctl_left:
+        with st.form("auto_trade_settings_form"):
+            _new_enabled = st.toggle(
+                "⚡ MASTER AUTOMATION ON / OFF (Auto-initiate trades when a VALIDATED signal fires)",
+                value=bool(_acfg.get("enabled")),
+            )
+            _mode_opts = ["PAPER (Simulated Live Quotes)", "LIVE (Dhan v2 Order API)"]
+            _cur_m_idx = 1 if str(_acfg.get("mode", "")).startswith("LIVE") else 0
+            _new_mode = st.selectbox("EXECUTION MODE", _mode_opts, index=_cur_m_idx)
+
+            _new_indices = st.multiselect(
+                "1️⃣ SELECT INDEX / INDICES FOR AUTO-TRADING",
+                options=list(INDEX_MAP.keys()),
+                default=[x for x in (_acfg.get("allowed_indices") or ["NIFTY 50"]) if x in INDEX_MAP],
+                help="Only validated signals on the indices selected here will automatically initiate trades.",
+            )
+
+            st.markdown("**2️⃣ LOT SIZES PER TRADE (1 Lot = Trail to T2 | ≥2 Lots = 50% Partial Book at T1 & Trail Rest to T2)**")
+            l1, l2, l3, l4, l5 = st.columns(5)
+            _lots_Now = _acfg.get("lots_by_index") or {}
+            _lot_n50 = l1.number_input(f"NIFTY 50 (×{DEFAULT_LOT_SIZES['NIFTY 50']})", min_value=1, max_value=50, value=int(_lots_Now.get("NIFTY 50", 1)), step=1)
+            _lot_bnk = l2.number_input(f"BANKNIFTY (×{DEFAULT_LOT_SIZES['NIFTY BANK']})", min_value=1, max_value=50, value=int(_lots_Now.get("NIFTY BANK", 1)), step=1)
+            _lot_fin = l3.number_input(f"FINNIFTY (×{DEFAULT_LOT_SIZES['FINNIFTY']})", min_value=1, max_value=50, value=int(_lots_Now.get("FINNIFTY", 1)), step=1)
+            _lot_mid = l4.number_input(f"MIDCP (×{DEFAULT_LOT_SIZES['MIDCPNIFTY']})", min_value=1, max_value=50, value=int(_lots_Now.get("MIDCPNIFTY", 1)), step=1)
+            _lot_sen = l5.number_input(f"SENSEX (×{DEFAULT_LOT_SIZES['SENSEX']})", min_value=1, max_value=50, value=int(_lots_Now.get("SENSEX", 1)), step=1)
+
+            o1, o2, o3 = st.columns(3)
+            _new_prod = o1.selectbox("PRODUCT TYPE", ["INTRADAY", "MARGIN"], index=0 if _acfg.get("product_type") == "INTRADAY" else 1)
+            _new_max_pos = o2.number_input("MAX SIMULTANEOUS OPEN TRADES", min_value=1, max_value=5, value=int(_acfg.get("max_open_positions", 1)), step=1)
+            _t1_choices = [
+                "Smart Split (1 Lot: Trail to T2 | ≥2 Lots: Book Half at T1 & Trail Rest to T2)",
+                "Book 100% Full Exit at T1",
+            ]
+            _new_t1_mode = o3.selectbox(
+                "T1 PROFIT RULE",
+                _t1_choices,
+                index=1 if _acfg.get("t1_rule") == "BOOK_100_T1" else 0,
+            )
+
+            r_col1, r_col2, r_col3 = st.columns(3)
+            _new_rev_exit = r_col1.toggle(
+                "🔄 AUTO-CLOSE ON REVERSAL SIGNAL (Protect Profit & Wait for Next Validated Signal)",
+                value=bool(_acfg.get("exit_on_reversal", True)),
+            )
+            _t2_choices = [
+                "Chandelier Trail Beyond T2 (Lock T2 & Trail Below Peak Until Reversal)",
+                "Fixed Exit 100% at T2",
+            ]
+            _new_t2_mode = r_col2.selectbox(
+                "T2 RUNNER RULE",
+                _t2_choices,
+                index=1 if _acfg.get("t2_runner_rule") == "BOOK_T2" else 0,
+            )
+            _new_trail_pct = r_col3.number_input(
+                "CHANDELIER TRAIL % BELOW PEAK",
+                min_value=5.0, max_value=35.0, value=float(_acfg.get("t2_trail_pct", 15.0)), step=2.5,
+            )
+
+            _save_btn = st.form_submit_button("💾 SAVE AUTO-TRADE SETTINGS", use_container_width=True)
+            if _save_btn:
+                _updated_cfg = {
+                    "enabled": bool(_new_enabled),
+                    "mode": _new_mode,
+                    "allowed_indices": _new_indices if _new_indices else ["NIFTY 50"],
+                    "lots_by_index": {
+                        "NIFTY 50": int(_lot_n50),
+                        "NIFTY BANK": int(_lot_bnk),
+                        "FINNIFTY": int(_lot_fin),
+                        "MIDCPNIFTY": int(_lot_mid),
+                        "SENSEX": int(_lot_sen),
+                    },
+                    "product_type": _new_prod,
+                    "max_open_positions": int(_new_max_pos),
+                    "t1_rule": "BOOK_100_T1" if _new_t1_mode.startswith("Book 100%") else "AUTO_SPLIT",
+                    "exit_on_reversal": bool(_new_rev_exit),
+                    "t2_runner_rule": "BOOK_T2" if _new_t2_mode.startswith("Fixed") else "CHANDELIER",
+                    "t2_trail_pct": float(_new_trail_pct),
+                }
+                save_auto_cfg(_updated_cfg)
+                st.success("Auto-trade settings saved!")
+                st.rerun()
+
+    with ctl_right:
+        st.markdown("##### 🚨 3️⃣ Emergency Kill-Switch")
+        st.warning("Clicking **STOP AUTOMATION & CLOSE ALL ACTIVE TRADES** immediately disarms automation and squares off all open positions at the latest market price.")
+        if st.button("🛑 STOP AUTOMATION & CLOSE ALL ACTIVE TRADES", type="primary", use_container_width=True, key="btn_kill_all"):
+            _n_closed = emergency_kill_all_auto_trades(_acfg, dhan_token, client_id, alert_cfg, now_ist)
+            st.error(f"Automation DISARMED. Closed {_n_closed} open trade(s).")
+            st.rerun()
+
+        if _acfg.get("enabled"):
+            if st.button("⏸️ PAUSE AUTOMATION ONLY (Keep Open Trades)", use_container_width=True, key="btn_pause_auto"):
+                _acfg["enabled"] = False
+                save_auto_cfg(_acfg)
+                st.info("Automation paused. Existing open trades will still be monitored.")
+                st.rerun()
+        else:
+            if st.button("▶️ ARM / START AUTOMATION NOW", use_container_width=True, key="btn_start_auto"):
+                _acfg["enabled"] = True
+                save_auto_cfg(_acfg)
+                st.success("Automation ARMED!")
+                st.rerun()
+
+    st.markdown("---")
+
+    # ---- Active Open Trades Section (with individual 1-click Close button)
+    st.markdown("##### 🟢 Active Open Trades (Live P&L & Partial-Split Status)")
+    if _open_at:
+        for _t in _open_at[::-1]:
+            _upnl = float(_t.get("unrealized_pnl") or 0.0)
+            _ppnl = float(_t.get("partial_realized_pnl") or 0.0)
+            _comb_pnl = _upnl + _ppnl
+            _upct = float(_t.get("pnl_pct") or 0.0)
+            _pcol = "#00e676" if _comb_pnl >= 0 else "#ff1744"
+            _init_l = int(_t.get("initial_lots") or _t.get("lots") or 1)
+            _cur_l = int(_t.get("lots") or 1)
+            _t1_badge = (
+                f" | 🏦 <b>T1 Banked: {_t.get('t1_booked_lots')}L @ ₹{_t.get('t1_booked_price', 0):.2f} (₹{_ppnl:+,.2f})</b>"
+                if _t.get("t1_booked_lots")
+                else (" | 🛡️ <b>1-Lot T1 Hit: SL Trailed to Cost</b>" if _t.get("t1_hit") else "")
+            )
+            c_info, c_btn = st.columns([4, 1])
+            with c_info:
+                st.markdown(
+                    f"<div style='border:1px solid {_pcol};background:#111;padding:10px 14px;border-radius:5px;'>"
+                    f"<b>{esc(_t.get('index'))} — {esc(_t.get('symbol'))}</b> &nbsp;[{esc(_t.get('mode'))}] "
+                    f"| Open Lots: <b>{_cur_l}/{_init_l}</b> ({_t.get('qty')} qty) | Entry: <b>₹{_t.get('entry_price', 0):.2f}</b> "
+                    f"→ Live: <b>₹{_t.get('last_price', 0):.2f}</b> (Peak ₹{_t.get('peak_price', 0):.2f}){_t1_badge}<br>"
+                    f"<span style='color:{_pcol};font-size:1.1rem;font-weight:700;'>Open P&L: ₹{_upnl:+,.2f} | Total Trade P&L: ₹{_comb_pnl:+,.2f} ({_upct:+.1f}%)</span> "
+                    f"&nbsp;|&nbsp; Auto SL: <b>₹{_t.get('sl_price', 0):.2f}</b> {'[COST TRAIL]' if _t.get('t1_hit') else ''} "
+                    f"| T1: <b>₹{_t.get('t1_price', 0):.2f}</b> | T2: <b>₹{_t.get('t2_price', 0):.2f}</b></div>",
+                    unsafe_allow_html=True,
+                )
+            with c_btn:
+                if st.button(f"❌ Close {int(_t['strike'])} {_t['side']}", key=f"cls_one_{_t['trade_id']}", use_container_width=True):
+                    _all_t = load_auto_trades()
+                    for _x in _all_t:
+                        if _x.get("trade_id") == _t["trade_id"] and _x.get("status") == "OPEN":
+                            close_auto_trade_record(
+                                _x, float(_x.get("last_price") or _x.get("entry_price") or 0.05),
+                                "MANUAL BUTTON CLOSE", _acfg, dhan_token, client_id, alert_cfg, now_ist
+                            )
+                    save_auto_trades(_all_t)
+                    st.success(f"Closed {_t.get('symbol')}.")
+                    st.rerun()
+    else:
+        st.info("No active open trades right now. When a VALIDATED signal fires on an enabled index while Automation is ON, it will appear here automatically.")
+
+    # ---- Closed Auto-Trades Log & CSV Export
+    st.markdown("##### 📜 Auto-Trade Execution Log & Closed P&L")
+    if _atrades:
+        _at_df = pd.DataFrame([
+            {
+                "Date": t.get("date"), "Entry Time": t.get("entry_time"), "Exit Time": t.get("exit_time") or "OPEN",
+                "Mode": t.get("mode"), "Index": t.get("index"), "Contract": t.get("symbol"),
+                "Initial Lots": t.get("initial_lots", t.get("lots")), "Open Lots": t.get("lots") if t.get("status") == "OPEN" else 0,
+                "T1 Booked Lots": t.get("t1_booked_lots", 0), "T1 Booked ₹": t.get("t1_booked_price"),
+                "Entry ₹": t.get("entry_price"), "Last/Exit ₹": t.get("exit_price") or t.get("last_price"),
+                "Peak ₹": t.get("peak_price"), "SL ₹": t.get("sl_price"), "T1 ₹": t.get("t1_price"), "T2 ₹": t.get("t2_price"),
+                "Status": t.get("status"), "Exit Reason": t.get("exit_reason"),
+                "P&L %": t.get("pnl_pct"),
+                "Net P&L ₹": t.get("realized_pnl") if t.get("status") == "CLOSED" else (float(t.get("unrealized_pnl") or 0.0) + float(t.get("partial_realized_pnl") or 0.0)),
+                "Order ID": t.get("entry_order_id"),
+            }
+            for t in _atrades[::-1]
+        ])
+        show_df(_at_df, hide_index=True)
+        b_dl, b_clr = st.columns([1, 1])
+        b_dl.download_button(
+            "📄 Download Auto-Trades CSV",
+            _at_df.to_csv(index=False),
+            file_name="auto_trades_log.csv",
+            mime="text/csv",
+        )
+        if b_clr.button("🗑️ Clear Closed History (Keep Open Trades)", key="btn_clr_at"):
+            save_auto_trades([t for t in _atrades if t.get("status") == "OPEN"])
+            st.rerun()
+    else:
+        st.caption("No auto-trades recorded yet.")
