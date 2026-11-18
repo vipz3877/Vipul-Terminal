@@ -1,5 +1,5 @@
 """
-VIPUL OPTIONS BUYER SIGNAL TERMINAL v17.2 (REVERSAL PROFIT-PROTECTION EXIT + T2 CHANDELIER TRAIL + DYNAMIC LOT SPLIT) (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
+VIPUL OPTIONS BUYER SIGNAL TERMINAL v17.3 (DTE-SCALED T1/T2 + STEP-1 PROFIT LOCK + ANTI-VWAP-CHASE GUARD + BASIS IGNITION FILTER) (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
 v15.1 adds an INSTITUTIONAL FOOTPRINT layer (needs footprint.py next to this file):
  - Index-futures price / volume / open-interest flow + session VWAP decide whether money is really moving your way
  - Footprint filter: VETO AGAINST (default) / REQUIRE ALIGNED / OFF; blocked signals are still logged with footprint fields
@@ -64,7 +64,7 @@ try:
 except ImportError:
     Groq = None
 
-st.set_page_config(page_title="Vipul Options Buyer Terminal v17.2", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Vipul Options Buyer Terminal v17.3", layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
 # CSS
@@ -1395,15 +1395,20 @@ def select_buyer_contract(m, direction, allowed=None, target_spot=None, sl_spot=
     best = min(rows, key=lambda x: x["score"])
     premium = best["ask"]
     best["entry_ref"] = round(premium, 2)
-    # On 0DTE expiry day, Gamma convexity allows faster T1/T2 expansion with tighter stop-loss against theta bleed
+    # DTE-scaled option stop & target percentages (prevents 5-DTE ₹200 options from needing a 35% / +₹70 move just to hit T1)
+    dte_now = int(m.get("dte", 99))
     if is_0dte:
-        t1_pct = 30.0 if is_call else 40.0
-        t2_pct = 65.0 if is_call else 80.0
+        t1_pct = 30.0 if is_call else 35.0
+        t2_pct = 65.0 if is_call else 75.0
+        stop_pct = 18.0 if is_call else 20.0
+    elif dte_now == 1:
+        t1_pct = 22.0 if is_call else 25.0
+        t2_pct = 42.0 if is_call else 48.0
         stop_pct = 18.0 if is_call else 20.0
     else:
-        t1_pct = 25.0 if is_call else BUYER_TARGET1_PCT
-        t2_pct = 45.0 if is_call else BUYER_TARGET2_PCT
-        stop_pct = 20.0 if is_call else BUYER_STOP_PCT
+        t1_pct = 18.0
+        t2_pct = 32.0
+        stop_pct = 18.0
     best["stop_premium"] = round(max(0.05, premium * (1 - stop_pct / 100.0)), 2)
     best["target1_premium"] = round(premium * (1 + t1_pct / 100.0), 2)
     best["target2_premium"] = round(premium * (1 + t2_pct / 100.0), 2)
@@ -1887,6 +1892,12 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
         who = "buyer" if sig == "BUY" else "seller"
         if not is_rev and mine["score"] >= 35:
             notes.append(f"{sig} rejected: anti-chase guard ({who} exhaustion is already {mine['score']}/100; do not chase an extended move without a reversal setup).")
+            sig = "WAIT"
+    fp_now = m.get("fp") or {}
+    if sig != "WAIT" and not is_rev and fp_now.get("ok") and fp_now.get("vwap_dist") is not None:
+        v_dist = float(fp_now["vwap_dist"])
+        if (sig == "BUY" and v_dist > 0.24) or (sig == "SELL" and v_dist < -0.24):
+            notes.append(f"{sig} rejected: anti-VWAP-chase guard (futures price is already stretched {v_dist:+.2f}σ beyond session VWAP; wait for a pullback near VWAP).")
             sig = "WAIT"
         elif mine["flag"] == "CONFIRMED" and P("exh_veto"):
             notes.append(f"{sig} rejected: {who} exhaustion confirmed ({mine['score']}/100), the move you would join is running out of fuel.")
@@ -2437,8 +2448,9 @@ def pre_chart_ignition(m, hist, lookback_min=15):
     # 1) Rolling OI flow must agree (>= 1.5x)
     # 2) Futures must not be building in the opposite direction (SHORT BUILD-UP blocks Bull Ignition; LONG BUILD-UP blocks Bear Ignition)
     # 3) Spot must not have already exhausted >0.22σ (~55 pts) in the same direction over the last 15m (unless it's a reversal)
-    bull_ok = (fl_ratio >= 1.5) and (q30 != "SHORT BUILD-UP") and (spot_move_sig <= 0.22)
-    bear_ok = (inv_ratio >= 1.5) and (q30 != "LONG BUILD-UP") and (spot_move_sig >= -0.22)
+    ex_b_now = float(b_now if b_now is not None else 0.0)
+    bull_ok = (fl_ratio >= 1.5) and (q30 != "SHORT BUILD-UP") and (spot_move_sig <= 0.22) and (ex_b_now >= -8.0)
+    bear_ok = (inv_ratio >= 1.5) and (q30 != "LONG BUILD-UP") and (spot_move_sig >= -0.22) and (ex_b_now <= 8.0)
 
     if bull_pts >= 2 and bull_pts > bear_pts and bull_ok:
         out.update({"dir": 1, "score": bull_pts, "reasons": bull_reasons, "label": f"⚡ BULLISH PRE-CHART IGNITION ({bull_pts}/5)"})
@@ -3458,6 +3470,13 @@ def update_auto_trades_live(idx_name, current_expiry, option_df, auto_cfg, token
                             close_auto_trade_record(t, mark, rev_why, auto_cfg, token, client_id, alert_cfg, now_ist)
                             continue
 
+                    # 0b. STEP-1 EARLY BREAKEVEN LOCK (+10% gain locks SL at Entry + 2% so a +10% winner never turns into a red loss)
+                    if mark >= round(ent * 1.10, 2) and not t.get("step1_locked") and not t.get("t1_hit"):
+                        t["step1_locked"] = True
+                        be_plus = round(ent * 1.02, 2)
+                        if be_plus > float(t.get("sl_price") or 0.0):
+                            t["sl_price"] = be_plus
+
                     # 1. Check T1 hit first (so multi-lot trades book 50% at T1 and trail SL to cost):
                     if mark >= float(t.get("t1_price") or 999999.0) and not t.get("t1_hit"):
                         if auto_cfg.get("t1_rule") == "BOOK_100_T1":
@@ -3467,6 +3486,12 @@ def update_auto_trades_live(idx_name, current_expiry, option_df, auto_cfg, token
                         else:
                             partial_book_at_t1(t, mark, auto_cfg, token, client_id, alert_cfg, now_ist)
 
+                    # 1b. Post-T1 Ratcheting Runner Trail (never let a +30% post-T1 runner round-trip all the way back to flat entry)
+                    if t.get("t1_hit") and not t.get("t2_hit"):
+                        post_t1_sl = round(max(ent * 1.02, float(t["peak_price"]) * 0.88), 2)
+                        if post_t1_sl > float(t.get("sl_price") or 0.0):
+                            t["sl_price"] = post_t1_sl
+
                     # 2. Check T2 hit & Chandelier High-Water-Mark Runner Trail:
                     t2_px = float(t.get("t2_price") or 999999.0)
                     if mark >= t2_px:
@@ -3474,7 +3499,7 @@ def update_auto_trades_live(idx_name, current_expiry, option_df, auto_cfg, token
                             close_auto_trade_record(t, mark, "TARGET_2 HIT", auto_cfg, token, client_id, alert_cfg, now_ist)
                             continue
                         else:
-                            trail_pct = float(auto_cfg.get("t2_trail_pct") or 15.0) / 100.0
+                            trail_pct = float(auto_cfg.get("t2_trail_pct") or 12.0) / 100.0
                             chandelier_sl = round(max(t2_px * 0.96, float(t["peak_price"]) * (1.0 - trail_pct)), 2)
                             if chandelier_sl > float(t.get("sl_price") or 0.0):
                                 t["sl_price"] = chandelier_sl
@@ -3489,14 +3514,18 @@ def update_auto_trades_live(idx_name, current_expiry, option_df, auto_cfg, token
                                         60, alert_cfg,
                                     )
                     elif t.get("t2_hit"):
-                        trail_pct = float(auto_cfg.get("t2_trail_pct") or 15.0) / 100.0
+                        trail_pct = float(auto_cfg.get("t2_trail_pct") or 12.0) / 100.0
                         chandelier_sl = round(max(t2_px * 0.96, float(t["peak_price"]) * (1.0 - trail_pct)), 2)
                         if chandelier_sl > float(t.get("sl_price") or 0.0):
                             t["sl_price"] = chandelier_sl
 
-                    # 3. Check Stop-Loss (Initial SL, T1 Cost-Trail SL, or T2 Chandelier Trail SL)
+                    # 3. Check Stop-Loss (Initial SL, Step-1 Breakeven Lock, T1 Runner Trail, or T2 Chandelier Trail SL)
                     if mark <= float(t.get("sl_price") or 0.0):
-                        rsn = "T2 CHANDELIER TRAIL STOP" if t.get("t2_hit") else ("T1 COST-TRAIL STOP" if t.get("t1_hit") else "STOP_LOSS HIT")
+                        rsn = (
+                            "T2 CHANDELIER TRAIL STOP" if t.get("t2_hit")
+                            else ("T1 RUNNER PROFIT TRAIL" if t.get("t1_hit")
+                                  else ("STEP-1 BREAKEVEN LOCK (+2%)" if t.get("step1_locked") else "STOP_LOSS HIT"))
+                        )
                         close_auto_trade_record(t, mark, rsn, auto_cfg, token, client_id, alert_cfg, now_ist)
                         continue
 
@@ -4258,7 +4287,7 @@ def esc(x):
 # SIDEBAR
 # ============================================================
 with st.sidebar:
-    st.markdown("### BBG // BUYER TERMINAL v17.2 REVERSAL-GUARD EDITION")
+    st.markdown("### BBG // BUYER TERMINAL v17.3 PROFIT-LOCK EDITION")
     dhan_token = clean(get_secret("DHAN_ACCESS_TOKEN", DEFAULT_DHAN_TOKEN))
     client_id = clean(get_secret("DHAN_CLIENT_ID", DEFAULT_CLIENT_ID))
     groq_key = get_secret("GROQ_API_KEY", DEFAULT_GROQ_KEY).strip()
