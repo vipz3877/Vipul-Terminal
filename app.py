@@ -1,5 +1,5 @@
 """
-VIPUL OPTIONS BUYER SIGNAL TERMINAL v17.7 (ALL-IN-ONE SINGLE FILE: BUILT-IN FAST WEBSOCKET EXIT MONITOR + PRECISION ENGINE) (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
+VIPUL OPTIONS BUYER SIGNAL TERMINAL v17.8 (ALL-IN-ONE SINGLE FILE: BUILT-IN FAST WEBSOCKET EXIT MONITOR + PRECISION ENGINE) (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
 v15.1 adds an INSTITUTIONAL FOOTPRINT layer (needs footprint.py next to this file):
  - Index-futures price / volume / open-interest flow + session VWAP decide whether money is really moving your way
  - Footprint filter: VETO AGAINST (default) / REQUIRE ALIGNED / OFF; blocked signals are still logged with footprint fields
@@ -72,7 +72,7 @@ try:
 except ImportError:
     _ws_lib = None
 
-st.set_page_config(page_title="Vipul Options Buyer Terminal v17.7", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Vipul Options Buyer Terminal v17.8", layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
 # CSS
@@ -142,7 +142,7 @@ EXPIRY_URL = f"{BASE_URL}/optionchain/expirylist"
 PROFILE_URL = f"{BASE_URL}/profile"
 
 YEAR_DAYS = 365
-APP_VERSION = "17.7"
+APP_VERSION = "17.8"
 PATH_HORIZONS = (5, 15, 30, 60)
 DATA_GAP_AFTER_DAYS = 3
 
@@ -4196,51 +4196,48 @@ def fire_alert(key, text, cooldown_min, cfg):
 def signal_alert_text(r):
     tgt = f"{r['target']:,.0f}" if r.get("target") else "-"
     sl = f"{r['sl']:,.0f}" if r.get("sl") else "-"
-    rr = f"1:{r['rr']:.2f}" if r.get("rr") else "-"
-    kind_label = "✅ VALIDATED OPTION-BUY SIGNAL" if r["kind"] == "VALIDATED" else "❌ REJECTED SIGNAL (NOT ACTIONABLE)"
-    if r.get("reversal_label") and r.get("reversal_label") != "NONE":
-        kind_label += f" [{r['reversal_label']}]"
-    elif r.get("ignition_label") and r.get("ignition_label") != "NONE":
-        kind_label += f" [{r['ignition_label']}]"
+    is_buy = (r.get("option_type") == "CALL") if r.get("option_type") else (r.get("signal") == "BUY")
+    action = "BUY CALL" if is_buy else "BUY PUT"
+    em = "🟢" if is_buy else "🔴"
+
+    if r.get("kind") != "VALIDATED" or r.get("option_strike") is None:
+        rsn = (r.get("reason") or "Filtered out")[:90]
+        return f"❌ REJECTED — {r['index']} {action}\nSpot: {r['entry']:,.0f} | {rsn}\n{r['time']} IST"
+
+    tags = []
     if r.get("playbook"):
-        kind_label += f" [EXPIRY PLAYBOOK {r['playbook']} | time stop {r.get('time_stop_min')} min | HALF SIZE]"
-    reason_txt = f"\nReason: {r['reason']}" if r.get("reason") else ""
-    if r.get("kind") == "VALIDATED" and r.get("option_strike") is not None:
-        action = "BUY CALL" if r.get("option_type") == "CALL" else "BUY PUT"
-        option = (f"\nContract: {r.get('index')} {r.get('option_strike'):g} {r.get('option_type')} | Expiry {r.get('option_expiry')}"
-                  f"\nQuote bid/ask: ₹{r.get('option_bid', 0):.2f} / ₹{r.get('option_ask', 0):.2f}"
-                  f" | spread {r.get('option_spread_pct', 0):.1f}% | Δ {r.get('option_delta', 0):+.2f} | IV {r.get('option_iv', 0):.1f}%"
-                  f"\nManual entry reference: ≤ ₹{r.get('option_entry_ref', 0):.2f} (ask snapshot, not a fill)"
-                  f"\nOption premium plan: SL ₹{r.get('option_stop', 0):.2f} | T1 ₹{r.get('option_target1', 0):.2f} | T2 ₹{r.get('option_target2', 0):.2f}"
-                  f"\nMax planned loss/unit ≈ ₹{(r.get('option_entry_ref') or 0) - (r.get('option_stop') or 0):.2f}")
-    else:
-        action, option = ("BUY CALL" if r.get("signal") == "BUY" else "BUY PUT"), "\nNo approved option contract; do not trade."
-    pre_txt = ""
+        tags.append(f"0DTE PB-{r['playbook']} HALF SIZE")
     if r.get("reversal_label") and r.get("reversal_label") != "NONE":
-        pre_txt = f"Pre-Chart Reversal: {r['reversal_label']} ({r.get('reversal_reasons', '')})\n"
-    elif r.get("ignition_label") and r.get("ignition_label") != "NONE":
-        pre_txt = f"Pre-Chart Ignition: {r['ignition_label']} ({r.get('ignition_reasons', '')})\n"
-    return (f"{kind_label}\n{r['index']} | {action} | Underlying {r['entry']:,.2f}\n"
-            f"{pre_txt}"
-            f"Underlying confirmation levels: target {tgt} | invalidation/stop {sl} | R:R {rr}\n"
-            f"Regime: {r.get('market_regime', 'not classified')} (advisory) | Futures footprint: {r.get('fp_bias') or 'n/a'}\n"
-            f"AI confidence {r['confidence']}% | Chain agreement {r['net']:+d}{option}{reason_txt}\n"
-            f"{r['time']} IST. Manual execution only. Recheck quote freshness/liquidity; levels are planning estimates, not guaranteed fills.")
+        tags.append("REVERSAL")
+    tag_str = f" [{' | '.join(tags)}]" if tags else ""
+
+    opt_code = "CE" if r.get("option_type") == "CALL" else "PE"
+    return (
+        f"{em} {action} — {r['index']}{tag_str}\n"
+        f"Strike: {r.get('option_strike'):g} {opt_code} (Exp {r.get('option_expiry')})\n"
+        f"Entry: ₹{r.get('option_entry_ref', 0):.2f} | SL: ₹{r.get('option_stop', 0):.2f}\n"
+        f"T1: ₹{r.get('option_target1', 0):.2f} | T2: ₹{r.get('option_target2', 0):.2f}\n"
+        f"Spot: {r['entry']:,.0f} | Tgt: {tgt} | SL: {sl}\n"
+        f"Time: {r['time']} IST"
+    )
 
 
 def outcome_alert_text(r):
     if str(r.get("event_type", "")).startswith("OPTION_"):
-        action = "BUY CALL" if r.get("option_type") == "CALL" else "BUY PUT"
-        return (f"{'🛑' if r.get('event_type') == 'OPTION_STOP_LOSS' else '🎯'} OPTION PREMIUM EVENT: {r.get('event_type')}\n"
-                f"{r.get('index')} | {action} | {r.get('option_strike')} {r.get('option_type')} | expiry {r.get('option_expiry')}\n"
-                f"Latest observed exit-side bid/LTP ₹{r.get('premium_mark', r.get('option_last_mark', 0)):.2f} | SL ₹{r.get('option_stop', 0):.2f} | T1 ₹{r.get('option_target1', 0):.2f} | T2 ₹{r.get('option_target2', 0):.2f}\n"
-                f"Snapshot time {r.get('time', '')} IST. Bid is used where available (LTP fallback); polling can miss fast moves, so verify live bid/ask and manage manually.")
+        em = "🛑" if r.get("event_type") == "OPTION_STOP_LOSS" else "🎯"
+        opt_code = "CE" if r.get("option_type") == "CALL" else "PE"
+        return (
+            f"{em} {r.get('event_type')} — {r.get('index')}\n"
+            f"{r.get('option_strike'):g} {opt_code} @ ₹{r.get('premium_mark', r.get('option_last_mark', 0)):.2f} "
+            f"(SL ₹{r.get('option_stop', 0):.2f} | T1 ₹{r.get('option_target1', 0):.2f})\n"
+            f"Time: {r.get('time', '')} IST"
+        )
     action = "BUY CALL" if r.get("signal") == "BUY" else "BUY PUT"
-    return (f"🏁 UNDERLYING LEVEL EVENT: {r['outcome']}\n"
-            f"{r['index']} | {action} candidate {r.get('option_strike', 'N/A')} {r.get('option_type', '')}\n"
-            f"Underlying signal level {r['entry']:,.0f} | target/stop {r.get('target')} / {r.get('sl')}\n"
-            f"Underlying MFE: +{r['mfe']} pts | MAE: -{r['mae']} pts\n"
-            f"Event time: {r.get('resolved_time', r['time'])} IST. This is NOT confirmation that option premium target/SL was hit; check live option quote manually.")
+    return (
+        f"🏁 {r['outcome']} — {r['index']} ({action})\n"
+        f"Spot: {r['entry']:,.0f} | MFE: +{r['mfe']:.0f} | MAE: -{r['mae']:.0f}\n"
+        f"Time: {r.get('resolved_time', r['time'])} IST"
+    )
 
 
 def post_webhook(url, payload):
@@ -4896,7 +4893,7 @@ def esc(x):
 # SIDEBAR
 # ============================================================
 with st.sidebar:
-    st.markdown("### BBG // BUYER TERMINAL v17.7 ALL-IN-ONE")
+    st.markdown("### BBG // BUYER TERMINAL v17.8 ALL-IN-ONE")
     dhan_token = clean(get_secret("DHAN_ACCESS_TOKEN", DEFAULT_DHAN_TOKEN))
     client_id = clean(get_secret("DHAN_CLIENT_ID", DEFAULT_CLIENT_ID))
     groq_key = get_secret("GROQ_API_KEY", DEFAULT_GROQ_KEY).strip()
