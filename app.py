@@ -1,5 +1,5 @@
 """
-VIPUL OPTIONS BUYER SIGNAL TERMINAL v17.3 (DTE-SCALED T1/T2 + STEP-1 PROFIT LOCK + ANTI-VWAP-CHASE GUARD + BASIS IGNITION FILTER) (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
+VIPUL OPTIONS BUYER SIGNAL TERMINAL v17.6 (PRECISION LOGIC + PRUNED LAGGING CHECKS + LIVE FILL SYNC + REAL OPTION-BID SCORECARD) (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
 v15.1 adds an INSTITUTIONAL FOOTPRINT layer (needs footprint.py next to this file):
  - Index-futures price / volume / open-interest flow + session VWAP decide whether money is really moving your way
  - Footprint filter: VETO AGAINST (default) / REQUIRE ALIGNED / OFF; blocked signals are still logged with footprint fields
@@ -64,7 +64,7 @@ try:
 except ImportError:
     Groq = None
 
-st.set_page_config(page_title="Vipul Options Buyer Terminal v17.3", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Vipul Options Buyer Terminal v17.6", layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
 # CSS
@@ -134,6 +134,9 @@ EXPIRY_URL = f"{BASE_URL}/optionchain/expirylist"
 PROFILE_URL = f"{BASE_URL}/profile"
 
 YEAR_DAYS = 365
+APP_VERSION = "17.6"
+PATH_HORIZONS = (5, 15, 30, 60)
+DATA_GAP_AFTER_DAYS = 3
 
 
 class _SessionFlag:
@@ -1295,8 +1298,10 @@ def chain_checks(m):
         add("Premium-confirmed writing", 0, "no previous-close premiums available", "flow")
 
     li = j["ladder_imbalance"]
-    add("Ladder OI imbalance", 1 if li >= 0.10 else -1 if li <= -0.10 else 0, f"{li:+.3f} (PE-heavy is +)", "positioning")
-    add("PCR (whole chain)", 1 if m["pcr"] > 1.2 else -1 if m["pcr"] < 0.8 else 0, f"{m['pcr']:.2f}", "positioning")
+    checks.append({"name": "Ladder OI imbalance", "v": 1 if li >= 0.10 else -1 if li <= -0.10 else 0, "counted": False,
+                   "detail": f"{li:+.3f} (PE-heavy is +) [observe only: lagging multi-day OI]", "family": "positioning"})
+    checks.append({"name": "PCR (whole chain)", "v": 1 if m["pcr"] > 1.2 else -1 if m["pcr"] < 0.8 else 0, "counted": False,
+                   "detail": f"{m['pcr']:.2f} [observe only: lagging multi-day OI]", "family": "positioning"})
     add("Bias score", 1 if m["score"] >= 55 else -1 if m["score"] <= 45 else 0, f"{m['score']}/100 {m['bias']}", "positioning")
 
     if m["dte"] > 2:
@@ -1419,6 +1424,9 @@ def select_buyer_contract(m, direction, allowed=None, target_spot=None, sl_spot=
         mod_sl = reprice(premium, m["spot"], sl_spot, best["strike"], T0, T1, iv0, iv0 * 0.95, is_call)
         best["model_target_premium"] = round(mod_t, 2) if mod_t else None
         best["model_stop_premium"] = round(mod_sl, 2) if mod_sl else None
+        # v17.6: Sync T1 with Black-Scholes wall target when the wall is realistic (>= +10% gain) and closer than fixed % T1
+        if mod_t and premium * 1.10 <= mod_t < best["target1_premium"]:
+            best["target1_premium"] = round(mod_t, 2)
     best["max_loss_per_unit"] = round(premium - best["stop_premium"], 2)
     best["risk_note"] = (
         f"{'0DTE GAMMA PLAN' if is_0dte else 'Asymmetric plan'} "
@@ -1426,6 +1434,40 @@ def select_buyer_contract(m, direction, allowed=None, target_spot=None, sl_spot=
         f"Γ/Θ ratio {best['gamma_theta_ratio']:.1f}x, 15m Θ ≈ -₹{best['theta_15m']:.1f})."
     )
     return best
+
+
+def pick_tracking_contract(m, direction):
+    """v17.6 (from v16.1): nearest-ATM contract on the signal's side, used to paper-track real option bids
+    at +5/15/30/60m for ALL logged signals (validated and rejected)."""
+    df = m.get("df")
+    if df is None or df.empty or direction not in ("BUY", "SELL"):
+        return None
+    side = "CE" if direction == "BUY" else "PE"
+    spot, step = float(m["spot"]), float(m["step"])
+    atm = round(spot / step) * step
+    row = df[(df["Strike"] - atm).abs() < 1e-6]
+    if row.empty:
+        row = df.iloc[[int((df["Strike"] - spot).abs().values.argmin())]]
+    r = row.iloc[0]
+    bid, ask, ltp = _n(r.get(f"{side}_Bid")), _n(r.get(f"{side}_Ask")), _n(r.get(f"{side}_LTP"))
+    if ask <= 0:
+        ask = ltp
+    if bid <= 0:
+        bid = ltp
+    if ltp < MIN_PREMIUM or ask <= 0 or bid <= 0:
+        return None
+    return {"strike": float(r["Strike"]), "side": side, "ask0": round(ask, 2), "bid0": round(bid, 2)}
+
+
+def parkinson_intraday_vol(intraday):
+    """Annualised intraday realized volatility (%) from today's 1-min high/low bars using Parkinson's range estimator."""
+    bars = [b for b in (intraday or []) if b.get("h", 0) > 0 and b.get("l", 0) > 0 and b["h"] >= b["l"]]
+    if len(bars) < 10:
+        return None
+    sq_logs = [math.log(float(b["h"]) / float(b["l"])) ** 2 for b in bars]
+    var_bar = sum(sq_logs) / (4.0 * len(sq_logs) * math.log(2.0))
+    # 375 one-minute bars per NSE session * 252 trading days
+    return round(math.sqrt(max(0.0, var_bar) * 375.0 * 252.0) * 100.0, 1)
 
 
 # ============================================================
@@ -1444,8 +1486,8 @@ def session_phase(now, expiry_active=False):
         return "PRE-OPEN", True, "Market not open yet."
     if expiry_active and EXPIRY_CUTOFF_MIN <= t < 15 * 60 + 30:
         return "EXPIRY CUTOFF (after 2:30 pm)", True, "No new expiry-day entries after 2:30 pm: theta and gamma make late buying very hard."
-    if t < 9 * 60 + 25:
-        return "OPENING 10 MIN", True, "Spreads are wide and OI data is stale in the first 10 minutes."
+    if t < 9 * 60 + 35:
+        return "OPENING 20 MIN", True, "Opening volatility & stale OI in the first 20 minutes; wait for 09:35 IST."
     if t < 11 * 60 + 30:
         return "MORNING TREND WINDOW", False, ""
     if t < 13 * 60 + 30:
@@ -1480,9 +1522,15 @@ def daily_lock_status(now, trade_cap=None):
     reasons = []
     if d["max_loss"] and d["pnl"] <= -abs(float(d["max_loss"])):
         reasons.append(f"daily loss limit reached (P&L {d['pnl']:+,.0f} vs limit -{abs(float(d['max_loss'])):,.0f})")
-    cap_t = min(d["max_trades"], trade_cap) if (trade_cap and d["max_trades"]) else (trade_cap or d["max_trades"])
-    if cap_t and d["trades"] >= cap_t:
-        reasons.append(f"max trades per day reached ({d['trades']}/{cap_t})")
+    churn_on = False
+    try:
+        churn_on = bool(load_auto_cfg().get("churn_mode"))
+    except Exception:
+        pass
+    if not churn_on:
+        cap_t = min(d["max_trades"], trade_cap) if (trade_cap and d["max_trades"]) else (trade_cap or d["max_trades"])
+        if cap_t and d["trades"] >= cap_t:
+            reasons.append(f"max trades per day reached ({d['trades']}/{cap_t})")
     return bool(reasons), "; ".join(reasons), d
 
 
@@ -1887,17 +1935,19 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
     exh = m.get("exh") or {}
     rev_now = m.get("reversal") or {}
     is_rev = (sig == "BUY" and rev_now.get("dir") == 1) or (sig == "SELL" and rev_now.get("dir") == -1)
+    _reg_lbl = str((m.get("market_regime") or {}).get("label", "")).upper()
+    _fp_now = m.get("fp") or {}
+    _is_blast = ("BULLISH GAMMA" in str(m.get("status", "")) and sig == "BUY") or ("BEARISH GAMMA" in str(m.get("status", "")) and sig == "SELL")
+    _is_trend = (sig == "BUY" and _reg_lbl == "TRENDING UP") or (sig == "SELL" and _reg_lbl == "TRENDING DOWN")
+    _fp_aligned = (sig == "BUY" and _fp_now.get("bias") == "BULLISH") or (sig == "SELL" and _fp_now.get("bias") == "BEARISH")
+    _strong_trend = _is_trend or (_is_blast and _fp_aligned)
+
     if sig != "WAIT" and exh.get("ready"):
         mine = exh["buyer"] if sig == "BUY" else exh["seller"]
         who = "buyer" if sig == "BUY" else "seller"
-        if not is_rev and mine["score"] >= 35:
-            notes.append(f"{sig} rejected: anti-chase guard ({who} exhaustion is already {mine['score']}/100; do not chase an extended move without a reversal setup).")
-            sig = "WAIT"
-    fp_now = m.get("fp") or {}
-    if sig != "WAIT" and not is_rev and fp_now.get("ok") and fp_now.get("vwap_dist") is not None:
-        v_dist = float(fp_now["vwap_dist"])
-        if (sig == "BUY" and v_dist > 0.24) or (sig == "SELL" and v_dist < -0.24):
-            notes.append(f"{sig} rejected: anti-VWAP-chase guard (futures price is already stretched {v_dist:+.2f}σ beyond session VWAP; wait for a pullback near VWAP).")
+        _exh_cap = 55 if _strong_trend else 35
+        if not is_rev and mine["score"] >= _exh_cap:
+            notes.append(f"{sig} rejected: anti-chase guard ({who} exhaustion is already {mine['score']}/100 >= {_exh_cap}; do not chase an extended move without a reversal setup).")
             sig = "WAIT"
         elif mine["flag"] == "CONFIRMED" and P("exh_veto"):
             notes.append(f"{sig} rejected: {who} exhaustion confirmed ({mine['score']}/100), the move you would join is running out of fuel.")
@@ -1905,6 +1955,41 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
         elif mine["flag"] in ("CONFIRMED", "WATCH"):
             notes.append(f"Caution: {who} exhaustion {mine['flag'].lower()} ({mine['score']}/100)"
                          + ("" if P("exh_veto") else " [advisory only: exhaustion veto is off]") + ".")
+
+    if sig != "WAIT" and not is_rev and _fp_now.get("ok") and _fp_now.get("vwap_dist") is not None:
+        v_dist = float(_fp_now["vwap_dist"])
+        _vwap_lim = 0.65 if _strong_trend else 0.28
+        if (sig == "BUY" and v_dist > _vwap_lim) or (sig == "SELL" and v_dist < -_vwap_lim):
+            notes.append(f"{sig} rejected: anti-VWAP-chase guard (futures price is stretched {v_dist:+.2f}σ beyond session VWAP, limit ±{_vwap_lim:.2f}σ).")
+            sig = "WAIT"
+
+    # v17.6 Logic Guard 1: Opposite 30-min Futures Build-Up Veto (even when fp_bias is NEUTRAL)
+    if sig != "WAIT" and not is_rev and _fp_now.get("ok"):
+        _q30 = str(_fp_now.get("quad30", "")).upper()
+        if (sig == "BUY" and _q30 == "SHORT BUILD-UP") or (sig == "SELL" and _q30 == "LONG BUILD-UP"):
+            notes.append(f"{sig} rejected: opposite 30-min futures build-up ({_q30}).")
+            sig = "WAIT"
+
+    # v17.6 Logic Guard 2: Extreme Basis + Skew Tail-Risk Divergence Guard
+    if sig != "WAIT" and not is_rev and m.get("surface_ok"):
+        _exb = float(m.get("excess_basis") or 0.0)
+        _rr25 = float(m.get("rr_25") or 0.0)
+        if sig == "BUY" and _exb < -18.0 and _rr25 < -1.8:
+            notes.append(f"{sig} rejected: extreme futures discount ({_exb:+.1f} pts) + heavy put skew ({_rr25:+.2f}).")
+            sig = "WAIT"
+        elif sig == "SELL" and _exb > 18.0 and _rr25 > 1.8:
+            notes.append(f"{sig} rejected: extreme futures premium ({_exb:+.1f} pts) + heavy call skew ({_rr25:+.2f}).")
+            sig = "WAIT"
+
+    # v17.6 Logic Guard 3: Positive-GEX + Balanced Accumulation Mean-Reversion Chop Guard
+    if sig != "WAIT" and not is_rev and str(m.get("gex_regime", "")).upper() == "POSITIVE" and str(m.get("status", "")).upper() == "BALANCED ACCUMULATION":
+        _v_d = float(_fp_now.get("vwap_dist") or 0.0) if _fp_now.get("ok") else 0.0
+        if _fp_now.get("ok") and abs(_v_d) > 0.22:
+            notes.append(f"{sig} rejected: POSITIVE-GEX balanced chop requires tight VWAP proximity ({_v_d:+.2f}σ > ±0.22σ).")
+            sig = "WAIT"
+        elif _fp_now.get("ok") and not _fp_aligned:
+            notes.append(f"{sig} rejected: POSITIVE-GEX balanced chop requires strictly aligned futures footprint (currently {_fp_now.get('bias')}).")
+            sig = "WAIT"
 
     if sig != "WAIT" and FP is not None:
         blocked, why = FP.footprint_veto(sig, m.get("fp"), P("fp_mode"))
@@ -2024,6 +2109,7 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
                 notes.append(f"Target trimmed from {target:,.0f} to {new_t:,.0f} (more than {P('target_cap'):.1f} daily sigma away is not a realistic intraday target).")
                 target = new_t
             max_sl_dist = 0.38 * sd_now
+            min_sl_floor = 3.0 * (sd_now / math.sqrt(75.0))
             if abs(entry - sl) > max_sl_dist and max_sl_dist > 0:
                 pocket = float((m.get("jobber") or {}).get("pocket_support") or 0.0)
                 if sig == "BUY" and (entry - max_sl_dist) <= pocket < entry:
@@ -2034,6 +2120,9 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
                     new_sl = (entry - max_sl_dist) if sig == "BUY" else (entry + max_sl_dist)
                 notes.append(f"Stop tightened from stale OI wall {sl:,.0f} to {new_sl:,.0f} (0.38σ / pocket-flow stop).")
                 sl = new_sl
+            if abs(entry - sl) < min_sl_floor:
+                sl = (entry - min_sl_floor) if sig == "BUY" else (entry + min_sl_floor)
+                notes.append(f"Stop widened to {sl:,.0f} (3x 5-min σ noise floor).")
 
     if sig != "WAIT":
         risk = abs(entry - sl)
@@ -3005,6 +3094,17 @@ def wilson_lower(wins, n, z=1.28):
     return max(0.0, (centre - adj) / den)
 
 
+def wilson_interval(wins, n, z=1.96):
+    """Two-sided 95% Wilson confidence interval in percent."""
+    if n <= 0:
+        return (float("nan"), float("nan"))
+    p = wins / n
+    den = 1.0 + z * z / n
+    centre = p + z * z / (2.0 * n)
+    adj = z * math.sqrt((p * (1.0 - p) + z * z / (4.0 * n)) / n)
+    return ((centre - adj) / den * 100.0, (centre + adj) / den * 100.0)
+
+
 def kelly_sizing(sig, card, capital, max_risk_pct):
     """Risk budget for a validated signal. Uses quarter-Kelly on the Wilson LOWER bound of the win rate
     (TIMEOUT counts as a non-win) only when enough resolved signals exist; otherwise a flat conservative budget.
@@ -3046,9 +3146,9 @@ AUTO_CONFIG_FILE = os.path.join(DATA_DIR, "bbg_auto_config_v17.json")
 SCRIP_MASTER_CSV_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 
 DEFAULT_LOT_SIZES = {
-    "NIFTY 50": 75,
+    "NIFTY 50": 65,
     "NIFTY BANK": 30,
-    "FINNIFTY": 65,
+    "FINNIFTY": 60,
     "MIDCPNIFTY": 120,
     "SENSEX": 20,
 }
@@ -3064,6 +3164,11 @@ DEFAULT_AUTO_CFG = {
     "exit_on_reversal": True,         # Immediately close open position when an opposite Reversal / Validated Signal fires
     "t2_runner_rule": "CHANDELIER",   # CHANDELIER: once T2 is hit, lock SL at T2 & trail 15% below peak Bid until reversal/stop; BOOK_T2: exit 100% at T2
     "t2_trail_pct": 15.0,
+    "churn_mode": False,              # Continuous Scalp/Churn Mode: book fixed 10-20 option pts per trade & keep re-entering until 15:20 IST
+    "churn_target_pts": 15.0,
+    "churn_sl_pts": 15.0,
+    "churn_be_lock_pts": 8.0,
+    "churn_cooldown_min": 3,
 }
 
 
@@ -3181,7 +3286,30 @@ def place_dhan_option_order(sec_id, segment, txn_type, qty, limit_price, product
         return {"ok": False, "orderId": None, "error": str(e)[:160]}
 
 
-def auto_initiate_from_signals(new_recs, auto_cfg, token, client_id, alert_cfg, now_ist):
+def fetch_dhan_order_fill(order_id, token, client_id, wait_sec=1.5):
+    """Poll Dhan v2 GET /orders/{orderId} to retrieve real averageTradedPrice and filledQty."""
+    if not order_id or str(order_id).startswith(("PAPER", "ERR")):
+        return None
+    try:
+        if wait_sec > 0:
+            time.sleep(wait_sec)
+        r = requests.get(f"{BASE_URL}/orders/{order_id}", headers=auth_headers(token, client_id), timeout=8)
+        if not r.ok:
+            return None
+        d = r.json() if r.content else {}
+        if isinstance(d, list) and d:
+            d = d[0]
+        avg_px = float(d.get("averageTradedPrice") or 0.0)
+        filled_q = int(d.get("filledQty") or d.get("tradedQuantity") or 0)
+        status = str(d.get("orderStatus") or "")
+        if avg_px > 0:
+            return {"avg_price": round(avg_px, 2), "filled_qty": filled_q, "status": status}
+    except Exception:
+        pass
+    return None
+
+
+def auto_initiate_from_signals(new_recs, auto_cfg, token, client_id, alert_cfg, now_ist, live_sig=None, idx_name=None, expiry=None):
     """Automatically initiate an option trade when a new VALIDATED signal fires for an enabled index."""
     if not auto_cfg.get("enabled"):
         return []
@@ -3191,8 +3319,39 @@ def auto_initiate_from_signals(new_recs, auto_cfg, token, client_id, alert_cfg, 
     allowed_idx = set(auto_cfg.get("allowed_indices") or [])
     existing_sig_ids = {t.get("signal_id") for t in trades}
     initiated = []
+    churn_on = bool(auto_cfg.get("churn_mode"))
 
-    for r in new_recs:
+    # In Churn Mode, allow continuous re-entry on the live validated signal after cooldown (until 15:15 IST)
+    candidates = list(new_recs or [])
+    if (churn_on and live_sig and live_sig.get("signal") in ("BUY", "SELL") and live_sig.get("buyer_plan")
+            and idx_name in allowed_idx and len(open_trades) < max_open
+            and (now_ist.hour * 60 + now_ist.minute) < (15 * 60 + 15)):
+        cd_sec = max(1, int(auto_cfg.get("churn_cooldown_min") or 3)) * 60
+        last_idx_ts = max(
+            (float(t.get("exit_ts") or t.get("entry_ts") or 0.0) for t in trades if t.get("index") == idx_name),
+            default=0.0,
+        )
+        if (now_ist.timestamp() - last_idx_ts) >= cd_sec and not any(r.get("kind") == "VALIDATED" and r.get("index") == idx_name for r in candidates):
+            bp = live_sig["buyer_plan"]
+            candidates.append({
+                "id": f"CHURN_{int(now_ist.timestamp())}",
+                "kind": "VALIDATED",
+                "date": now_ist.date().isoformat(),
+                "index": idx_name,
+                "expiry": str(expiry)[:10],
+                "signal": live_sig["signal"],
+                "option_strike": bp["strike"],
+                "option_type": bp["option_type"],
+                "option_expiry": str(expiry)[:10],
+                "option_entry_ref": bp["entry_ref"],
+                "option_ask": bp["ask"],
+                "option_stop": bp["stop_premium"],
+                "option_target1": bp["target1_premium"],
+                "option_target2": bp["target2_premium"],
+                "time_stop_min": live_sig.get("time_stop_min") or 20,
+            })
+
+    for r in candidates:
         if r.get("kind") != "VALIDATED" or r.get("option_strike") is None:
             continue
         if r.get("id") in existing_sig_ids:
@@ -3242,28 +3401,51 @@ def auto_initiate_from_signals(new_recs, auto_cfg, token, client_id, alert_cfg, 
                 trades.append(t_rec)
                 save_auto_trades(trades)
                 continue
+            # v17.6: Sync real broker fill price via GET /v2/orders/{orderId} and re-anchor SL/T1/T2
+            _fill_info = fetch_dhan_order_fill(ord_id, token, client_id, wait_sec=1.5)
+            if _fill_info and _fill_info["avg_price"] > 0:
+                _old_ref = entry_ref
+                entry_ref = _fill_info["avg_price"]
+                ord_note = f"{_fill_info['status']} @ ₹{entry_ref:.2f}"
+                if _fill_info["filled_qty"] > 0:
+                    qty = _fill_info["filled_qty"]
+                if _old_ref > 0:
+                    _ratio = entry_ref / _old_ref
+                    for _k in ("option_stop", "option_target1", "option_target2"):
+                        if r.get(_k):
+                            r[_k] = round(float(r[_k]) * _ratio, 2)
         else:
             ord_id = f"PAPER_{int(time.time())}"
             ord_note = "PAPER_FILLED"
 
-        plan_txt = (
-            f"1-Lot Plan: Trail SL to Cost at T1 (₹{float(r.get('option_target1') or 0):.2f}) & Hold 100% for T2 (₹{float(r.get('option_target2') or 0):.2f})"
-            if lots == 1
-            else f"Multi-Lot Split Plan: Sell {lots // 2} of {lots} lots at T1 (₹{float(r.get('option_target1') or 0):.2f}) & Trail remaining {lots - (lots // 2)} lot(s) at Cost to T2 (₹{float(r.get('option_target2') or 0):.2f})"
-        )
+        if churn_on:
+            c_tgt = float(auto_cfg.get("churn_target_pts") or 15.0)
+            c_sl = float(auto_cfg.get("churn_sl_pts") or 15.0)
+            c_be = float(auto_cfg.get("churn_be_lock_pts") or 8.0)
+            sl_px = round(max(0.05, entry_ref - c_sl), 2)
+            t1_px = round(entry_ref + c_tgt, 2)
+            t2_px = round(entry_ref + c_tgt * 1.5, 2)
+            plan_txt = f"CHURN SCALP: Book 100% at +{c_tgt:.0f} pts (₹{t1_px:.2f}) | SL -{c_sl:.0f} pts (₹{sl_px:.2f}) | BE Lock at +{c_be:.0f} pts"
+        else:
+            sl_px = round(float(r.get("option_stop") or entry_ref * 0.8), 2)
+            t1_px = round(float(r.get("option_target1") or entry_ref * 1.25), 2)
+            t2_px = round(float(r.get("option_target2") or entry_ref * 1.50), 2)
+            plan_txt = (
+                f"1-Lot Plan: Trail SL to Cost at T1 (₹{t1_px:.2f}) & Hold 100% for T2 (₹{t2_px:.2f})"
+                if lots == 1
+                else f"Multi-Lot Split Plan: Sell {lots // 2} of {lots} lots at T1 (₹{t1_px:.2f}) & Trail remaining {lots - (lots // 2)} lot(s) at Cost to T2 (₹{t2_px:.2f})"
+            )
 
         t_rec = {
             "trade_id": f"AT_{r['id']}", "signal_id": r["id"], "date": r.get("date"),
             "entry_time": now_ist.strftime("%H:%M:%S"), "exit_time": None,
-            "entry_ts": now_ist.timestamp(), "index": idx_nm, "expiry": exp_str,
+            "entry_ts": now_ist.timestamp(), "exit_ts": None, "index": idx_nm, "expiry": exp_str,
             "strike": strike, "option_type": opt_type, "side": side,
             "symbol": c_info["symbol"], "security_id": c_info["security_id"], "segment": c_info["segment"],
             "initial_lots": lots, "lots": lots, "lot_size": lot_size, "initial_qty": qty, "qty": qty,
-            "mode": "LIVE" if is_live_api else "PAPER",
+            "mode": "LIVE" if is_live_api else "PAPER", "churn_mode": churn_on,
             "entry_price": round(entry_ref, 2), "last_price": round(entry_ref, 2), "peak_price": round(entry_ref, 2),
-            "sl_price": round(float(r.get("option_stop") or entry_ref * 0.8), 2),
-            "t1_price": round(float(r.get("option_target1") or entry_ref * 1.25), 2),
-            "t2_price": round(float(r.get("option_target2") or entry_ref * 1.50), 2),
+            "sl_price": sl_px, "t1_price": t1_px, "t2_price": t2_px,
             "t1_hit": False, "t1_booked_lots": 0, "t1_booked_qty": 0, "t1_booked_price": None,
             "partial_realized_pnl": 0.0, "time_stop_min": r.get("time_stop_min") or 30,
             "status": "OPEN", "exit_price": None, "exit_reason": "",
@@ -3380,6 +3562,7 @@ def close_auto_trade_record(t, exit_px, reason, auto_cfg, token, client_id, aler
     t["exit_price"] = exit_px
     t["last_price"] = exit_px
     t["exit_time"] = now_ist.strftime("%H:%M:%S")
+    t["exit_ts"] = now_ist.timestamp()
     t["exit_reason"] = reason + (f" (after T1 partial +{t.get('t1_booked_lots')}L @ ₹{t.get('t1_booked_price'):.2f})" if t.get("t1_booked_lots") else "")
     t["realized_pnl"] = total_pnl
     t["unrealized_pnl"] = 0.0
@@ -3470,21 +3653,34 @@ def update_auto_trades_live(idx_name, current_expiry, option_df, auto_cfg, token
                             close_auto_trade_record(t, mark, rev_why, auto_cfg, token, client_id, alert_cfg, now_ist)
                             continue
 
-                    # 0b. STEP-1 EARLY BREAKEVEN LOCK (+10% gain locks SL at Entry + 2% so a +10% winner never turns into a red loss)
-                    if mark >= round(ent * 1.10, 2) and not t.get("step1_locked") and not t.get("t1_hit"):
-                        t["step1_locked"] = True
-                        be_plus = round(ent * 1.02, 2)
-                        if be_plus > float(t.get("sl_price") or 0.0):
-                            t["sl_price"] = be_plus
-
-                    # 1. Check T1 hit first (so multi-lot trades book 50% at T1 and trail SL to cost):
-                    if mark >= float(t.get("t1_price") or 999999.0) and not t.get("t1_hit"):
-                        if auto_cfg.get("t1_rule") == "BOOK_100_T1":
+                    # 0b. CHURN-MODE EARLY BREAKEVEN LOCK (+8 pts -> Entry + 1.5 pts) & FIXED-POINT SCALP EXIT
+                    if t.get("churn_mode"):
+                        c_be = float(auto_cfg.get("churn_be_lock_pts") or 8.0)
+                        if (mark - ent) >= c_be and not t.get("step1_locked"):
+                            t["step1_locked"] = True
+                            be_plus = round(ent + 1.5, 2)
+                            if be_plus > float(t.get("sl_price") or 0.0):
+                                t["sl_price"] = be_plus
+                        if mark >= float(t.get("t1_price") or 999999.0):
                             t["t1_hit"] = True
-                            close_auto_trade_record(t, mark, "TARGET_1 FULL EXIT", auto_cfg, token, client_id, alert_cfg, now_ist)
+                            close_auto_trade_record(t, mark, f"CHURN SCALP TARGET HIT (+{mark - ent:.1f} pts)", auto_cfg, token, client_id, alert_cfg, now_ist)
                             continue
-                        else:
-                            partial_book_at_t1(t, mark, auto_cfg, token, client_id, alert_cfg, now_ist)
+                    else:
+                        # STEP-1 EARLY BREAKEVEN LOCK (+10% gain locks SL at Entry + 2% so a +10% winner never turns into a red loss)
+                        if mark >= round(ent * 1.10, 2) and not t.get("step1_locked") and not t.get("t1_hit"):
+                            t["step1_locked"] = True
+                            be_plus = round(ent * 1.02, 2)
+                            if be_plus > float(t.get("sl_price") or 0.0):
+                                t["sl_price"] = be_plus
+
+                        # 1. Check T1 hit first (so multi-lot trades book 50% at T1 and trail SL to cost):
+                        if mark >= float(t.get("t1_price") or 999999.0) and not t.get("t1_hit"):
+                            if auto_cfg.get("t1_rule") == "BOOK_100_T1":
+                                t["t1_hit"] = True
+                                close_auto_trade_record(t, mark, "TARGET_1 FULL EXIT", auto_cfg, token, client_id, alert_cfg, now_ist)
+                                continue
+                            else:
+                                partial_book_at_t1(t, mark, auto_cfg, token, client_id, alert_cfg, now_ist)
 
                     # 1b. Post-T1 Ratcheting Runner Trail (never let a +30% post-T1 runner round-trip all the way back to flat entry)
                     if t.get("t1_hit") and not t.get("t2_hit"):
@@ -3855,6 +4051,36 @@ def fp_fields(m, direction):
             "fp_vwap_dist": fp.get("vwap_dist") if ok else None, "fp_orb": fp.get("orb") if ok else None, "fp_against": against}
 
 
+def idea_key(r):
+    """v17.6 (from v16.1): deduplicates repeated signals of the same intraday idea for unbiased scorecard stats."""
+    try:
+        if r.get("kind") == "VALIDATED" and r.get("target") is not None and r.get("sl") is not None:
+            return (f"{r.get('date')}|{r.get('index')}|{r.get('expiry')}|{r.get('signal')}|"
+                    f"{round(float(r['target']))}|{round(float(r['sl']))}")
+        return (f"{r.get('date')}|{r.get('index')}|{r.get('expiry')}|{r.get('signal')}|{r.get('kind')}|"
+                f"{rejection_category(r)}|{int(float(r.get('ts', 0)) // 3600)}")
+    except (TypeError, ValueError):
+        return str(r.get("id"))
+
+
+def unique_ideas(recs):
+    return [r for r in recs if not r.get("is_repeat")]
+
+
+def backfill_ideas(card):
+    seen, n = set(), 0
+    for r in sorted(card, key=lambda x: x.get("ts", 0)):
+        key = r.get("idea_key") or idea_key(r)
+        if r.get("idea_key") is None:
+            r["idea_key"] = key
+            n += 1
+        if r.get("is_repeat") is None:
+            r["is_repeat"] = key in seen
+            n += 1
+        seen.add(key)
+    return n
+
+
 def make_record(kind, idx_name, expiry, m, sig, ai, tone, now):
     direction = sig["signal"] if kind == "VALIDATED" else (sig.get("proposed_signal") if sig.get("proposed_signal") in ("BUY", "SELL") else sig["ai_signal"])
     ex = m.get("exh") or {}
@@ -3863,8 +4089,13 @@ def make_record(kind, idx_name, expiry, m, sig, ai, tone, now):
     note = sig["note"] if kind == "REJECTED" else ""
     buyer_plan = select_buyer_contract(m, direction, xctx_allowed(m, direction)) if kind == "VALIDATED" and direction in ("BUY", "SELL") else None
     trade_key = f"{idx_name}|{str(expiry)[:10]}|{direction}|{buyer_plan.get('option_type') if buyer_plan else 'NA'}|{buyer_plan.get('strike') if buyer_plan else 'NA'}"
-    return {
+    if buyer_plan:
+        trk = {"strike": buyer_plan["strike"], "side": buyer_plan["side"], "ask0": buyer_plan["ask"], "bid0": buyer_plan["bid"]}
+    else:
+        trk = pick_tracking_contract(m, direction) if direction in ("BUY", "SELL") else None
+    rec = {
         "id": hashlib.sha256(f"{now.timestamp()}|{trade_key}|{kind}".encode()).hexdigest()[:12], "trade_key": trade_key,
+        "app_version": APP_VERSION,
         "kind": kind, "ts": now.timestamp(), "date": now.date().isoformat(), "time": now.strftime("%H:%M:%S"),
         "index": idx_name, "expiry": str(expiry)[:10], "signal": direction, "entry": round(float(m["spot"]), 2),
         "target": sig["target"] if kind == "VALIDATED" else None, "sl": sig["sl"] if kind == "VALIDATED" else None,
@@ -3918,7 +4149,16 @@ def make_record(kind, idx_name, expiry, m, sig, ai, tone, now):
         "actual_exit_ts": None,
         "actual_fees": 0.0,
         "actual_net_pnl": None,
+        # v17.6: Real option-bid paper tracking across +5/15/30/60m for BOTH validated and rejected signals
+        "trk_strike": trk["strike"] if trk else None, "trk_side": trk["side"] if trk else None,
+        "trk_ask0": trk["ask0"] if trk else None, "trk_bid0": trk["bid0"] if trk else None,
+        "p5": None, "p15": None, "p30": None, "p60": None, "p_close": None,
+        "trk_last_bid": None, "trk_last_ts": None, "trk_max_bid": None, "trk_min_bid": None,
+        "last_spot": None,
     }
+    rec["idea_key"] = idea_key(rec)
+    rec["is_repeat"] = False
+    return rec
 
 
 def maybe_log_signal(recs, idx_name, expiry, m, sig, ai, tone, now):
@@ -3938,6 +4178,8 @@ def maybe_log_signal(recs, idx_name, expiry, m, sig, ai, tone, now):
     elif rej_dir in ("BUY", "SELL"):
         if not recent("REJECTED", rej_dir):
             new.append(make_record("REJECTED", idx_name, expiry, m, sig, ai, tone, now))
+    for rec in new:
+        rec["is_repeat"] = any(x.get("idea_key") == rec["idea_key"] for x in recs)
     recs.extend(new)
     return new
 
@@ -3999,6 +4241,25 @@ def update_outcomes(recs, idx_name, spot, now, candles, intraday=None, option_df
                         touched_now.append({**r, "event_type": event, "premium_mark": round(mark, 2),
                                             "outcome": event, "time": stamp, "resolved_time": stamp})
                     changed = True
+        # v17.6: paper-track real option bid (+5/15/30/60m & peak/min) for EVERY logged signal (validated & rejected)
+        if (same_day and live and r.get("trk_strike") is not None and option_df is not None and not option_df.empty
+                and str(r.get("expiry")) == str(current_expiry)[:10]):
+            tm = option_df[option_df["Strike"].astype(float).sub(float(r["trk_strike"])).abs() < 0.001]
+            if not tm.empty:
+                tside = r.get("trk_side") or "CE"
+                bid_now = _n(tm.iloc[0].get(f"{tside}_Bid"))
+                if bid_now <= 0:
+                    bid_now = _n(tm.iloc[0].get(f"{tside}_LTP"))
+                if bid_now > 0:
+                    bid_now = round(bid_now, 2)
+                    r["trk_last_bid"], r["trk_last_ts"] = bid_now, now.timestamp()
+                    r["trk_max_bid"] = bid_now if r.get("trk_max_bid") is None else max(r["trk_max_bid"], bid_now)
+                    r["trk_min_bid"] = bid_now if r.get("trk_min_bid") is None else min(r["trk_min_bid"], bid_now)
+                    for h in PATH_HORIZONS:
+                        tol = 4 if h == 5 else HORIZON_TOL_MIN
+                        if r.get(f"p{h}") is None and h <= el <= h + tol:
+                            r[f"p{h}"] = bid_now
+                    changed = True
         if same_day:
             later = [b for b in bars if b["ts"] >= r["ts"]]
             for b in later:
@@ -4049,6 +4310,16 @@ def update_outcomes(recs, idx_name, spot, now, candles, intraday=None, option_df
                 r["sclose"] = round(float(bars[-1]["c"]), 2)
             elif same_day and spot > 0:
                 r["sclose"] = round(float(spot), 2)
+            if r.get("p_close") is None and r.get("trk_last_bid") is not None:
+                r["p_close"] = r["trk_last_bid"]
+            touched = r["first_touch"] in ("TARGET", "STOP")
+            if r.get("sclose") is None and not touched:
+                try:
+                    age_days = (now.date() - date.fromisoformat(r["date"])).days
+                except (TypeError, ValueError):
+                    age_days = DATA_GAP_AFTER_DAYS
+                if age_days < DATA_GAP_AFTER_DAYS:
+                    continue
             r["resolved"] = True
             if r["first_touch"] in ("TARGET", "STOP"):
                 r["outcome"] = r["first_touch"]
@@ -4080,6 +4351,47 @@ def scorecard_summary(recs):
                          "Hit % (moved the signal's way)": round(sum(1 for v, _ in vals if v > 0) / n * 100, 1) if n else None,
                          "Avg move (pts)": round(sum(v for v, _ in vals) / n, 1) if n else None,
                          "Avg move (σ)": round(sum(v / sd for v, sd in vals if sd) / n, 2) if n else None})
+    return pd.DataFrame(rows)
+
+
+def baseline_summary(recs, key="s60"):
+    """v17.6 (from v16.1): Hit rate against 'Always BUY' market drift with 95% Wilson confidence intervals."""
+    marked = [r for r in recs if r.get(key) is not None and r.get("signal") in ("BUY", "SELL") and r.get("entry") is not None]
+    if not marked:
+        return pd.DataFrame()
+    rows = []
+    n = len(marked)
+    ups = sum(1 for r in marked if r[key] - r["entry"] > 0)
+    lo, hi = wilson_interval(ups, n)
+    rows.append({"Group": "Always BUY (market drift)", "n": n, "Days": len({r["date"] for r in marked}),
+                 "Hit %": round(ups / n * 100, 1), "95% Low": round(lo, 1), "95% High": round(hi, 1),
+                 "Avg Move (pts)": round(sum(r[key] - r["entry"] for r in marked) / n, 1)})
+    for kind in ("VALIDATED", "REJECTED"):
+        sub = [r for r in marked if r.get("kind") == kind]
+        if not sub:
+            continue
+        k = len(sub)
+        w = sum(1 for r in sub if fav_points(r, key) > 0)
+        lo, hi = wilson_interval(w, k)
+        rows.append({"Group": f"{kind} (signal direction)", "n": k, "Days": len({r["date"] for r in sub}),
+                     "Hit %": round(w / k * 100, 1), "95% Low": round(lo, 1), "95% High": round(hi, 1),
+                     "Avg Move (pts)": round(sum(fav_points(r, key) for r in sub) / k, 1)})
+    return pd.DataFrame(rows)
+
+
+def option_paper_summary(recs):
+    """v17.6 (from v16.1): Real option-bid paper P&L (Ask at entry -> Bid at +5/15/30/60m & Close)."""
+    rows = []
+    labels = (("p5", "5 min"), ("p15", "15 min"), ("p30", "30 min"), ("p60", "60 min"), ("p_close", "Close"))
+    for kind in ("VALIDATED", "REJECTED"):
+        rs = [r for r in recs if r.get("kind") == kind and r.get("trk_ask0")]
+        for key, lab in labels:
+            vals = [(float(r[key]) - float(r["trk_ask0"])) / float(r["trk_ask0"]) * 100.0 for r in rs if r.get(key) is not None]
+            n = len(vals)
+            rows.append({"Type": kind, "Horizon": lab, "n": n,
+                         "Hit % (Bid > Ask-in)": round(sum(1 for v in vals if v > 0) / n * 100, 1) if n else None,
+                         "Avg Return %": round(sum(vals) / n, 2) if n else None,
+                         "Median Return %": round(float(np.median(vals)), 2) if n else None})
     return pd.DataFrame(rows)
 
 
@@ -4155,7 +4467,8 @@ def scorecard_to_df(recs):
         row = {k: r.get(k) for k in ("id", "kind", "date", "time", "index", "expiry", "signal", "entry", "target", "sl", "rr",
                                     "confidence", "net", "lean", "status", "bias", "pcr", "atm_iv", "sd", "flow_conc", "exh_buyer",
                                     "exh_seller", "exh_own_flag", "tone", "news_score", "reason", "rejection_category", "gex_regime", "regime_stable", "zero_gamma_dist_sigma", "excess_basis", "rr_25", "rr_shift", "bf_25", "s15", "s30", "s60",
-                                    "sclose", "first_touch", "mfe", "mae", "samples", "max_gap_min", "resolved", "outcome", "touch_alerted", "fp_bias", "fp_score", "fp_quad30", "fp_vwap_dist", "fp_orb", "fp_against")}
+                                    "sclose", "first_touch", "mfe", "mae", "samples", "max_gap_min", "resolved", "outcome", "touch_alerted", "fp_bias", "fp_score", "fp_quad30", "fp_vwap_dist", "fp_orb", "fp_against",
+                                    "app_version", "idea_key", "is_repeat", "trk_strike", "trk_side", "trk_ask0", "trk_bid0", "p5", "p15", "p30", "p60", "p_close", "trk_max_bid", "trk_min_bid")}
         for nm, v in (r.get("checks") or {}).items():
             row[f"check:{nm}"] = v
         for key in ("s15", "s30", "s60", "sclose"):
@@ -4287,7 +4600,7 @@ def esc(x):
 # SIDEBAR
 # ============================================================
 with st.sidebar:
-    st.markdown("### BBG // BUYER TERMINAL v17.3 PROFIT-LOCK EDITION")
+    st.markdown("### BBG // BUYER TERMINAL v17.6 PRECISION EDITION")
     dhan_token = clean(get_secret("DHAN_ACCESS_TOKEN", DEFAULT_DHAN_TOKEN))
     client_id = clean(get_secret("DHAN_CLIENT_ID", DEFAULT_CLIENT_ID))
     groq_key = get_secret("GROQ_API_KEY", DEFAULT_GROQ_KEY).strip()
@@ -4352,7 +4665,7 @@ groq_model = GROQ_MODELS[0]
 live_news = True
 news = st.session_state.get("macro_note", "")      # optional note typed in the AI Council tab
 horizon_days, iv_shock, use_skew = 0.25, 15, True  # premium-scanner scenario settings
-USE_SURFACE_CHECK["on"] = True                     # active: synthetic-basis & 25d skew vote in volatility family
+USE_SURFACE_CHECK["on"] = False                    # observe-only (v17.4): prevents lagging basis from vetoing GAMMA BLAST trends
 TIME_BASIS["mode"] = "calendar"
 exh_lookback = 15
 weekly_alert = True
@@ -4552,8 +4865,8 @@ if alerts_on and tg_token and tg_chat:
 
 auto_cfg = load_auto_cfg()
 update_auto_trades_live(idx_name, expiry, m["df"], auto_cfg, dhan_token, client_id, alert_cfg, now_ist, m=m, sig=sig)
-if new_recs and auto_cfg.get("enabled") and market_open_now(now_ist):
-    auto_initiate_from_signals(new_recs, auto_cfg, dhan_token, client_id, alert_cfg, now_ist)
+if auto_cfg.get("enabled") and market_open_now(now_ist) and (new_recs or auto_cfg.get("churn_mode")):
+    auto_initiate_from_signals(new_recs, auto_cfg, dhan_token, client_id, alert_cfg, now_ist, live_sig=sig, idx_name=idx_name, expiry=expiry)
 
 # ============================================================
 # DASHBOARD HEADER
@@ -4754,11 +5067,22 @@ with tab6:
 
 
 with tab7:
-    st.markdown("#### 📒 SIGNAL SCORECARD")
+    st.markdown("#### 📒 SIGNAL SCORECARD (DEDUPLICATED + REAL OPTION-BID TRACKING)")
     recs = st.session_state["scorecard"]
     if recs:
-        show_df(scorecard_summary(recs), hide_index=True)
-        _ts = touch_stats(recs)
+        backfill_ideas(recs)
+        recs_u = unique_ideas(recs)
+        st.caption(f"{len(recs)} logged rows = **{len(recs_u)} unique trade ideas** (30-min repeats excluded from stats below).")
+        _bl = baseline_summary(recs_u)
+        if not _bl.empty:
+            st.markdown("##### Against Market Drift ('Always BUY' 60-min Baseline)")
+            show_df(_bl, hide_index=True)
+        show_df(scorecard_summary(recs_u), hide_index=True)
+        _op = option_paper_summary(recs_u)
+        if not _op.empty and _op["n"].sum() > 0:
+            st.markdown("##### Real Option-Bid Paper P&L (Ask-in → Bid-out across +5/15/30/60m)")
+            show_df(_op, hide_index=True)
+        _ts = touch_stats(recs_u)
         t1, t2, t3, t4, t5 = st.columns(5)
         t1.metric("TARGET HITS", _ts["target"])
         t2.metric("STOP HITS", _ts["stop"])
@@ -5021,8 +5345,9 @@ with tab0:
     v1.metric("ATM IV", f"{m['atm_iv']:.1f}%",
               f"{_ivp['pct']}th pct of last 30d ({_ivp['n']} samples)" if _ivp["pct"] is not None
               else f"percentile building ({_ivp['n']}/30 samples)", delta_color="off")
-    v2.metric("REALISED VOL (10d)", f"{_rv:.1f}%" if _rv else "n/a",
-              f"IV minus RV {m['atm_iv'] - _rv:+.1f} pts" if _rv else None, delta_color="off")
+    _pk_rv = parkinson_intraday_vol(intraday)
+    v2.metric("REALISED VOL (10d / Intraday)", f"{_rv:.1f}% / {_pk_rv:.1f}%" if (_rv and _pk_rv) else (f"{_rv:.1f}%" if _rv else "n/a"),
+              f"IV minus 10d RV {m['atm_iv'] - _rv:+.1f} pts" if _rv else None, delta_color="off")
     v3.metric("ATM STRADDLE", f"{_straddle:,.0f}", f"expected daily move ±{_sd_pts:,.0f} pts", delta_color="off")
     v4.metric("EXPECTED MOVE TO EXPIRY (±)", f"{m['exp_move']:,.0f}", f"{m['lower_1sigma']:,.0f} to {m['upper_1sigma']:,.0f}", delta_color="off")
     st.caption("When IV is well above recent realised volatility, buyers need a bigger move than the market has recently delivered just to break even. "
@@ -5213,6 +5538,14 @@ with tab11:
                 min_value=5.0, max_value=35.0, value=float(_acfg.get("t2_trail_pct", 15.0)), step=2.5,
             )
 
+            st.markdown("**⚡ CONTINUOUS SCALP / CHURN MODE (Book 10–20 pts & keep churning until 15:20 IST)**")
+            ch1, ch2, ch3, ch4, ch5 = st.columns(5)
+            _new_churn = ch1.toggle("🔄 CHURN MODE ON", value=bool(_acfg.get("churn_mode", False)))
+            _new_c_tgt = ch2.number_input("TARGET PTS", min_value=5.0, max_value=50.0, value=float(_acfg.get("churn_target_pts", 15.0)), step=1.0)
+            _new_c_sl = ch3.number_input("SL PTS", min_value=5.0, max_value=50.0, value=float(_acfg.get("churn_sl_pts", 15.0)), step=1.0)
+            _new_c_be = ch4.number_input("BE LOCK PTS", min_value=3.0, max_value=30.0, value=float(_acfg.get("churn_be_lock_pts", 8.0)), step=1.0)
+            _new_c_cd = ch5.number_input("COOLDOWN (MIN)", min_value=1, max_value=30, value=int(_acfg.get("churn_cooldown_min", 3)), step=1)
+
             _save_btn = st.form_submit_button("💾 SAVE AUTO-TRADE SETTINGS", use_container_width=True)
             if _save_btn:
                 _updated_cfg = {
@@ -5232,6 +5565,11 @@ with tab11:
                     "exit_on_reversal": bool(_new_rev_exit),
                     "t2_runner_rule": "BOOK_T2" if _new_t2_mode.startswith("Fixed") else "CHANDELIER",
                     "t2_trail_pct": float(_new_trail_pct),
+                    "churn_mode": bool(_new_churn),
+                    "churn_target_pts": float(_new_c_tgt),
+                    "churn_sl_pts": float(_new_c_sl),
+                    "churn_be_lock_pts": float(_new_c_be),
+                    "churn_cooldown_min": int(_new_c_cd),
                 }
                 save_auto_cfg(_updated_cfg)
                 st.success("Auto-trade settings saved!")
@@ -5256,6 +5594,20 @@ with tab11:
                 _acfg["enabled"] = True
                 save_auto_cfg(_acfg)
                 st.success("Automation ARMED!")
+                st.rerun()
+
+        if _acfg.get("churn_mode"):
+            if st.button("🔄 STOP CHURN MODE (Switch to Normal T1/T2)", use_container_width=True, key="btn_churn_off"):
+                _acfg["churn_mode"] = False
+                save_auto_cfg(_acfg)
+                st.info("Churn Mode OFF. Switched back to Normal T1/T2 Mode.")
+                st.rerun()
+        else:
+            if st.button("⚡ START CHURN MODE (15pt Scalps Till 15:20)", use_container_width=True, key="btn_churn_on"):
+                _acfg["churn_mode"] = True
+                _acfg["enabled"] = True
+                save_auto_cfg(_acfg)
+                st.success("CHURN MODE ARMED! Will scalp 15 pts continuously until 15:20 IST.")
                 st.rerun()
 
     st.markdown("---")
