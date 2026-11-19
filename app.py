@@ -1,5 +1,5 @@
 """
-VIPUL OPTIONS BUYER SIGNAL TERMINAL v17.6 (PRECISION LOGIC + PRUNED LAGGING CHECKS + LIVE FILL SYNC + REAL OPTION-BID SCORECARD) (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
+VIPUL OPTIONS BUYER SIGNAL TERMINAL v17.7 (ALL-IN-ONE SINGLE FILE: BUILT-IN FAST WEBSOCKET EXIT MONITOR + PRECISION ENGINE) (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
 v15.1 adds an INSTITUTIONAL FOOTPRINT layer (needs footprint.py next to this file):
  - Index-futures price / volume / open-interest flow + session VWAP decide whether money is really moving your way
  - Footprint filter: VETO AGAINST (default) / REQUIRE ALIGNED / OFF; blocked signals are still logged with footprint fields
@@ -37,7 +37,10 @@ import math
 import html
 import time
 import hashlib
+import asyncio
+import struct
 import tempfile
+import threading
 import xml.etree.ElementTree as ET
 from datetime import datetime, date, timezone, timedelta
 from email.utils import parsedate_to_datetime
@@ -64,7 +67,12 @@ try:
 except ImportError:
     Groq = None
 
-st.set_page_config(page_title="Vipul Options Buyer Terminal v17.6", layout="wide", initial_sidebar_state="expanded")
+try:
+    import websockets as _ws_lib
+except ImportError:
+    _ws_lib = None
+
+st.set_page_config(page_title="Vipul Options Buyer Terminal v17.7", layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
 # CSS
@@ -134,7 +142,7 @@ EXPIRY_URL = f"{BASE_URL}/optionchain/expirylist"
 PROFILE_URL = f"{BASE_URL}/profile"
 
 YEAR_DAYS = 365
-APP_VERSION = "17.6"
+APP_VERSION = "17.7"
 PATH_HORIZONS = (5, 15, 30, 60)
 DATA_GAP_AFTER_DAYS = 3
 
@@ -3750,6 +3758,294 @@ def emergency_kill_all_auto_trades(auto_cfg, token, client_id, alert_cfg, now_is
     return closed_count
 
 
+# ============================================================
+# v17.7 BUILT-IN FAST BACKGROUND EXIT MONITOR (SINGLE-FILE CLOUD READY)
+# ============================================================
+_WS_FEED_URL = "wss://api-feed.dhan.co"
+_WS_EXCH_MAP = {0: "IDX_I", 1: "NSE_EQ", 2: "NSE_FNO", 3: "NSE_CURRENCY", 4: "BSE_EQ", 5: "MCX_COMM", 7: "BSE_CURRENCY", 8: "BSE_FNO"}
+
+
+def _ws_parse_packets(buf: bytes):
+    out, n, off = [], len(buf), 0
+    while off + 8 <= n:
+        code, mlen, exch, sid = struct.unpack_from("<BHBI", buf, off)
+        seg = _WS_EXCH_MAP.get(exch, "NSE_FNO")
+        s_str = str(sid)
+        if code in (2, 4):
+            plen = mlen if mlen >= (16 if code == 2 else 50) else (16 if code == 2 else 50)
+            if off + 12 <= n:
+                ltp = struct.unpack_from("<f", buf, off + 8)[0]
+                if math.isfinite(ltp) and ltp > 0:
+                    out.append({"code": code, "segment": seg, "security_id": s_str, "ltp": round(ltp, 2), "bid": 0.0})
+        elif code == 8:
+            plen = mlen if mlen >= 162 else 162
+            if off + 12 <= n:
+                ltp = struct.unpack_from("<f", buf, off + 8)[0]
+                bid_px = 0.0
+                if off + 82 <= n:
+                    _, _, _, _, b1, _ = struct.unpack_from("<IIHHff", buf, off + 62)
+                    if math.isfinite(b1) and ltp > 0 and (0.5 * ltp <= b1 <= 1.5 * ltp):
+                        bid_px = round(b1, 2)
+                if math.isfinite(ltp) and ltp > 0:
+                    out.append({"code": 8, "segment": seg, "security_id": s_str, "ltp": round(ltp, 2), "bid": bid_px})
+        elif code == 50:
+            plen = mlen if mlen >= 10 else 10
+            dc = struct.unpack_from("<H", buf, off + 8)[0] if off + 10 <= n else 0
+            out.append({"code": 50, "disconnect_code": dc})
+        else:
+            plen = mlen if mlen >= 8 else (n - off)
+        if plen <= 0:
+            break
+        off += plen
+    return out
+
+
+def _ws_eval_tick(t, mark_px, auto_cfg, token, client_id, alert_cfg, now_ist):
+    """Apply tick-level SL, Breakeven Lock, T1 Split, T2 Chandelier, and 15:20 EOD exit rules."""
+    if t.get("status") != "OPEN" or mark_px <= 0:
+        return False
+    ent = float(t.get("entry_price") or mark_px)
+    rem_qty = int(t.get("qty") or 1)
+    init_qty = int(t.get("initial_qty") or rem_qty or 1)
+    part_pnl = float(t.get("partial_realized_pnl") or 0.0)
+    t["last_price"] = round(mark_px, 2)
+    t["peak_price"] = round(max(float(t.get("peak_price") or mark_px), mark_px), 2)
+    t["unrealized_pnl"] = round((mark_px - ent) * rem_qty, 2)
+    comb_pnl = part_pnl + t["unrealized_pnl"]
+    t["pnl_pct"] = round((comb_pnl / (ent * init_qty) * 100.0) if (ent > 0 and init_qty > 0) else 0.0, 2)
+    crit = False
+
+    if t.get("churn_mode"):
+        c_be = float(auto_cfg.get("churn_be_lock_pts") or 8.0)
+        if (mark_px - ent) >= c_be and not t.get("step1_locked"):
+            t["step1_locked"] = True
+            be_plus = round(ent + 1.5, 2)
+            if be_plus > float(t.get("sl_price") or 0.0):
+                t["sl_price"] = be_plus
+                crit = True
+        if mark_px >= float(t.get("t1_price") or 999999.0):
+            t["t1_hit"] = True
+            close_auto_trade_record(t, mark_px, f"[FAST] CHURN SCALP TARGET (+{mark_px - ent:.1f} pts)", auto_cfg, token, client_id, alert_cfg, now_ist)
+            return True
+    else:
+        if mark_px >= round(ent * 1.10, 2) and not t.get("step1_locked") and not t.get("t1_hit"):
+            t["step1_locked"] = True
+            be_plus = round(ent * 1.02, 2)
+            if be_plus > float(t.get("sl_price") or 0.0):
+                t["sl_price"] = be_plus
+                crit = True
+        if mark_px >= float(t.get("t1_price") or 999999.0) and not t.get("t1_hit"):
+            if auto_cfg.get("t1_rule") == "BOOK_100_T1":
+                t["t1_hit"] = True
+                close_auto_trade_record(t, mark_px, "[FAST] TARGET_1 FULL EXIT", auto_cfg, token, client_id, alert_cfg, now_ist)
+                return True
+            else:
+                partial_book_at_t1(t, mark_px, auto_cfg, token, client_id, alert_cfg, now_ist)
+                crit = True
+        if t.get("t1_hit") and not t.get("t2_hit"):
+            post_sl = round(max(ent * 1.02, float(t["peak_price"]) * 0.88), 2)
+            if post_sl > float(t.get("sl_price") or 0.0):
+                t["sl_price"] = post_sl
+                crit = True
+        t2_px = float(t.get("t2_price") or 999999.0)
+        if mark_px >= t2_px:
+            if auto_cfg.get("t2_runner_rule", "CHANDELIER") == "BOOK_T2":
+                close_auto_trade_record(t, mark_px, "[FAST] TARGET_2 HIT", auto_cfg, token, client_id, alert_cfg, now_ist)
+                return True
+            else:
+                tp = float(auto_cfg.get("t2_trail_pct") or 12.0) / 100.0
+                ch_sl = round(max(t2_px * 0.96, float(t["peak_price"]) * (1.0 - tp)), 2)
+                if ch_sl > float(t.get("sl_price") or 0.0):
+                    t["sl_price"] = ch_sl
+                    crit = True
+                if not t.get("t2_hit"):
+                    t["t2_hit"] = True
+                    crit = True
+        elif t.get("t2_hit"):
+            tp = float(auto_cfg.get("t2_trail_pct") or 12.0) / 100.0
+            ch_sl = round(max(t2_px * 0.96, float(t["peak_price"]) * (1.0 - tp)), 2)
+            if ch_sl > float(t.get("sl_price") or 0.0):
+                t["sl_price"] = ch_sl
+                crit = True
+
+    if mark_px <= float(t.get("sl_price") or 0.0):
+        rsn = (
+            "[FAST] T2 CHANDELIER TRAIL STOP" if t.get("t2_hit")
+            else ("[FAST] T1 RUNNER PROFIT TRAIL" if t.get("t1_hit")
+                  else ("[FAST] STEP-1 BREAKEVEN LOCK (+2%)" if t.get("step1_locked") else "[FAST] STOP_LOSS HIT"))
+        )
+        close_auto_trade_record(t, mark_px, rsn, auto_cfg, token, client_id, alert_cfg, now_ist)
+        return True
+
+    if market_open_now(now_ist) and (now_ist.hour * 60 + now_ist.minute) >= (15 * 60 + 20):
+        close_auto_trade_record(t, mark_px, "[FAST] EOD 15:20 AUTO SQUARE-OFF", auto_cfg, token, client_id, alert_cfg, now_ist)
+        return True
+
+    return crit
+
+
+def _ws_rest_quotes(pairs, token, client_id):
+    payload = {}
+    for seg, sid in pairs:
+        try:
+            payload.setdefault(seg, []).append(int(sid))
+        except ValueError:
+            continue
+    if not payload:
+        return {}
+    out = {}
+    try:
+        r = requests.post(f"{BASE_URL}/marketfeed/quote", headers=auth_headers(token, client_id), json=payload, timeout=6)
+        if not r.ok:
+            return out
+        data = (r.json() or {}).get("data") or {}
+        for seg, smap in data.items():
+            if not isinstance(smap, dict):
+                continue
+            for sid, q in smap.items():
+                ltp = float(q.get("last_price") or 0.0)
+                bd = (q.get("depth") or {}).get("buy") or []
+                bid = float(bd[0].get("price") or 0.0) if bd else 0.0
+                mk = bid if (bid > 0 and ltp > 0 and 0.5 * ltp <= bid <= 1.5 * ltp) else ltp
+                if mk > 0:
+                    out[str(sid)] = mk
+    except Exception:
+        pass
+    return out
+
+
+def _bg_exit_thread_main(state, token, client_id, tg_token, tg_chat, hook):
+    alert_cfg = {"enabled": bool(tg_token and tg_chat), "tg_token": tg_token, "tg_chat": tg_chat, "hook": hook}
+
+    async def _ws_loop():
+        ws_url = f"{_WS_FEED_URL}?version=2&token={token}&clientId={client_id}&authType=2"
+        subscribed = set()
+        last_sync, last_reload, dirty = 0.0, 0.0, False
+        trades, acfg = load_auto_trades(), load_auto_cfg()
+        while not state.get("stop"):
+            try:
+                async with _ws_lib.connect(ws_url, ping_interval=None, max_size=2**22) as ws:
+                    state["connected"] = True
+                    state["mode"] = "Sub-Second WebSocket"
+                    subscribed.clear()
+                    while not state.get("stop"):
+                        now_ts = time.time()
+                        now_ist = datetime.now(IST)
+                        if now_ts - last_reload >= 2.0:
+                            if dirty:
+                                save_auto_trades(trades)
+                                dirty, last_sync = False, now_ts
+                            trades, acfg = load_auto_trades(), load_auto_cfg()
+                            last_reload = now_ts
+                            desired = {
+                                (str(t.get("segment") or "NSE_FNO"), str(t.get("security_id")))
+                                for t in trades if t.get("status") == "OPEN" and t.get("security_id")
+                            }
+                            state["open_watched"] = len(desired)
+                            to_sub, to_unsub = desired - subscribed, subscribed - desired
+                            if to_sub:
+                                await ws.send(json.dumps({
+                                    "RequestCode": 21, "InstrumentCount": len(to_sub),
+                                    "InstrumentList": [{"ExchangeSegment": s, "SecurityId": i} for s, i in sorted(to_sub)],
+                                }))
+                                subscribed |= to_sub
+                            if to_unsub:
+                                await ws.send(json.dumps({
+                                    "RequestCode": 22, "InstrumentCount": len(to_unsub),
+                                    "InstrumentList": [{"ExchangeSegment": s, "SecurityId": i} for s, i in sorted(to_unsub)],
+                                }))
+                                subscribed -= to_unsub
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                        except asyncio.TimeoutError:
+                            if market_open_now(now_ist) and (now_ist.hour * 60 + now_ist.minute) >= (15 * 60 + 20):
+                                for t in trades:
+                                    if t.get("status") == "OPEN":
+                                        px = float(t.get("last_price") or t.get("entry_price") or 0.05)
+                                        close_auto_trade_record(t, px, "[FAST] EOD 15:20 AUTO SQUARE-OFF", acfg, token, client_id, alert_cfg, now_ist)
+                                        dirty = True
+                            if dirty and (now_ts - last_sync >= 2.0):
+                                save_auto_trades(trades)
+                                dirty, last_sync = False, now_ts
+                            continue
+                        if not isinstance(raw, (bytes, bytearray)):
+                            continue
+                        urgent = False
+                        for pkt in _ws_parse_packets(raw):
+                            if pkt.get("code") == 50:
+                                raise ConnectionResetError(f"Dhan WS disconnect {pkt.get('disconnect_code')}")
+                            sid = pkt.get("security_id")
+                            mk = pkt["bid"] if pkt.get("bid", 0) > 0 else pkt.get("ltp", 0)
+                            if not sid or mk <= 0:
+                                continue
+                            state["last_tick"] = datetime.now(IST).strftime("%H:%M:%S")
+                            for t in trades:
+                                if t.get("status") == "OPEN" and str(t.get("security_id")) == sid:
+                                    if _ws_eval_tick(t, mk, acfg, token, client_id, alert_cfg, datetime.now(IST)):
+                                        urgent = True
+                                    dirty = True
+                        if urgent or (dirty and time.time() - last_sync >= 2.0):
+                            save_auto_trades(trades)
+                            dirty, last_sync = False, time.time()
+            except Exception as exc:
+                state["connected"] = False
+                state["last_err"] = str(exc)[:100]
+                if dirty:
+                    save_auto_trades(trades)
+                    dirty = False
+                await asyncio.sleep(4.0)
+
+    def _rest_loop():
+        state["mode"] = "Fast 1.5s Quote Backup"
+        state["connected"] = True
+        while not state.get("stop"):
+            try:
+                trades = load_auto_trades()
+                acfg = load_auto_cfg()
+                open_t = [t for t in trades if t.get("status") == "OPEN" and t.get("security_id")]
+                state["open_watched"] = len(open_t)
+                if open_t:
+                    pairs = {(str(t.get("segment") or "NSE_FNO"), str(t["security_id"])) for t in open_t}
+                    quotes = _ws_rest_quotes(pairs, token, client_id)
+                    now_ist = datetime.now(IST)
+                    chg = False
+                    for t in open_t:
+                        mk = quotes.get(str(t["security_id"]), 0.0)
+                        if mk > 0:
+                            state["last_tick"] = now_ist.strftime("%H:%M:%S")
+                            _ws_eval_tick(t, mk, acfg, token, client_id, alert_cfg, now_ist)
+                            chg = True
+                    if chg:
+                        save_auto_trades(trades)
+            except Exception as exc:
+                state["last_err"] = str(exc)[:100]
+            time.sleep(1.5)
+
+    if _ws_lib is not None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(_ws_loop())
+    else:
+        _rest_loop()
+
+
+@st.cache_resource(show_spinner=False)
+def start_fast_exit_monitor(token, client_id, tg_token, tg_chat, hook):
+    """Starts ONE singleton background exit monitor per Streamlit server (never duplicates WebSockets)."""
+    state = {"mode": "Starting...", "connected": False, "open_watched": 0, "last_tick": "—", "last_err": "", "stop": False}
+    if not token or not client_id:
+        state["mode"] = "Waiting for Dhan keys"
+        return state
+    th = threading.Thread(
+        target=_bg_exit_thread_main,
+        args=(state, token, client_id, tg_token, tg_chat, hook),
+        daemon=True,
+        name="bbg_fast_exit_monitor",
+    )
+    th.start()
+    return state
+
+
 SCORECARD_FILE = os.path.join(DATA_DIR, "bbg_scorecard_v14.json")
 ALERT_FILE = os.path.join(DATA_DIR, "bbg_alerts_sent_v15.json")
 SIGNAL_DEDUP_MIN = 30
@@ -4600,7 +4896,7 @@ def esc(x):
 # SIDEBAR
 # ============================================================
 with st.sidebar:
-    st.markdown("### BBG // BUYER TERMINAL v17.6 PRECISION EDITION")
+    st.markdown("### BBG // BUYER TERMINAL v17.7 ALL-IN-ONE")
     dhan_token = clean(get_secret("DHAN_ACCESS_TOKEN", DEFAULT_DHAN_TOKEN))
     client_id = clean(get_secret("DHAN_CLIENT_ID", DEFAULT_CLIENT_ID))
     groq_key = get_secret("GROQ_API_KEY", DEFAULT_GROQ_KEY).strip()
@@ -4863,6 +5159,7 @@ if alerts_on and tg_token and tg_chat:
     # Retry previously failed Telegram/webhook deliveries on subsequent app reruns.
     alert_results += process_alert_queue(alert_cfg)
 
+fast_mon = start_fast_exit_monitor(dhan_token, client_id, tg_token if alerts_on else "", tg_chat if alerts_on else "", log_hook)
 auto_cfg = load_auto_cfg()
 update_auto_trades_live(idx_name, expiry, m["df"], auto_cfg, dhan_token, client_id, alert_cfg, now_ist, m=m, sig=sig)
 if auto_cfg.get("enabled") and market_open_now(now_ist) and (new_recs or auto_cfg.get("churn_mode")):
@@ -5458,11 +5755,15 @@ with tab11:
     # ---- Top Banner: Automation Status + Emergency Kill-Switch Button
     _st_col = "#00e676" if _acfg.get("enabled") else "#ff1744"
     _st_txt = f"🟢 AUTOMATION ARMED ({_acfg.get('mode')})" if _acfg.get("enabled") else "🔴 AUTOMATION STOPPED (DISARMED)"
+    _fm_ok = bool(fast_mon.get("connected"))
+    _fm_col = "#00e676" if _fm_ok else "#ffab00"
+    _fm_txt = f"⚡ FAST EXIT MONITOR: {fast_mon.get('mode', 'Starting')} ({'LIVE' if _fm_ok else 'RECONNECTING'}) | Watching {fast_mon.get('open_watched', 0)} open trade(s) | Last tick: {fast_mon.get('last_tick', '—')}"
     st.markdown(
-        f"<div style='border:2px solid {_st_col};background:#0f0f0f;padding:12px 16px;border-radius:6px;margin-bottom:12px;'>"
+        f"<div style='border:2px solid {_st_col};background:#0f0f0f;padding:12px 16px;border-radius:6px;margin-bottom:8px;'>"
         f"<span style='font-size:1.3rem;font-weight:800;color:{_st_col};'>{esc(_st_txt)}</span>"
         f"&nbsp;&nbsp;|&nbsp;&nbsp;<span style='color:#ddd;'>Active Indices: <b>{esc(', '.join(_acfg.get('allowed_indices') or ['None']))}</b> "
-        f"| Open Trades: <b>{len(_open_at)}/{_acfg.get('max_open_positions', 1)}</b></span></div>",
+        f"| Open Trades: <b>{len(_open_at)}/{_acfg.get('max_open_positions', 1)}</b></span><br>"
+        f"<span style='font-size:0.9rem;color:{_fm_col};'>{esc(_fm_txt)}</span></div>",
         unsafe_allow_html=True,
     )
 
