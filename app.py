@@ -1,5 +1,5 @@
 """
-VIPUL OPTIONS BUYER SIGNAL TERMINAL v17.8 (ALL-IN-ONE SINGLE FILE: BUILT-IN FAST WEBSOCKET EXIT MONITOR + PRECISION ENGINE) (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
+VIPUL OPTIONS BUYER SIGNAL TERMINAL v16.0 (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
 v15.1 adds an INSTITUTIONAL FOOTPRINT layer (needs footprint.py next to this file):
  - Index-futures price / volume / open-interest flow + session VWAP decide whether money is really moving your way
  - Footprint filter: VETO AGAINST (default) / REQUIRE ALIGNED / OFF; blocked signals are still logged with footprint fields
@@ -37,10 +37,7 @@ import math
 import html
 import time
 import hashlib
-import asyncio
-import struct
 import tempfile
-import threading
 import xml.etree.ElementTree as ET
 from datetime import datetime, date, timezone, timedelta
 from email.utils import parsedate_to_datetime
@@ -67,12 +64,7 @@ try:
 except ImportError:
     Groq = None
 
-try:
-    import websockets as _ws_lib
-except ImportError:
-    _ws_lib = None
-
-st.set_page_config(page_title="Vipul Options Buyer Terminal v17.8", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Vipul Options Buyer Terminal v16.0", layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
 # CSS
@@ -127,12 +119,7 @@ DEFAULT_TG_CHAT = get_secret("TELEGRAM_CHAT_ID", "").strip()
 
 # NSE trading holidays are NOT hard-coded (they change every year). Put them in the secret/env
 # NSE_HOLIDAYS as comma-separated ISO dates, e.g. "2026-11-08,2026-11-09,2026-12-25".
-DEFAULT_NSE_HOLIDAYS_2026 = (
-    "2026-01-26,2026-03-03,2026-03-26,2026-03-31,2026-04-03,"
-    "2026-04-14,2026-05-01,2026-05-28,2026-06-26,2026-09-14,"
-    "2026-10-02,2026-10-20,2026-11-10,2026-11-24,2026-12-25"
-)
-NSE_HOLIDAYS = {x.strip() for x in get_secret("NSE_HOLIDAYS", DEFAULT_NSE_HOLIDAYS_2026).split(",") if x.strip()}
+NSE_HOLIDAYS = {x.strip() for x in get_secret("NSE_HOLIDAYS", "").split(",") if x.strip()}
 
 GROQ_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
 
@@ -142,9 +129,6 @@ EXPIRY_URL = f"{BASE_URL}/optionchain/expirylist"
 PROFILE_URL = f"{BASE_URL}/profile"
 
 YEAR_DAYS = 365
-APP_VERSION = "17.8"
-PATH_HORIZONS = (5, 15, 30, 60)
-DATA_GAP_AFTER_DAYS = 3
 
 
 class _SessionFlag:
@@ -173,7 +157,7 @@ PARAM_DEFAULTS = {
     "max_risk": 2.0, "capital": 100000, "move_alert_pct": 2.0,
     "min_conf": 60, "exh_veto": False, "alert_rejected": False,
     "fp_mode": "VETO AGAINST", "target_cap": 0.8,
-    "expiry_mode": True, "engine_led": True, "regime_gate": "STRICT (trend only)", "session_guard": True,
+    "expiry_mode": True, "engine_led": True, "regime_gate": "SOFT (block against trend)", "session_guard": True,
 }
 
 
@@ -233,8 +217,8 @@ INDEX_MAP = {
     "NIFTY 50": {"scrip": 13, "seg": "IDX_I", "step": 50},
     "NIFTY BANK": {"scrip": 25, "seg": "IDX_I", "step": 100},
     "FINNIFTY": {"scrip": 27, "seg": "IDX_I", "step": 50},
-    "MIDCPNIFTY": {"scrip": 442, "alt_scrip": 118, "seg": "IDX_I", "step": 25},
-    "SENSEX": {"scrip": 51, "seg": "IDX_I", "step": 100},
+    "MIDCPNIFTY": {"scrip": 118, "seg": "IDX_I", "step": 25},
+    "SENSEX": {"scrip": 51, "seg": "IDX_I", "step": 100},  # v16: BSE index; verify id 51 on first run (see notes)
 }
 
 DIV_YIELD = 0.013
@@ -242,7 +226,7 @@ GEX_BAND_PCT = 5.0
 GEX_WINDOWS = (4, 8, 16)
 BASIS_MIN_PTS = 8.0
 SURF_CHECK_NAME = "Synthetic basis vs fair carry"
-USE_SURFACE_CHECK = _SessionFlag("surface_check", True)
+USE_SURFACE_CHECK = _SessionFlag("surface_check", False)
 SURFACE_KEYS = ("syn_fut", "fair_fwd", "carry", "basis", "excess_basis", "surface_ok", "iv_25c", "iv_25p", "rr_25", "bf_25",
                 "net_gex", "gross_gex", "gex_regime", "gex_regime_label", "regime_stable", "regime_by_window", "crossover",
                 "zero_gamma", "total_gex_at_spot", "net_vex", "net_cex")
@@ -297,32 +281,12 @@ def fmt_cr(x):
 # ============================================================
 # DATA FETCHERS
 # ============================================================
-def active_expiries(exps, now=None):
-    """Filter out past expiries and today's expiry after 15:30 IST so settled contracts are skipped."""
-    now = now or datetime.now(IST)
-    today_iso = now.date().isoformat()
-    after_close = (now.hour * 60 + now.minute) >= (15 * 60 + 30)
-    valid = [
-        e for e in (exps or [])
-        if str(e)[:10] > today_iso or (str(e)[:10] == today_iso and not after_close)
-    ]
-    return valid if valid else list(exps or [])
-
-
 @st.cache_data(ttl=300, show_spinner=False)
 def get_expiries(scrip, seg, token, client_id):
-    enforce_global_api_throttle(1.0)
     r = requests.post(EXPIRY_URL, headers=auth_headers(token, client_id),
                       json={"UnderlyingScrip": scrip, "UnderlyingSeg": seg}, timeout=10)
     check(r)
-    data = r.json().get("data", [])
-    if not data and scrip == 442:
-        enforce_global_api_throttle(1.0)
-        r2 = requests.post(EXPIRY_URL, headers=auth_headers(token, client_id),
-                           json={"UnderlyingScrip": 118, "UnderlyingSeg": seg}, timeout=10)
-        if r2.ok:
-            data = r2.json().get("data", [])
-    return active_expiries(data)
+    return r.json().get("data", [])
 
 
 def enforce_global_api_throttle(min_interval=None):
@@ -767,15 +731,14 @@ def compute_bias(dce, dpe, ce_tot, pe_tot, spot, prev_close, pcr, basis, rr_25, 
     score = 50
     dce_p = dce / ce_tot * 100.0 if ce_tot > 0 else 0.0
     dpe_p = dpe / pe_tot * 100.0 if pe_tot > 0 else 0.0
-    flow_diff = dpe_p - dce_p
     (su, sb), (mu, mb) = BIAS_STRONG, BIAS_MILD
-    if (dce_p < -su and dpe_p > sb) or flow_diff >= 2.0:
+    if dce_p < -su and dpe_p > sb:
         score += 25
-    elif (dce_p < -mu and dpe_p > mb) or flow_diff >= 1.0:
+    elif dce_p < -mu and dpe_p > mb:
         score += 15
-    elif (dpe_p < -su and dce_p > sb) or flow_diff <= -2.0:
+    elif dpe_p < -su and dce_p > sb:
         score -= 25
-    elif (dpe_p < -mu and dce_p > mb) or flow_diff <= -1.0:
+    elif dpe_p < -mu and dce_p > mb:
         score -= 15
 
     if prev_close and prev_close > 0 and sd > 0:
@@ -797,7 +760,7 @@ def compute_bias(dce, dpe, ce_tot, pe_tot, spot, prev_close, pcr, basis, rr_25, 
         score -= 5
 
     score = max(0, min(100, score))
-    label = "BULLISH" if score >= 55 else "BEARISH" if score <= 45 else "NEUTRAL"
+    label = "BULLISH" if score > 55 else "BEARISH" if score < 45 else "NEUTRAL"
     return score, label
 
 
@@ -881,20 +844,12 @@ def detect_gamma_blast(near):
         return ("CONFLICTED", "WAIT",
                 f"Opposing flows both active (bull force {e['bull_force']:.1f} vs bear {e['bear_force']:.1f}). Stand aside.")
     if base_bear:
-        if e["bear_force"] >= 2.2 * max(e["bull_force"], 0.1) and e["ce_net_flow"] > abs(e["pe_net_flow"]):
-            return ("BEARISH GAMMA BLAST", "SELL",
-                    f"Dominant call writing ({e['ce_build_pct']:.1f}%) + put exits ({e['pe_exit_pct']:.1f}%) overpowering put additions; "
-                    f"bear force {e['bear_force']:.1f} vs bull {e['bull_force']:.1f}.")
         if bear_dom:
             return ("RESISTANCE BUILD (bearish lean)", "WAIT",
                     f"Heavy call writing ({e['ce_build_pct']:.1f}% of near OI) but put writers are still NET adding "
                     f"({pe_net_pct:+.1f}%), so there is no capitulation yet. Not a blast.")
         return ("CONFLICTED", "WAIT", "Put exits and call builds present, but no clear winner. Stand aside.")
     if base_bull:
-        if e["bull_force"] >= 2.2 * max(e["bear_force"], 0.1) and e["pe_net_flow"] > abs(e["ce_net_flow"]):
-            return ("BULLISH GAMMA BLAST", "BUY",
-                    f"Dominant put writing ({e['pe_build_pct']:.1f}%) + call exits ({e['ce_exit_pct']:.1f}%) overpowering call additions; "
-                    f"bull force {e['bull_force']:.1f} vs bear {e['bear_force']:.1f}.")
         if bull_dom:
             return ("SUPPORT BUILD (bullish lean)", "WAIT",
                     f"Heavy put writing ({e['pe_build_pct']:.1f}% of near OI) but call writers are still NET adding "
@@ -945,9 +900,8 @@ def calculate_jobber_microstructure(df, spot):
 
 def find_structure(df, spot, step, exp_move, call_wall, put_wall):
     reach = max(exp_move * 1.5, step * 4)
-    min_gap = 0.12 * step
-    res_pool = df[(df["Strike"] >= spot + min_gap) & (df["Strike"] <= spot + reach) & (df["CE_OI"] > 0)]
-    sup_pool = df[(df["Strike"] <= spot - min_gap) & (df["Strike"] >= spot - reach) & (df["PE_OI"] > 0)]
+    res_pool = df[(df["Strike"] >= spot + step) & (df["Strike"] <= spot + reach) & (df["CE_OI"] > 0)]
+    sup_pool = df[(df["Strike"] <= spot - step) & (df["Strike"] >= spot - reach) & (df["PE_OI"] > 0)]
 
     def pick(pool, col, chg_col, fallback, ok):
         if not pool.empty:
@@ -979,15 +933,10 @@ def compute_metrics(df, spot, prev_close, expiry_str, step):
     df = df.copy()
     df["CE_OI_Chg"] = df["CE_OI"] - df["CE_PrevOI"]
     df["PE_OI_Chg"] = df["PE_OI"] - df["PE_PrevOI"]
-    # Delta-adjusted premium change vs previous close (removes underlying index move confounder so gap-ups don't fake 100% put writing)
-    spot_chg_day = (spot - prev_close) if (prev_close and prev_close > 0) else 0.0
+    # premium change vs previous close (NaN when the previous close or today's LTP is missing)
     for s in ("CE", "PE"):
         ok = (df[f"{s}_PrevLTP"] > 0) & (df[f"{s}_LTP"] > 0)
-        raw_px_chg = df[f"{s}_LTP"] - df[f"{s}_PrevLTP"]
-        default_d = 0.5 if s == "CE" else -0.5
-        d_col = np.where(df[f"{s}_Delta"].abs() > 0, df[f"{s}_Delta"], default_d)
-        delta_move = np.clip(d_col, -0.99, 0.99) * spot_chg_day
-        df[f"{s}_PxChg"] = np.where(ok, raw_px_chg - delta_move, np.nan)
+        df[f"{s}_PxChg"] = np.where(ok, df[f"{s}_LTP"] - df[f"{s}_PrevLTP"], np.nan)
 
     ce_tot_all, pe_tot_all = float(df["CE_OI"].sum()), float(df["PE_OI"].sum())
     pcr = pe_tot_all / ce_tot_all if ce_tot_all > 0 else 1.0
@@ -1033,7 +982,7 @@ def compute_metrics(df, spot, prev_close, expiry_str, step):
     jobber = calculate_jobber_microstructure(df, spot)
 
     return {
-        "df": df, "near": near, "spot": spot, "step": step, "pcr": pcr, "expiry": str(expiry_str)[:10],
+        "df": df, "near": near, "spot": spot, "step": step, "pcr": pcr,
         "dce": dce, "dpe": dpe, "battle": interpret_oi_battle(dce, dpe, ce_tot_all, pe_tot_all),
         "atm_iv": atm_iv, "dte": dte, "exp_move": round(exp_move, 2),
         "t_years": t_years, "days_left": t_years * (365.0 if TIME_BASIS["mode"] == "calendar" else 252.0),
@@ -1306,11 +1255,9 @@ def chain_checks(m):
         add("Premium-confirmed writing", 0, "no previous-close premiums available", "flow")
 
     li = j["ladder_imbalance"]
-    checks.append({"name": "Ladder OI imbalance", "v": 1 if li >= 0.10 else -1 if li <= -0.10 else 0, "counted": False,
-                   "detail": f"{li:+.3f} (PE-heavy is +) [observe only: lagging multi-day OI]", "family": "positioning"})
-    checks.append({"name": "PCR (whole chain)", "v": 1 if m["pcr"] > 1.2 else -1 if m["pcr"] < 0.8 else 0, "counted": False,
-                   "detail": f"{m['pcr']:.2f} [observe only: lagging multi-day OI]", "family": "positioning"})
-    add("Bias score", 1 if m["score"] >= 55 else -1 if m["score"] <= 45 else 0, f"{m['score']}/100 {m['bias']}", "positioning")
+    add("Ladder OI imbalance", 1 if li >= 0.10 else -1 if li <= -0.10 else 0, f"{li:+.3f} (PE-heavy is +)", "positioning")
+    add("PCR (whole chain)", 1 if m["pcr"] > 1.2 else -1 if m["pcr"] < 0.8 else 0, f"{m['pcr']:.2f}", "positioning")
+    add("Bias score", 1 if m["score"] > 55 else -1 if m["score"] < 45 else 0, f"{m['score']}/100 {m['bias']}", "positioning")
 
     if m["dte"] > 2:
         add("Spot vs max pain", 0, f"{m['dte']}d to expiry: max-pain pull is weak, neutral", "volatility")
@@ -1321,53 +1268,33 @@ def chain_checks(m):
 
     thr = max(BASIS_MIN_PTS, 0.0004 * m["spot"])
     ex_b = m.get("excess_basis", 0.0)
-    rr_25 = m.get("rr_25", 0.0)
-    sv = 0
-    if m.get("surface_ok"):
-        if ex_b >= thr or (ex_b >= 0 and rr_25 >= 0.5):
-            sv = 1
-        elif ex_b <= -thr or (ex_b <= 0 and rr_25 <= -1.5):
-            sv = -1
+    sv = 1 if (m.get("surface_ok") and ex_b >= thr) else -1 if (m.get("surface_ok") and ex_b <= -thr) else 0
     on = USE_SURFACE_CHECK["on"]
     checks.append({"name": SURF_CHECK_NAME, "v": sv, "counted": on, "family": "volatility",
                    "detail": (f"F_syn {m['syn_fut']:,.1f} vs fair {m['fair_fwd']:,.1f} (excess {ex_b:+.1f}, needs ±{thr:.0f}) | "
-                              f"RR25 {rr_25:+.2f}" + ("" if on else " [observe only]")) if m.get("surface_ok")
+                              f"RR25 {m.get('rr_25', 0):+.2f}" + ("" if on else " [observe only]")) if m.get("surface_ok")
                    else "no balanced near-ATM call/put mids [observe only]"})
-
-    ign = m.get("ignition") or {}
-    if ign.get("dir", 0) != 0:
-        checks.append({"name": "Pre-Chart Ignition (15m velocity)", "v": int(ign["dir"]), "counted": True, "family": "volatility",
-                       "detail": f"{ign.get('label')}: {', '.join(ign.get('reasons', []))}"})
     return checks
 
 
 VETO_RE = re.compile(r"\b(REJECT|REJECTED|VETO|VETOED|DENY|DENIED|DECLINE|DECLINED|DISAPPROVE|DISAPPROVED|NOT APPROVED)\b")
 
 
-def select_buyer_contract(m, direction, allowed=None, target_spot=None, sl_spot=None, hold_min=30.0):
-    """Choose a liquid, near-ATM long option ranked by Gamma-per-Rupee + Delta + Spread (especially on 0DTE expiry day)."""
+def select_buyer_contract(m, direction, allowed=None):
+    """Choose a liquid, near-ATM long option. This ranks available quotes; it does not predict returns."""
     df = m.get("df")
     if df is None or df.empty or direction not in ("BUY", "SELL"):
         return None
     side = "CE" if direction == "BUY" else "PE"
-    is_call = side == "CE"
-    is_0dte = int(m.get("dte", 99)) == 0
-    sd = max(daily_sigma(m), 1.0)
-    impulse_pts = 0.25 * sd  # standard 15-min gamma impulse test
-    T0 = max(float(m.get("t_years") or 1 / 365.0), 1e-5)
-    dt_15m = 15.0 / (252.0 * 375.0)
-    T_15m = max(1e-6, T0 - dt_15m)
-
     rows = []
     for _, r in df.iterrows():
         strike = _n(r.get("Strike"))
         ltp = _n(r.get(f"{side}_LTP"))
         bid, ask = _n(r.get(f"{side}_Bid")), _n(r.get(f"{side}_Ask"))
         delta = _n(r.get(f"{side}_Delta"))
-        gamma = abs(_n(r.get(f"{side}_Gamma")))
         iv = _n(r.get(f"{side}_IV"))
         oi, vol = _n(r.get(f"{side}_OI")), _n(r.get(f"{side}_Vol"))
-        if not all(math.isfinite(x) for x in (strike, ltp, bid, ask, delta, gamma, iv, oi, vol)):
+        if not all(math.isfinite(x) for x in (strike, ltp, bid, ask, delta, iv, oi, vol)):
             continue
         if allowed is not None and strike not in allowed:
             continue
@@ -1376,106 +1303,26 @@ def select_buyer_contract(m, direction, allowed=None, target_spot=None, sl_spot=
         mid = (bid + ask) / 2.0
         spread_pct = (ask - bid) / mid * 100.0 if mid > 0 else 999.0
         abs_delta = abs(delta)
-        if not (0.30 <= abs_delta <= 0.75) or spread_pct > MAX_OPTION_SPREAD_PCT or vol <= 0:
+        # Favor 0.45-0.60 absolute delta, allow 0.30-0.70; reject very wide/illiquid quotes.
+        if not (0.30 <= abs_delta <= 0.70) or spread_pct > MAX_OPTION_SPREAD_PCT or vol <= 0:
             continue
-
-        # Gamma-to-Theta Efficiency Ratio:
-        # 1) Expected option gain on a 0.25σ underlying impulse: Δ*dS + 0.5*Γ*(dS^2)
-        gamma_burst_pts = abs_delta * impulse_pts + 0.5 * gamma * (impulse_pts ** 2)
-        # 2) Expected 15-minute Theta decay at flat spot
-        iv_use = iv if iv > 0 else float(m.get("atm_iv") or 12.0)
-        p_now = bs_price(m["spot"], strike, T0, iv_use, is_call)
-        p_15m = bs_price(m["spot"], strike, T_15m, iv_use, is_call)
-        theta_15m_pts = max(0.05, (p_now - p_15m) * (ask / p_now) if p_now > 0.1 else ask * 0.03)
-        gamma_theta_ratio = gamma_burst_pts / max(theta_15m_pts, 0.1)
-        gamma_per_rs = (gamma * 10000.0) / max(ask, 1.0)
-
-        # On 0DTE expiry, reward high Gamma-per-Rupee and high Gamma/Theta ratio; on normal days, standard delta/spread score
-        if is_0dte:
-            score = abs(abs_delta - 0.52) * 2.2 + spread_pct / 80.0 - min(gamma_per_rs, 1.5) * 0.45
-        else:
-            score = abs(abs_delta - 0.50) * 3.0 + spread_pct / 100.0 + abs(strike - m["spot"]) / max(m["step"], 1) * 0.025
-
-        rows.append({"option_type": "CALL" if is_call else "PUT", "side": side,
+        # Spread dominates score; then delta proximity to 0.50 and distance to spot.
+        score = abs(abs_delta - 0.50) * 3.0 + spread_pct / 100.0 + abs(strike - m["spot"]) / max(m["step"], 1) * 0.025
+        rows.append({"option_type": "CALL" if side == "CE" else "PUT", "side": side,
                      "strike": strike, "expiry": str(m.get("expiry", "")), "ltp": ltp,
                      "bid": bid, "ask": ask, "mid": mid, "spread_pct": spread_pct,
-                     "delta": delta, "gamma": round(gamma, 6), "gamma_per_rs": round(gamma_per_rs, 3),
-                     "theta_15m": round(theta_15m_pts, 2), "gamma_burst_pts": round(gamma_burst_pts, 2),
-                     "gamma_theta_ratio": round(gamma_theta_ratio, 2),
-                     "iv": iv, "oi": int(oi), "volume": int(vol), "score": score})
+                     "delta": delta, "iv": iv, "oi": int(oi), "volume": int(vol), "score": score})
     if not rows:
         return None
     best = min(rows, key=lambda x: x["score"])
-    premium = best["ask"]
+    premium = best["ask"]  # conservative manual-entry reference; never treat this as a fill
     best["entry_ref"] = round(premium, 2)
-    # DTE-scaled option stop & target percentages (prevents 5-DTE ₹200 options from needing a 35% / +₹70 move just to hit T1)
-    dte_now = int(m.get("dte", 99))
-    if is_0dte:
-        t1_pct = 30.0 if is_call else 35.0
-        t2_pct = 65.0 if is_call else 75.0
-        stop_pct = 18.0 if is_call else 20.0
-    elif dte_now == 1:
-        t1_pct = 22.0 if is_call else 25.0
-        t2_pct = 42.0 if is_call else 48.0
-        stop_pct = 18.0 if is_call else 20.0
-    else:
-        t1_pct = 18.0
-        t2_pct = 32.0
-        stop_pct = 18.0
-    best["stop_premium"] = round(max(0.05, premium * (1 - stop_pct / 100.0)), 2)
-    best["target1_premium"] = round(premium * (1 + t1_pct / 100.0), 2)
-    best["target2_premium"] = round(premium * (1 + t2_pct / 100.0), 2)
-    T1 = max(1e-5, T0 - (hold_min / (252.0 * 375.0)))
-    iv0 = best["iv"] or float(m.get("atm_iv") or 12.0)
-    if target_spot and sl_spot:
-        mod_t = reprice(premium, m["spot"], target_spot, best["strike"], T0, T1, iv0, iv0 * (0.96 if is_call else 1.03), is_call)
-        mod_sl = reprice(premium, m["spot"], sl_spot, best["strike"], T0, T1, iv0, iv0 * 0.95, is_call)
-        best["model_target_premium"] = round(mod_t, 2) if mod_t else None
-        best["model_stop_premium"] = round(mod_sl, 2) if mod_sl else None
-        # v17.6: Sync T1 with Black-Scholes wall target when the wall is realistic (>= +10% gain) and closer than fixed % T1
-        if mod_t and premium * 1.10 <= mod_t < best["target1_premium"]:
-            best["target1_premium"] = round(mod_t, 2)
+    best["stop_premium"] = round(max(0.05, premium * (1 - BUYER_STOP_PCT / 100.0)), 2)
+    best["target1_premium"] = round(premium * (1 + BUYER_TARGET1_PCT / 100.0), 2)
+    best["target2_premium"] = round(premium * (1 + BUYER_TARGET2_PCT / 100.0), 2)
     best["max_loss_per_unit"] = round(premium - best["stop_premium"], 2)
-    best["risk_note"] = (
-        f"{'0DTE GAMMA PLAN' if is_0dte else 'Asymmetric plan'} "
-        f"({'CALL ' + str(int(stop_pct)) + '% SL / +' + str(int(t1_pct)) + '% T1' if is_call else 'PUT ' + str(int(stop_pct)) + '% SL / +' + str(int(t1_pct)) + '% T1'} | "
-        f"Γ/Θ ratio {best['gamma_theta_ratio']:.1f}x, 15m Θ ≈ -₹{best['theta_15m']:.1f})."
-    )
+    best["risk_note"] = "Premium levels are fixed-percentage planning levels, not exchange orders or a modelled fill. Re-check live bid/ask before entry."
     return best
-
-
-def pick_tracking_contract(m, direction):
-    """v17.6 (from v16.1): nearest-ATM contract on the signal's side, used to paper-track real option bids
-    at +5/15/30/60m for ALL logged signals (validated and rejected)."""
-    df = m.get("df")
-    if df is None or df.empty or direction not in ("BUY", "SELL"):
-        return None
-    side = "CE" if direction == "BUY" else "PE"
-    spot, step = float(m["spot"]), float(m["step"])
-    atm = round(spot / step) * step
-    row = df[(df["Strike"] - atm).abs() < 1e-6]
-    if row.empty:
-        row = df.iloc[[int((df["Strike"] - spot).abs().values.argmin())]]
-    r = row.iloc[0]
-    bid, ask, ltp = _n(r.get(f"{side}_Bid")), _n(r.get(f"{side}_Ask")), _n(r.get(f"{side}_LTP"))
-    if ask <= 0:
-        ask = ltp
-    if bid <= 0:
-        bid = ltp
-    if ltp < MIN_PREMIUM or ask <= 0 or bid <= 0:
-        return None
-    return {"strike": float(r["Strike"]), "side": side, "ask0": round(ask, 2), "bid0": round(bid, 2)}
-
-
-def parkinson_intraday_vol(intraday):
-    """Annualised intraday realized volatility (%) from today's 1-min high/low bars using Parkinson's range estimator."""
-    bars = [b for b in (intraday or []) if b.get("h", 0) > 0 and b.get("l", 0) > 0 and b["h"] >= b["l"]]
-    if len(bars) < 10:
-        return None
-    sq_logs = [math.log(float(b["h"]) / float(b["l"])) ** 2 for b in bars]
-    var_bar = sum(sq_logs) / (4.0 * len(sq_logs) * math.log(2.0))
-    # 375 one-minute bars per NSE session * 252 trading days
-    return round(math.sqrt(max(0.0, var_bar) * 375.0 * 252.0) * 100.0, 1)
 
 
 # ============================================================
@@ -1494,8 +1341,8 @@ def session_phase(now, expiry_active=False):
         return "PRE-OPEN", True, "Market not open yet."
     if expiry_active and EXPIRY_CUTOFF_MIN <= t < 15 * 60 + 30:
         return "EXPIRY CUTOFF (after 2:30 pm)", True, "No new expiry-day entries after 2:30 pm: theta and gamma make late buying very hard."
-    if t < 9 * 60 + 35:
-        return "OPENING 20 MIN", True, "Opening volatility & stale OI in the first 20 minutes; wait for 09:35 IST."
+    if t < 9 * 60 + 25:
+        return "OPENING 10 MIN", True, "Spreads are wide and OI data is stale in the first 10 minutes."
     if t < 11 * 60 + 30:
         return "MORNING TREND WINDOW", False, ""
     if t < 13 * 60 + 30:
@@ -1530,15 +1377,9 @@ def daily_lock_status(now, trade_cap=None):
     reasons = []
     if d["max_loss"] and d["pnl"] <= -abs(float(d["max_loss"])):
         reasons.append(f"daily loss limit reached (P&L {d['pnl']:+,.0f} vs limit -{abs(float(d['max_loss'])):,.0f})")
-    churn_on = False
-    try:
-        churn_on = bool(load_auto_cfg().get("churn_mode"))
-    except Exception:
-        pass
-    if not churn_on:
-        cap_t = min(d["max_trades"], trade_cap) if (trade_cap and d["max_trades"]) else (trade_cap or d["max_trades"])
-        if cap_t and d["trades"] >= cap_t:
-            reasons.append(f"max trades per day reached ({d['trades']}/{cap_t})")
+    cap_t = min(d["max_trades"], trade_cap) if (trade_cap and d["max_trades"]) else (trade_cap or d["max_trades"])
+    if cap_t and d["trades"] >= cap_t:
+        reasons.append(f"max trades per day reached ({d['trades']}/{cap_t})")
     return bool(reasons), "; ".join(reasons), d
 
 
@@ -1774,33 +1615,6 @@ def expiry_context(m, intraday, hist, now):
                 b = {**best, "state": f"price beyond the {best['side']} wall {best['level']:,.0f} but OI changed {best['oi_chg_pct']:+.1f}%, not confirmed"}
     xc["B"] = b
 
-    # Playbook G (0DTE Gamma Wall Reversal): Strictly catches institutional Top/Bottom Trap reversals at a major OI wall
-    # when opposite exhaustion >= 60/100 and Spot has NOT already moved > 45 pts away from the wall/high/low.
-    g_strike = float(m.get("gamma_strike") or atm)
-    rev = m.get("reversal") or {}
-    exh = m.get("exh") or {}
-    fp_bias = str((m.get("fp") or {}).get("bias", "NEUTRAL"))
-    h_high = max((float(h.get("spot", spot)) for h in (hist or [])), default=spot)
-    h_low = min((float(h.get("spot", spot)) for h in (hist or [])), default=spot)
-    b_exh = int(((exh.get("buyer") or {}).get("score")) or 0) if exh.get("ready") else 0
-    s_exh = int(((exh.get("seller") or {}).get("score")) or 0) if exh.get("ready") else 0
-    g_pb = {"dir": 0, "confirmed": False, "level": g_strike, "state": "awaiting confirmed wall reversal (exhaustion >= 60)"}
-    if 9 * 60 + 45 <= t < EXPIRY_CUTOFF_MIN:
-        if rev.get("dir") == -1 and b_exh >= 60 and fp_bias != "BULLISH" and (h_high - spot) <= 0.9 * step:
-            piv_lvl = float(rev.get("level") or g_strike)
-            g_pb = {
-                "dir": -1, "confirmed": True, "level": piv_lvl,
-                "state": f"0DTE Top-Trap Reversal DOWN from {piv_lvl:,.0f} ({rev.get('label')}, buyer exh {b_exh}/100)"
-            }
-        elif rev.get("dir") == 1 and s_exh >= 60 and fp_bias != "BEARISH" and (spot - h_low) <= 0.9 * step:
-            piv_lvl = float(rev.get("level") or g_strike)
-            g_pb = {
-                "dir": 1, "confirmed": True, "level": piv_lvl,
-                "state": f"0DTE Bottom-Trap Reversal UP from {piv_lvl:,.0f} ({rev.get('label')}, seller exh {s_exh}/100)"
-            }
-    xc["G"] = g_pb
-    xc["time_stops"]["G"] = 20
-
     # Pin guard (late day): spot sitting on max pain with a compressed range
     pin = float(m.get("max_pain") or spot)
     last30 = cs[-30:]
@@ -1878,7 +1692,7 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
     xc = m.get("xctx") or {}
     playbook, time_stop, b_lead, be_info = None, None, False, None
     if xc.get("active"):
-        trig_a, trig_b, trig_g = xc.get("A", {}), xc.get("B", {}), xc.get("G", {})
+        trig_a, trig_b = xc.get("A", {}), xc.get("B", {})
         d_eng = {"BUY": 1, "SELL": -1}.get(sig, 0)
         tag_b = "C" if xc.get("late") else "B"
         if d_eng != 0:
@@ -1886,11 +1700,9 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
                 playbook = tag_b
             elif xc.get("a_window") and trig_a.get("dir") == d_eng:
                 playbook = "A"
-            elif trig_g.get("confirmed") and trig_g.get("dir") == d_eng:
-                playbook = "G"
             if playbook is None:
                 notes.append(f"{sig} rejected: expiry day needs a playbook trigger in the same direction. "
-                             f"A (ORB): {trig_a.get('state', 'n/a')}. B/C (wall): {trig_b.get('state', 'n/a')}. G (Gamma unpin): {trig_g.get('state', 'n/a')}.")
+                             f"A (opening-range break): {trig_a.get('state', 'n/a')}. B/C (wall break): {trig_b.get('state', 'n/a')}.")
                 sig = "WAIT"
         elif xc.get("b_window") and trig_b.get("confirmed"):
             sig = "BUY" if trig_b["dir"] > 0 else "SELL"
@@ -1941,63 +1753,15 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
             sig = "WAIT"
 
     exh = m.get("exh") or {}
-    rev_now = m.get("reversal") or {}
-    is_rev = (sig == "BUY" and rev_now.get("dir") == 1) or (sig == "SELL" and rev_now.get("dir") == -1)
-    _reg_lbl = str((m.get("market_regime") or {}).get("label", "")).upper()
-    _fp_now = m.get("fp") or {}
-    _is_blast = ("BULLISH GAMMA" in str(m.get("status", "")) and sig == "BUY") or ("BEARISH GAMMA" in str(m.get("status", "")) and sig == "SELL")
-    _is_trend = (sig == "BUY" and _reg_lbl == "TRENDING UP") or (sig == "SELL" and _reg_lbl == "TRENDING DOWN")
-    _fp_aligned = (sig == "BUY" and _fp_now.get("bias") == "BULLISH") or (sig == "SELL" and _fp_now.get("bias") == "BEARISH")
-    _strong_trend = _is_trend or (_is_blast and _fp_aligned)
-
     if sig != "WAIT" and exh.get("ready"):
         mine = exh["buyer"] if sig == "BUY" else exh["seller"]
         who = "buyer" if sig == "BUY" else "seller"
-        _exh_cap = 55 if _strong_trend else 35
-        if not is_rev and mine["score"] >= _exh_cap:
-            notes.append(f"{sig} rejected: anti-chase guard ({who} exhaustion is already {mine['score']}/100 >= {_exh_cap}; do not chase an extended move without a reversal setup).")
-            sig = "WAIT"
-        elif mine["flag"] == "CONFIRMED" and P("exh_veto"):
+        if mine["flag"] == "CONFIRMED" and P("exh_veto"):
             notes.append(f"{sig} rejected: {who} exhaustion confirmed ({mine['score']}/100), the move you would join is running out of fuel.")
             sig = "WAIT"
         elif mine["flag"] in ("CONFIRMED", "WATCH"):
             notes.append(f"Caution: {who} exhaustion {mine['flag'].lower()} ({mine['score']}/100)"
                          + ("" if P("exh_veto") else " [advisory only: exhaustion veto is off]") + ".")
-
-    if sig != "WAIT" and not is_rev and _fp_now.get("ok") and _fp_now.get("vwap_dist") is not None:
-        v_dist = float(_fp_now["vwap_dist"])
-        _vwap_lim = 0.65 if _strong_trend else 0.28
-        if (sig == "BUY" and v_dist > _vwap_lim) or (sig == "SELL" and v_dist < -_vwap_lim):
-            notes.append(f"{sig} rejected: anti-VWAP-chase guard (futures price is stretched {v_dist:+.2f}σ beyond session VWAP, limit ±{_vwap_lim:.2f}σ).")
-            sig = "WAIT"
-
-    # v17.6 Logic Guard 1: Opposite 30-min Futures Build-Up Veto (even when fp_bias is NEUTRAL)
-    if sig != "WAIT" and not is_rev and _fp_now.get("ok"):
-        _q30 = str(_fp_now.get("quad30", "")).upper()
-        if (sig == "BUY" and _q30 == "SHORT BUILD-UP") or (sig == "SELL" and _q30 == "LONG BUILD-UP"):
-            notes.append(f"{sig} rejected: opposite 30-min futures build-up ({_q30}).")
-            sig = "WAIT"
-
-    # v17.6 Logic Guard 2: Extreme Basis + Skew Tail-Risk Divergence Guard
-    if sig != "WAIT" and not is_rev and m.get("surface_ok"):
-        _exb = float(m.get("excess_basis") or 0.0)
-        _rr25 = float(m.get("rr_25") or 0.0)
-        if sig == "BUY" and _exb < -18.0 and _rr25 < -1.8:
-            notes.append(f"{sig} rejected: extreme futures discount ({_exb:+.1f} pts) + heavy put skew ({_rr25:+.2f}).")
-            sig = "WAIT"
-        elif sig == "SELL" and _exb > 18.0 and _rr25 > 1.8:
-            notes.append(f"{sig} rejected: extreme futures premium ({_exb:+.1f} pts) + heavy call skew ({_rr25:+.2f}).")
-            sig = "WAIT"
-
-    # v17.6 Logic Guard 3: Positive-GEX + Balanced Accumulation Mean-Reversion Chop Guard
-    if sig != "WAIT" and not is_rev and str(m.get("gex_regime", "")).upper() == "POSITIVE" and str(m.get("status", "")).upper() == "BALANCED ACCUMULATION":
-        _v_d = float(_fp_now.get("vwap_dist") or 0.0) if _fp_now.get("ok") else 0.0
-        if _fp_now.get("ok") and abs(_v_d) > 0.22:
-            notes.append(f"{sig} rejected: POSITIVE-GEX balanced chop requires tight VWAP proximity ({_v_d:+.2f}σ > ±0.22σ).")
-            sig = "WAIT"
-        elif _fp_now.get("ok") and not _fp_aligned:
-            notes.append(f"{sig} rejected: POSITIVE-GEX balanced chop requires strictly aligned futures footprint (currently {_fp_now.get('bias')}).")
-            sig = "WAIT"
 
     if sig != "WAIT" and FP is not None:
         blocked, why = FP.footprint_veto(sig, m.get("fp"), P("fp_mode"))
@@ -2025,40 +1789,23 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
                 notes.append(f"{sig} rejected: futures footprint is stale ({fp_age:.0f}s old; maximum 180s).")
                 sig = "WAIT"
 
-    # Regime gate (v16.4: supports Pre-Chart Ignition for range breakouts AND Institutional Reversal override for top/bottom turns).
+    # Regime gate (v16: three modes). STRICT = original behaviour, SOFT = only block against a clear trend, OFF = advisory.
     if sig != "WAIT":
         regime_info = m.get("market_regime") or {}
         regime = str(regime_info.get("label", "UNAVAILABLE")).upper()
         mode = str(P("regime_gate"))
-        ign = m.get("ignition") or {}
-        rev = m.get("reversal") or {}
-        # Non-reversal breakouts in RANGE/CHOP or TRANSITION/MIXED require strong 3/5 Pre-Chart Ignition; Reversals at walls require 2/5
-        ign_aligned = (sig == "BUY" and ign.get("dir") == 1 and ign.get("score", 0) >= 3) or (
-            sig == "SELL" and ign.get("dir") == -1 and ign.get("score", 0) >= 3)
-        rev_aligned = (sig == "BUY" and rev.get("dir") == 1) or (sig == "SELL" and rev.get("dir") == -1)
         against = (sig == "BUY" and regime == "TRENDING DOWN") or (sig == "SELL" and regime == "TRENDING UP")
         if mode.startswith("STRICT"):
-            if against:
-                if rev_aligned:
-                    notes.append(f"Institutional Reversal override ({rev.get('label')}): catching turn at {rev.get('level'):,.0f} before {regime} regime flips.")
-                else:
-                    notes.append(f"{sig} rejected: signal direction conflicts with market regime {regime} (no reversal footprint at wall).")
-                    sig = "WAIT"
-            elif regime not in ("TRENDING UP", "TRENDING DOWN"):
-                if rev_aligned:
-                    notes.append(f"Institutional Reversal override ({rev.get('label')}): entering turn at {rev.get('level'):,.0f}.")
-                elif ign_aligned:
-                    notes.append(f"Pre-Chart Ignition override ({ign.get('label')}): entering early before spot-history regime flips.")
-                else:
-                    notes.append(f"{sig} rejected: market regime is {regime} and no Pre-Chart Ignition / Reversal override is active (STRICT regime gate).")
-                    sig = "WAIT"
+            if regime not in ("TRENDING UP", "TRENDING DOWN"):
+                notes.append(f"{sig} rejected: market regime is {regime}. Wait for a clearer directional regime (STRICT regime gate).")
+                sig = "WAIT"
+            elif against or (sig == "BUY" and regime != "TRENDING UP") or (sig == "SELL" and regime != "TRENDING DOWN"):
+                notes.append(f"{sig} rejected: signal direction conflicts with market regime {regime}.")
+                sig = "WAIT"
         elif mode.startswith("SOFT"):
             if against:
-                if rev_aligned:
-                    notes.append(f"Institutional Reversal override ({rev.get('label')}): catching counter-trend turn at {rev.get('level'):,.0f}.")
-                else:
-                    notes.append(f"{sig} rejected: it fights a clear trend (regime {regime}) without a reversal footprint.")
-                    sig = "WAIT"
+                notes.append(f"{sig} rejected: it fights a clear trend (regime {regime}).")
+                sig = "WAIT"
             elif regime not in ("TRENDING UP", "TRENDING DOWN"):
                 notes.append(f"Caution: regime is {regime}, not a clear trend; expect chop and keep size small.")
         elif against:
@@ -2086,21 +1833,13 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
 
     if sig != "WAIT" and playbook:
         _unit = max(0.5 * float(m.get("exp_move") or 0.0), 0.6 * m["step"])
-        _lvl = (xc.get("or_high") if sig == "BUY" else xc.get("or_low")) if playbook == "A" else (
-            (xc.get("G") or {}).get("level") if playbook == "G" else (xc.get("B") or {}).get("level")
-        )
+        _lvl = (xc.get("or_high") if sig == "BUY" else xc.get("or_low")) if playbook == "A" else (xc.get("B") or {}).get("level")
         if _lvl is None:
             _lvl = entry
-        _stop_dist = max(min(abs(entry - _lvl) + 0.2 * m["step"], 0.8 * m["step"]), 0.45 * m["step"])
+        _stop_dist = max(abs(entry - _lvl) + 0.2 * m["step"], 0.3 * _unit)
         target = entry + _unit if sig == "BUY" else entry - _unit
-        # If an unbroken OI wall sits closer than target (and we are not in a confirmed B/C wall-break of that wall), cap target at the wall
-        if playbook not in ("B", "C"):
-            if sig == "BUY" and res and entry < res["level"] < target:
-                target = res["level"]
-            elif sig == "SELL" and sup and target < sup["level"] < entry:
-                target = sup["level"]
         sl = entry - _stop_dist if sig == "BUY" else entry + _stop_dist
-        notes.append(f"Expiry playbook levels: target {target:,.0f}, stop {sl:,.0f} ( anchored to {_lvl:,.0f}).")
+        notes.append(f"Expiry playbook levels: target {target:,.0f} (half the remaining expected move), stop {sl:,.0f} (back through {_lvl:,.0f}).")
     if sig != "WAIT" and not playbook:
         if res is None or sup is None:
             notes.append(f"{sig} rejected: no usable OI wall on one side of spot.")
@@ -2110,27 +1849,11 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
         else:
             target, sl = sup["level"], res["level"] + sl_buf
         if sig != "WAIT":
-            sd_now = daily_sigma(m)
-            cap = float(P("target_cap")) * sd_now
+            cap = float(P("target_cap")) * daily_sigma(m)
             if cap > 0 and abs(target - entry) > cap:
                 new_t = entry + cap if sig == "BUY" else entry - cap
                 notes.append(f"Target trimmed from {target:,.0f} to {new_t:,.0f} (more than {P('target_cap'):.1f} daily sigma away is not a realistic intraday target).")
                 target = new_t
-            max_sl_dist = 0.38 * sd_now
-            min_sl_floor = 3.0 * (sd_now / math.sqrt(75.0))
-            if abs(entry - sl) > max_sl_dist and max_sl_dist > 0:
-                pocket = float((m.get("jobber") or {}).get("pocket_support") or 0.0)
-                if sig == "BUY" and (entry - max_sl_dist) <= pocket < entry:
-                    new_sl = pocket - sl_buf * 0.5
-                elif sig == "SELL" and entry < pocket <= (entry + max_sl_dist):
-                    new_sl = pocket + sl_buf * 0.5
-                else:
-                    new_sl = (entry - max_sl_dist) if sig == "BUY" else (entry + max_sl_dist)
-                notes.append(f"Stop tightened from stale OI wall {sl:,.0f} to {new_sl:,.0f} (0.38σ / pocket-flow stop).")
-                sl = new_sl
-            if abs(entry - sl) < min_sl_floor:
-                sl = (entry - min_sl_floor) if sig == "BUY" else (entry + min_sl_floor)
-                notes.append(f"Stop widened to {sl:,.0f} (3x 5-min σ noise floor).")
 
     if sig != "WAIT":
         risk = abs(entry - sl)
@@ -2143,7 +1866,7 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
                          f"(target {target:,.0f}, SL {sl:,.0f}) is below 1:{_min_rr:.1f}.")
             sig, target, sl, rr = "WAIT", None, None, None
 
-    buyer_plan = select_buyer_contract(m, sig, xctx_allowed(m, sig), target_spot=target, sl_spot=sl) if sig in ("BUY", "SELL") else None
+    buyer_plan = select_buyer_contract(m, sig, xctx_allowed(m, sig)) if sig in ("BUY", "SELL") else None
     if sig in ("BUY", "SELL") and buyer_plan is None:
         notes.append(f"{sig} rejected: no near-ATM option passed premium, bid/ask, spread (≤{MAX_OPTION_SPREAD_PCT:.0f}%), OI, nonzero traded volume and delta filters. Do not chase an illiquid contract.")
         sig, target, sl, rr = "WAIT", None, None, None
@@ -2155,13 +1878,7 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
             sig, target, sl, rr, buyer_plan, playbook = "WAIT", None, None, None, None, None
         elif be_info["vs_avg30"] is not None and be_info["vs_avg30"] > 1.5:
             notes.append(f"Caution: breakeven needs {be_info['required_move']:,.0f} pts, {be_info['vs_avg30']:.1f}x today's typical 30-minute range.")
-        gt_ratio = float(buyer_plan.get("gamma_theta_ratio") or 0.0)
-        if sig in ("BUY", "SELL") and gt_ratio > 0 and gt_ratio < 1.35:
-            notes.append(f"{sig} rejected: 0DTE Gamma/Theta efficiency ratio ({gt_ratio:.2f}x) is below 1.35x "
-                         f"(15m expected gamma burst +₹{buyer_plan.get('gamma_burst_pts', 0):.1f} vs 15m theta decay -₹{buyer_plan.get('theta_15m', 0):.1f}).")
-            sig, target, sl, rr, buyer_plan, playbook = "WAIT", None, None, None, None, None
-    proposed_sig = ({1: "BUY", -1: "SELL", 0: "WAIT"}[direction]) if engine_led else ai_sig
-    return {"signal": sig, "ai_signal": ai_sig, "proposed_signal": proposed_sig, "entry": entry, "target": target, "sl": sl, "rr": rr,
+    return {"signal": sig, "ai_signal": ai_sig, "entry": entry, "target": target, "sl": sl, "rr": rr,
             "confidence": conf, "note": " ".join(notes), "checks": checks, "net": net, "lean": lean,
             "families": families, "direction": direction, "buyer_plan": buyer_plan,
             "playbook": playbook, "time_stop_min": time_stop, "expiry_day": bool(xc.get("active")), "breakeven": be_info}
@@ -2207,24 +1924,19 @@ def fetch_daily_candles(scrip, seg, token, client_id):
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_intraday_candles(scrip, seg, token, client_id):
-    """Today's 1-minute index candles (with prior-session fallback between 00:00 and 09:15 IST)."""
-    now = datetime.now(IST)
-    today_dt = now.date()
-    days_try = [today_dt.isoformat()] if (now.hour * 60 + now.minute) >= (9 * 60 + 16) else []
-    days_try += [(today_dt - timedelta(days=k)).isoformat() for k in range(1, 5)]
-    for day_iso in days_try:
-        r = requests.post(f"{BASE_URL}/charts/intraday", headers=auth_headers(token, client_id),
-                          json={"securityId": str(scrip), "exchangeSegment": seg, "instrument": "INDEX",
-                                "interval": "1", "fromDate": f"{day_iso} 09:15:00", "toDate": f"{day_iso} 15:30:00"},
-                          timeout=12)
-        if not r.ok:
-            continue
-        d = r.json() or {}
-        n = len(d.get("close", []))
-        if n > 0:
-            return [{"ts": _epoch(d["timestamp"][i]), "h": float(d["high"][i]), "l": float(d["low"][i]),
-                     "c": float(d["close"][i])} for i in range(n)]
-    raise RuntimeError("empty intraday response")
+    """Today's 1-minute index candles (used so target/stop touches and MFE/MAE see intrabar wicks)."""
+    today = datetime.now(IST).date().isoformat()
+    r = requests.post(f"{BASE_URL}/charts/intraday", headers=auth_headers(token, client_id),
+                      json={"securityId": str(scrip), "exchangeSegment": seg, "instrument": "INDEX",
+                            "interval": "1", "fromDate": f"{today} 09:15:00", "toDate": f"{today} 15:30:00"},
+                      timeout=12)
+    check(r)
+    d = r.json()
+    n = len(d.get("close", []))
+    if n == 0:
+        raise RuntimeError("empty intraday response")
+    return [{"ts": _epoch(d["timestamp"][i]), "h": float(d["high"][i]), "l": float(d["low"][i]),
+             "c": float(d["close"][i])} for i in range(n)]
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
@@ -2234,56 +1946,7 @@ def _fp_future(idx_name, override, day):
 
 @st.cache_data(ttl=25, show_spinner=False)
 def _fp_candles(sec_id, token, client_id, day, segment="NSE_FNO"):
-    try:
-        return FP.fetch_future_candles(sec_id, token, client_id, segment=segment)
-    except Exception as first_err:
-        # Off-hours / post-midnight fallback: walk back up to 5 prior calendar days if today's session hasn't opened yet
-        today_dt = datetime.now(IST).date()
-        for d_back in range(1, 6):
-            prev_iso = (today_dt - timedelta(days=d_back)).isoformat()
-            for f_dt, t_dt in ((f"{prev_iso} 09:15:00", f"{prev_iso} 15:30:00"), (prev_iso, prev_iso)):
-                try:
-                    r = requests.post(
-                        f"{BASE_URL}/charts/intraday",
-                        headers=auth_headers(token, client_id),
-                        json={
-                            "securityId": str(sec_id),
-                            "exchangeSegment": segment,
-                            "instrument": "FUTIDX",
-                            "interval": "1",
-                            "oi": True,
-                            "fromDate": f_dt,
-                            "toDate": t_dt,
-                        },
-                        timeout=12,
-                    )
-                    if not r.ok:
-                        continue
-                    d = r.json() or {}
-                    if "data" in d and isinstance(d["data"], dict):
-                        d = d["data"]
-                    closes = d.get("close") or []
-                    n = len(closes)
-                    if n == 0:
-                        continue
-                    ts_arr = d.get("timestamp") or [0] * n
-                    opens = d.get("open") or closes
-                    highs = d.get("high") or closes
-                    lows = d.get("low") or closes
-                    vols = d.get("volume") or [0.0] * n
-                    ois = d.get("open_interest") or d.get("oi") or [0.0] * n
-                    return [{
-                        "ts": _epoch(ts_arr[i]) if ts_arr[i] else time.time(),
-                        "o": float(opens[i] or 0.0),
-                        "h": float(highs[i] or 0.0),
-                        "l": float(lows[i] or 0.0),
-                        "c": float(closes[i] or 0.0),
-                        "v": float(vols[i] or 0.0),
-                        "oi": float(ois[i] or 0.0),
-                    } for i in range(n)]
-                except Exception:
-                    continue
-        raise first_err
+    return FP.fetch_future_candles(sec_id, token, client_id, segment=segment)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -2464,225 +2127,6 @@ def lb_flows(then, now, spot, window):
             out["ce_build" if dc > 0 else "ce_unw"] += abs(dc)
             out["pe_build" if dp > 0 else "pe_unw"] += abs(dp)
     return out
-
-
-def pre_chart_ignition(m, hist, lookback_min=15):
-    """Detects pre-chart institutional accumulation/distribution from rolling basis, skew, and OI velocity
-    BEFORE spot price breaks out on the chart (blocks late chasing after a >0.22σ 15m spot spike)."""
-    out = {"dir": 0, "score": 0, "label": "NONE", "reasons": [], "age_min": 0.0, "fl_edge": 0.0, "spot_move_sig": 0.0}
-    if not hist or len(hist) < 2:
-        return out
-    now_snap = hist[-1]
-    ref = _nearest(hist[:-1], now_snap["ts"] - lookback_min * 60)
-    age_min = (now_snap["ts"] - ref["ts"]) / 60.0
-    if age_min < 3.0:
-        return out
-    out["age_min"] = round(age_min, 1)
-
-    sd = max(daily_sigma(m), 1.0)
-    spot_move = float(m["spot"]) - float(ref.get("spot", m["spot"]))
-    spot_move_sig = spot_move / sd
-    out["spot_move_sig"] = round(spot_move_sig, 3)
-
-    b_now, b_ref = m.get("excess_basis"), ref.get("excess_basis")
-    b_shift = (b_now - b_ref) if (b_now is not None and b_ref is not None) else 0.0
-
-    rr_now, rr_ref = m.get("rr_25"), ref.get("rr_25")
-    rr_shift = (rr_now - rr_ref) if (rr_now is not None and rr_ref is not None) else 0.0
-
-    fl = lb_flows(ref, now_snap, m["spot"], near_window(m["spot"], m["step"]))
-    bull_fl = fl["pe_build"] + fl["ce_unw"]
-    bear_fl = fl["ce_build"] + fl["pe_unw"]
-    fl_ratio = (bull_fl / bear_fl) if bear_fl > 0 else (9.9 if bull_fl > 0 else 1.0)
-    inv_ratio = (bear_fl / bull_fl) if bull_fl > 0 else (9.9 if bear_fl > 0 else 1.0)
-    pe_net_r = (fl["pe_build"] - fl["pe_unw"]) / fl["pe_base"] * 100.0 if fl["pe_base"] > 0 else 0.0
-    ce_net_r = (fl["ce_build"] - fl["ce_unw"]) / fl["ce_base"] * 100.0 if fl["ce_base"] > 0 else 0.0
-    out["fl_edge"] = round(pe_net_r - ce_net_r, 2)
-
-    pcr_shift = float(now_snap.get("pcr", 1.0)) - float(ref.get("pcr", 1.0))
-
-    bull_pts, bear_pts = 0, 0
-    bull_reasons, bear_reasons = [], []
-    if b_shift >= 8.0:
-        bull_pts += 1
-        bull_reasons.append(f"basis +{b_shift:.1f} pts/{age_min:.0f}m")
-    elif b_shift <= -8.0:
-        bear_pts += 1
-        bear_reasons.append(f"basis {b_shift:.1f} pts/{age_min:.0f}m")
-
-    if rr_shift >= 0.25:
-        bull_pts += 1
-        bull_reasons.append(f"25Δ skew +{rr_shift:.2f}")
-    elif rr_shift <= -0.25:
-        bear_pts += 1
-        bear_reasons.append(f"25Δ skew {rr_shift:.2f}")
-
-    if fl_ratio >= 1.5 and bull_fl > 0:
-        bull_pts += 1
-        bull_reasons.append(f"rolling OI flow {fl_ratio:.1f}x bull")
-    elif inv_ratio >= 1.5 and bear_fl > 0:
-        bear_pts += 1
-        bear_reasons.append(f"rolling OI flow {inv_ratio:.1f}x bear")
-
-    if pcr_shift >= 0.035:
-        bull_pts += 1
-        bull_reasons.append(f"PCR +{pcr_shift:.3f}")
-    elif pcr_shift <= -0.035:
-        bear_pts += 1
-        bear_reasons.append(f"PCR {pcr_shift:.3f}")
-
-    fp = m.get("fp") or {}
-    q30 = str(fp.get("quad30", "")) if fp.get("ok") else ""
-    if fp.get("ok"):
-        if q30 == "LONG BUILD-UP" and float(fp.get("vwap_dist") or 0) > 0:
-            bull_pts += 1
-            bull_reasons.append("fut LONG BUILD-UP")
-        elif q30 == "SHORT BUILD-UP" and float(fp.get("vwap_dist") or 0) < 0.20:
-            bear_pts += 1
-            bear_reasons.append("fut SHORT BUILD-UP")
-
-    # Anti-conflict & anti-chase guard:
-    # 1) Rolling OI flow must agree (>= 1.5x)
-    # 2) Futures must not be building in the opposite direction (SHORT BUILD-UP blocks Bull Ignition; LONG BUILD-UP blocks Bear Ignition)
-    # 3) Spot must not have already exhausted >0.22σ (~55 pts) in the same direction over the last 15m (unless it's a reversal)
-    ex_b_now = float(b_now if b_now is not None else 0.0)
-    bull_ok = (fl_ratio >= 1.5) and (q30 != "SHORT BUILD-UP") and (spot_move_sig <= 0.22) and (ex_b_now >= -8.0)
-    bear_ok = (inv_ratio >= 1.5) and (q30 != "LONG BUILD-UP") and (spot_move_sig >= -0.22) and (ex_b_now <= 8.0)
-
-    if bull_pts >= 2 and bull_pts > bear_pts and bull_ok:
-        out.update({"dir": 1, "score": bull_pts, "reasons": bull_reasons, "label": f"⚡ BULLISH PRE-CHART IGNITION ({bull_pts}/5)"})
-    elif bear_pts >= 2 and bear_pts > bull_pts and bear_ok:
-        out.update({"dir": -1, "score": bear_pts, "reasons": bear_reasons, "label": f"⚡ BEARISH PRE-CHART IGNITION ({bear_pts}/5)"})
-    else:
-        out["reasons"] = bull_reasons if bull_pts >= bear_pts else bear_reasons
-    return out
-
-
-def detect_institutional_reversal(m, hist):
-    """Detects two-way pre-chart institutional trend reversals at key structural levels (XYZ):
-    - UPTREND -> BEARISH REVERSAL (Top Trap at Resistance Wall -> BUY PUT)
-    - DOWNTREND -> BULLISH REVERSAL (Bottom Trap at Support Wall -> BUY CALL)
-    Fires BEFORE the 12-snapshot spot-price regime flips."""
-    out = {"dir": 0, "type": "NONE", "level": None, "label": "NONE", "reasons": [], "action": "WAIT"}
-    if not hist or len(hist) < 3:
-        return out
-
-    spot = float(m["spot"])
-    sd = max(daily_sigma(m), 1.0)
-    prev_close = float(m.get("prev_close") or spot)
-    h_high = max(float(h.get("spot", spot)) for h in hist)
-    h_low = min(float(h.get("spot", spot)) for h in hist)
-
-    up_ext = max(spot - h_low, spot - prev_close, 0.0) / sd
-    dn_ext = max(h_high - spot, prev_close - spot, 0.0) / sd
-
-    regime = str((m.get("market_regime") or {}).get("label", "")).upper()
-    ign = m.get("ignition") or {}
-    exh = m.get("exh") or {}
-    jobber = m.get("jobber") or {}
-    mt = str(jobber.get("micro_turn", ""))
-    res = (m.get("struct") or {}).get("res")
-    sup = (m.get("struct") or {}).get("sup")
-
-    # --- 1. Check UPTREND -> BEARISH REVERSAL (Top Trap at Resistance XYZ) ---
-    was_uptrend = (regime == "TRENDING UP") or (up_ext >= 0.35)
-    res_lvl = float(res["level"]) if res else float(m.get("call_wall") or spot)
-    near_res = abs(res_lvl - spot) / sd <= 0.38
-    b_exh_score = int(((exh.get("buyer") or {}).get("score")) or 0) if exh.get("ready") else 0
-    bear_absorb = ("BEARISH" in mt) or (b_exh_score >= 50) or (near_res and res and float(res.get("chg") or 0) > 0)
-
-    if was_uptrend and bear_absorb and ign.get("dir") == -1 and ign.get("score", 0) >= 2:
-        reasons = [f"extended +{up_ext:.2f}σ / {regime or 'UP'}"]
-        if near_res:
-            reasons.append(f"testing CE wall {res_lvl:,.0f}")
-        if b_exh_score >= 50:
-            reasons.append(f"buyer exhaustion {b_exh_score}/100")
-        if "BEARISH" in mt:
-            reasons.append(mt)
-        reasons.extend(ign.get("reasons", [])[:2])
-        out.update({
-            "dir": -1,
-            "type": "TOP_REVERSAL_BEARISH",
-            "level": res_lvl,
-            "action": "BUY PUT (Reversal)",
-            "label": f"🔄 BEARISH REVERSAL AT {res_lvl:,.0f} (Top Trap)",
-            "reasons": reasons,
-        })
-        return out
-
-    # --- 2. Check DOWNTREND -> BULLISH REVERSAL (Bottom Trap at Support XYZ) ---
-    was_downtrend = (regime == "TRENDING DOWN") or (dn_ext >= 0.35)
-    sup_lvl = float(sup["level"]) if sup else float(m.get("put_wall") or spot)
-    near_sup = abs(spot - sup_lvl) / sd <= 0.38
-    s_exh_score = int(((exh.get("seller") or {}).get("score")) or 0) if exh.get("ready") else 0
-    bull_absorb = ("BULLISH" in mt) or (s_exh_score >= 50) or (near_sup and sup and float(sup.get("chg") or 0) > 0)
-
-    if was_downtrend and bull_absorb and ign.get("dir") == 1 and ign.get("score", 0) >= 2:
-        reasons = [f"dropped -{dn_ext:.2f}σ / {regime or 'DOWN'}"]
-        if near_sup:
-            reasons.append(f"defending PE wall {sup_lvl:,.0f}")
-        if s_exh_score >= 50:
-            reasons.append(f"seller exhaustion {s_exh_score}/100")
-        if "BULLISH" in mt:
-            reasons.append(mt)
-        reasons.extend(ign.get("reasons", [])[:2])
-        out.update({
-            "dir": 1,
-            "type": "BOTTOM_REVERSAL_BULLISH",
-            "level": sup_lvl,
-            "action": "BUY CALL (Reversal)",
-            "label": f"🔄 BULLISH REVERSAL AT {sup_lvl:,.0f} (Bottom Trap)",
-            "reasons": reasons,
-        })
-        return out
-
-    return out
-
-
-def apply_rolling_flow_blend(m, hist, lookback_min=15, rolling_weight=0.6):
-    """Blends 60% rolling 15-minute OI change with 40% full-day OI change once >=10 min of snapshots exist,
-    so midday reversals flip the Dual-Force Engine within minutes instead of lagging behind morning OI."""
-    if not hist or len(hist) < 3:
-        return
-    now_snap = hist[-1]
-    ref = _nearest(hist[:-1], now_snap["ts"] - lookback_min * 60)
-    age_min = (now_snap["ts"] - ref["ts"]) / 60.0
-    if age_min < 8.0:
-        return
-    ref_oi = ref.get("oi") or {}
-    if not ref_oi:
-        return
-    near = m["near"].copy()
-    r_ce, r_pe = [], []
-    for _, row in near.iterrows():
-        k = str(int(row["Strike"]))
-        if k in ref_oi:
-            c0, p0 = ref_oi[k]
-            r_ce.append(float(row["CE_OI"]) - float(c0))
-            r_pe.append(float(row["PE_OI"]) - float(p0))
-        else:
-            r_ce.append(float(row["CE_OI_Chg"]))
-            r_pe.append(float(row["PE_OI_Chg"]))
-    # Scale rolling 15m delta to comparable magnitude and blend 60/40 with full-day change
-    near["CE_OI_Chg"] = rolling_weight * (np.array(r_ce) * 2.5) + (1.0 - rolling_weight) * near["CE_OI_Chg"].to_numpy(float)
-    near["PE_OI_Chg"] = rolling_weight * (np.array(r_pe) * 2.5) + (1.0 - rolling_weight) * near["PE_OI_Chg"].to_numpy(float)
-    m["near"] = near
-    m["status"], m["engine_signal"], m["desc"] = detect_gamma_blast(near)
-    m["engine"] = engine_sums(near)
-    blended_df = m["df"].assign(
-        CE_OI_Chg=m["df"]["Strike"].map(dict(zip(near["Strike"], near["CE_OI_Chg"]))).fillna(m["df"]["CE_OI_Chg"]),
-        PE_OI_Chg=m["df"]["Strike"].map(dict(zip(near["Strike"], near["PE_OI_Chg"]))).fillna(m["df"]["PE_OI_Chg"]),
-    )
-    m["jobber"] = calculate_jobber_microstructure(blended_df, m["spot"])
-    # Sync Bias Score with blended near-spot rolling OI flow so midday reversals flip positioning vote immediately
-    ce_near_tot = max(float(near["CE_OI"].sum()), 1.0)
-    pe_near_tot = max(float(near["PE_OI"].sum()), 1.0)
-    dce_blended = float(near["CE_OI_Chg"].sum())
-    dpe_blended = float(near["PE_OI_Chg"].sum())
-    m["score"], m["bias"] = compute_bias(
-        dce_blended, dpe_blended, ce_near_tot, pe_near_tot,
-        m["spot"], m.get("prev_close"), m["pcr"], m.get("excess_basis", 0.0), m.get("rr_25", 0.0), daily_sigma(m)
-    )
 
 
 def exhaustion(hist, m, prev_close, lb_min):
@@ -3013,10 +2457,8 @@ def weekly_expiry_analysis(m):
         out["warnings"].append("DTE ≤ 3: gamma risk is elevated.")
     if tot > 0 and chg / tot > 0.03:
         out["warnings"].append(f"Heavy near-spot OI churn: {chg / tot * 100:.1f}% of near-spot OI changed.")
-    if m.get("gex_regime") == "NEGATIVE" and m["dte"] <= 5:
-        out["warnings"].append("NEGATIVE (assumed) gamma regime this close to expiry: moves can accelerate rapidly.")
-    elif m.get("gex_regime") == "POSITIVE" and m["dte"] <= 5:
-        out["warnings"].append("POSITIVE (assumed) gamma regime this close to expiry: high pinning and theta-crush risk.")
+    if m.get("gex_regime") in ("POSITIVE", "NEGATIVE") and m["dte"] <= 5:
+        out["warnings"].append(f"{m['gex_regime']} (assumed) gamma regime this close to expiry: moves can accelerate.")
     out["risk_level"] = "HIGH" if m["dte"] <= 1 or len(out["warnings"]) >= 3 else "MODERATE" if m["dte"] <= 3 else "LOW"
     return out
 
@@ -3052,34 +2494,24 @@ def calendar_view(m1, info, expiries, expiry, token, client_id, prev_close):
 
 def cross_index_view(token, client_id):
     rows = []
-    now = datetime.now(IST)
     for name, inf in INDEX_MAP.items():
         try:
-            exps = active_expiries(get_expiries(inf["scrip"], inf["seg"], token, client_id), now)
+            exps = get_expiries(inf["scrip"], inf["seg"], token, client_id)
             if not exps:
-                rows.append({"Index": name, "Expiry": "—", "Note": "no active expiries"})
+                rows.append({"Index": name, "Note": "no expiries"})
                 continue
-            exp_use = exps[0]
-            sp, d = fetch_option_chain(inf["scrip"], inf["seg"], exp_use, token, client_id)
-            if (d.empty or sp <= 0) and inf.get("alt_scrip"):
-                sp, d = fetch_option_chain(inf["alt_scrip"], inf["seg"], exp_use, token, client_id)
+            sp, d = fetch_option_chain(inf["scrip"], inf["seg"], exps[0], token, client_id)
             if d.empty or sp <= 0:
-                rows.append({"Index": name, "Expiry": str(exp_use)[:10], "Note": "no chain data"})
+                rows.append({"Index": name, "Note": "no chain data"})
                 continue
             pc, _src = fetch_prev_close(inf["scrip"], inf["seg"], token, client_id)
-            mm = compute_metrics(d, sp, pc or 0.0, exp_use, inf["step"])
-            if mm["atm_iv"] < 5.0 and len(exps) > 1:
-                exp_use = exps[1]
-                sp2, d2 = fetch_option_chain(inf["scrip"], inf["seg"], exp_use, token, client_id)
-                if not d2.empty and sp2 > 0:
-                    sp, d = sp2, d2
-                    mm = compute_metrics(d, sp, pc or 0.0, exp_use, inf["step"])
-            rows.append({"Index": name, "Expiry": str(exp_use)[:10], "Spot": round(sp, 1),
+            mm = compute_metrics(d, sp, pc or 0.0, exps[0], inf["step"])
+            rows.append({"Index": name, "Expiry": str(exps[0])[:10], "Spot": round(sp, 1),
                          "Chg %": round((sp - pc) / pc * 100, 2) if pc else None,
                          "ATM IV": round(mm["atm_iv"], 1), "PCR": round(mm["pcr"], 2),
-                         "Gamma (assumed)": mm["gex_regime"], "Bias": mm["bias"], "Engine": mm["status"], "Note": "OK"})
+                         "Gamma (assumed)": mm["gex_regime"], "Bias": mm["bias"], "Engine": mm["status"], "Note": ""})
         except Exception as e:
-            rows.append({"Index": name, "Expiry": "ERR", "Note": str(e)[:80]})
+            rows.append({"Index": name, "Note": str(e)[:80]})
     return pd.DataFrame(rows)
 
 
@@ -3100,17 +2532,6 @@ def wilson_lower(wins, n, z=1.28):
     centre = p + z * z / (2.0 * n)
     adj = z * math.sqrt((p * (1.0 - p) + z * z / (4.0 * n)) / n)
     return max(0.0, (centre - adj) / den)
-
-
-def wilson_interval(wins, n, z=1.96):
-    """Two-sided 95% Wilson confidence interval in percent."""
-    if n <= 0:
-        return (float("nan"), float("nan"))
-    p = wins / n
-    den = 1.0 + z * z / n
-    centre = p + z * z / (2.0 * n)
-    adj = z * math.sqrt((p * (1.0 - p) + z * z / (4.0 * n)) / n)
-    return ((centre - adj) / den * 100.0, (centre + adj) / den * 100.0)
 
 
 def kelly_sizing(sig, card, capital, max_risk_pct):
@@ -3146,906 +2567,6 @@ def kelly_sizing(sig, card, capital, max_risk_pct):
 # ============================================================
 # SCORECARD, ALERTS & DATA HEALTH
 # ============================================================
-# ============================================================
-# v17.1 AUTOMATED TRADE EXECUTION & DYNAMIC PARTIAL-SPLIT ENGINE
-# ============================================================
-AUTO_TRADES_FILE = os.path.join(DATA_DIR, "bbg_auto_trades_v17.json")
-AUTO_CONFIG_FILE = os.path.join(DATA_DIR, "bbg_auto_config_v17.json")
-SCRIP_MASTER_CSV_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
-
-DEFAULT_LOT_SIZES = {
-    "NIFTY 50": 65,
-    "NIFTY BANK": 30,
-    "FINNIFTY": 60,
-    "MIDCPNIFTY": 120,
-    "SENSEX": 20,
-}
-
-DEFAULT_AUTO_CFG = {
-    "enabled": False,
-    "mode": "PAPER (Simulated Live Quotes)",
-    "allowed_indices": ["NIFTY 50"],
-    "lots_by_index": {"NIFTY 50": 1, "NIFTY BANK": 1, "FINNIFTY": 1, "MIDCPNIFTY": 1, "SENSEX": 1},
-    "product_type": "INTRADAY",
-    "max_open_positions": 1,
-    "t1_rule": "AUTO_SPLIT",          # AUTO_SPLIT: 1 lot -> trail SL to cost till T2; >=2 lots -> book 50% lots at T1 & trail rest to T2
-    "exit_on_reversal": True,         # Immediately close open position when an opposite Reversal / Validated Signal fires
-    "t2_runner_rule": "CHANDELIER",   # CHANDELIER: once T2 is hit, lock SL at T2 & trail 15% below peak Bid until reversal/stop; BOOK_T2: exit 100% at T2
-    "t2_trail_pct": 15.0,
-    "churn_mode": False,              # Continuous Scalp/Churn Mode: book fixed 10-20 option pts per trade & keep re-entering until 15:20 IST
-    "churn_target_pts": 15.0,
-    "churn_sl_pts": 15.0,
-    "churn_be_lock_pts": 8.0,
-    "churn_cooldown_min": 3,
-}
-
-
-def load_auto_cfg():
-    cfg = _load_json(AUTO_CONFIG_FILE, {}) or {}
-    out = dict(DEFAULT_AUTO_CFG)
-    out.update({k: v for k, v in cfg.items() if k in out})
-    lots = dict(DEFAULT_AUTO_CFG["lots_by_index"])
-    if isinstance(cfg.get("lots_by_index"), dict):
-        for k, v in cfg["lots_by_index"].items():
-            try:
-                lots[k] = max(1, int(v))
-            except (TypeError, ValueError):
-                pass
-    out["lots_by_index"] = lots
-    if not isinstance(out.get("allowed_indices"), list):
-        out["allowed_indices"] = ["NIFTY 50"]
-    return out
-
-
-def save_auto_cfg(cfg):
-    _save_json(AUTO_CONFIG_FILE, cfg)
-
-
-def load_auto_trades():
-    rows = _load_json(AUTO_TRADES_FILE, [])
-    return rows if isinstance(rows, list) else []
-
-
-def save_auto_trades(rows):
-    _save_json(AUTO_TRADES_FILE, rows)
-
-
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
-def _load_optidx_master():
-    import io
-    r = requests.get(SCRIP_MASTER_CSV_URL, timeout=15)
-    r.raise_for_status()
-    cols = [
-        "SEM_EXM_EXCH_ID", "SEM_SEGMENT", "SEM_SMST_SECURITY_ID",
-        "SEM_INSTRUMENT_NAME", "SEM_TRADING_SYMBOL", "SEM_EXPIRY_DATE",
-        "SEM_STRIKE_PRICE", "SEM_OPTION_TYPE", "SEM_LOT_UNITS",
-    ]
-    df = pd.read_csv(io.StringIO(r.text), usecols=lambda c: c in cols, low_memory=False)
-    return df[df["SEM_INSTRUMENT_NAME"].astype(str).str.strip().isin(["OPTIDX", "OPTFUT"])].copy()
-
-
-def resolve_option_contract_dhan(idx_name, expiry_str, strike, side):
-    """Return {'security_id': str, 'lot_size': int, 'segment': str, 'symbol': str} for an index option."""
-    sym_map = {
-        "NIFTY 50": "NIFTY", "NIFTY BANK": "BANKNIFTY",
-        "FINNIFTY": "FINNIFTY", "MIDCPNIFTY": "MIDCPNIFTY", "SENSEX": "SENSEX",
-    }
-    root = sym_map.get(idx_name, idx_name)
-    seg = "BSE_FNO" if idx_name == "SENSEX" else "NSE_FNO"
-    lot_fallback = DEFAULT_LOT_SIZES.get(idx_name, 75)
-    exp_iso = str(expiry_str)[:10]
-    side_u = "CE" if str(side).upper().startswith("C") else "PE"
-    try:
-        df = _load_optidx_master()
-        tsym = df["SEM_TRADING_SYMBOL"].astype(str).str.strip().str.upper()
-        sub = df[tsym.str.startswith(root + "-") | tsym.str.startswith(root)].copy()
-        sub["exp_iso"] = sub["SEM_EXPIRY_DATE"].astype(str).str.slice(0, 10)
-        sub["stk_num"] = pd.to_numeric(sub["SEM_STRIKE_PRICE"], errors="coerce")
-        sub["opt_type"] = sub["SEM_OPTION_TYPE"].astype(str).str.strip().str.upper()
-        m_sub = sub[
-            (sub["exp_iso"] == exp_iso)
-            & ((sub["stk_num"] - float(strike)).abs() < 0.5)
-            & (sub["opt_type"] == side_u)
-        ]
-        if not m_sub.empty:
-            row = m_sub.iloc[0]
-            sec_id = str(int(float(row["SEM_SMST_SECURITY_ID"])))
-            lot_sz = int(float(row.get("SEM_LOT_UNITS") or lot_fallback))
-            return {
-                "security_id": sec_id,
-                "lot_size": max(1, lot_sz),
-                "segment": seg,
-                "symbol": str(row.get("SEM_TRADING_SYMBOL") or f"{root} {exp_iso} {int(strike)} {side_u}"),
-            }
-    except Exception:
-        pass
-    return {
-        "security_id": "",
-        "lot_size": lot_fallback,
-        "segment": seg,
-        "symbol": f"{root} {exp_iso} {int(strike)} {side_u}",
-    }
-
-
-def place_dhan_option_order(sec_id, segment, txn_type, qty, limit_price, product_type, token, client_id, tag=""):
-    """Submit a marketable LIMIT option order to Dhan v2 /orders API."""
-    if not sec_id:
-        return {"ok": False, "orderId": None, "error": "securityId could not be resolved from Dhan scrip master"}
-    tick_price = round(max(0.05, float(limit_price)) * 20.0) / 20.0
-    payload = {
-        "dhanClientId": str(client_id),
-        "correlationId": (tag or f"bbg_{int(time.time())}")[:24],
-        "transactionType": str(txn_type).upper(),
-        "exchangeSegment": str(segment),
-        "productType": str(product_type or "INTRADAY").upper(),
-        "orderType": "LIMIT",
-        "validity": "DAY",
-        "securityId": str(sec_id),
-        "quantity": int(qty),
-        "price": tick_price,
-    }
-    try:
-        r = requests.post(f"{BASE_URL}/orders", headers=auth_headers(token, client_id), json=payload, timeout=10)
-        data = r.json() if r.content else {}
-        if r.ok and (data.get("orderId") or data.get("orderStatus")):
-            return {"ok": True, "orderId": str(data.get("orderId", "")), "status": str(data.get("orderStatus", "SENT")), "error": ""}
-        return {"ok": False, "orderId": None, "error": f"HTTP {r.status_code}: {str(data)[:160]}"}
-    except Exception as e:
-        return {"ok": False, "orderId": None, "error": str(e)[:160]}
-
-
-def fetch_dhan_order_fill(order_id, token, client_id, wait_sec=1.5):
-    """Poll Dhan v2 GET /orders/{orderId} to retrieve real averageTradedPrice and filledQty."""
-    if not order_id or str(order_id).startswith(("PAPER", "ERR")):
-        return None
-    try:
-        if wait_sec > 0:
-            time.sleep(wait_sec)
-        r = requests.get(f"{BASE_URL}/orders/{order_id}", headers=auth_headers(token, client_id), timeout=8)
-        if not r.ok:
-            return None
-        d = r.json() if r.content else {}
-        if isinstance(d, list) and d:
-            d = d[0]
-        avg_px = float(d.get("averageTradedPrice") or 0.0)
-        filled_q = int(d.get("filledQty") or d.get("tradedQuantity") or 0)
-        status = str(d.get("orderStatus") or "")
-        if avg_px > 0:
-            return {"avg_price": round(avg_px, 2), "filled_qty": filled_q, "status": status}
-    except Exception:
-        pass
-    return None
-
-
-def auto_initiate_from_signals(new_recs, auto_cfg, token, client_id, alert_cfg, now_ist, live_sig=None, idx_name=None, expiry=None):
-    """Automatically initiate an option trade when a new VALIDATED signal fires for an enabled index."""
-    if not auto_cfg.get("enabled"):
-        return []
-    trades = load_auto_trades()
-    open_trades = [t for t in trades if t.get("status") == "OPEN"]
-    max_open = int(auto_cfg.get("max_open_positions") or 1)
-    allowed_idx = set(auto_cfg.get("allowed_indices") or [])
-    existing_sig_ids = {t.get("signal_id") for t in trades}
-    initiated = []
-    churn_on = bool(auto_cfg.get("churn_mode"))
-
-    # In Churn Mode, allow continuous re-entry on the live validated signal after cooldown (until 15:15 IST)
-    candidates = list(new_recs or [])
-    if (churn_on and live_sig and live_sig.get("signal") in ("BUY", "SELL") and live_sig.get("buyer_plan")
-            and idx_name in allowed_idx and len(open_trades) < max_open
-            and (now_ist.hour * 60 + now_ist.minute) < (15 * 60 + 15)):
-        cd_sec = max(1, int(auto_cfg.get("churn_cooldown_min") or 3)) * 60
-        last_idx_ts = max(
-            (float(t.get("exit_ts") or t.get("entry_ts") or 0.0) for t in trades if t.get("index") == idx_name),
-            default=0.0,
-        )
-        if (now_ist.timestamp() - last_idx_ts) >= cd_sec and not any(r.get("kind") == "VALIDATED" and r.get("index") == idx_name for r in candidates):
-            bp = live_sig["buyer_plan"]
-            candidates.append({
-                "id": f"CHURN_{int(now_ist.timestamp())}",
-                "kind": "VALIDATED",
-                "date": now_ist.date().isoformat(),
-                "index": idx_name,
-                "expiry": str(expiry)[:10],
-                "signal": live_sig["signal"],
-                "option_strike": bp["strike"],
-                "option_type": bp["option_type"],
-                "option_expiry": str(expiry)[:10],
-                "option_entry_ref": bp["entry_ref"],
-                "option_ask": bp["ask"],
-                "option_stop": bp["stop_premium"],
-                "option_target1": bp["target1_premium"],
-                "option_target2": bp["target2_premium"],
-                "time_stop_min": live_sig.get("time_stop_min") or 20,
-            })
-
-    for r in candidates:
-        if r.get("kind") != "VALIDATED" or r.get("option_strike") is None:
-            continue
-        if r.get("id") in existing_sig_ids:
-            continue
-        idx_nm = r.get("index")
-        if idx_nm not in allowed_idx:
-            continue
-        if len(open_trades) >= max_open:
-            break
-
-        strike = float(r["option_strike"])
-        opt_type = str(r.get("option_type") or ("CALL" if r.get("signal") == "BUY" else "PUT"))
-        side = "CE" if opt_type == "CALL" else "PE"
-        exp_str = str(r.get("option_expiry") or r.get("expiry"))[:10]
-        c_info = resolve_option_contract_dhan(idx_nm, exp_str, strike, side)
-        lots = max(1, int((auto_cfg.get("lots_by_index") or {}).get(idx_nm, 1)))
-        lot_size = int(c_info["lot_size"])
-        qty = lots * lot_size
-        entry_ref = float(r.get("option_entry_ref") or r.get("option_ask") or 10.0)
-        limit_px = round(entry_ref * 1.01 * 20.0) / 20.0  # +1% marketable limit buffer
-
-        is_live_api = str(auto_cfg.get("mode", "")).startswith("LIVE")
-        if is_live_api:
-            ord_res = place_dhan_option_order(
-                c_info["security_id"], c_info["segment"], "BUY", qty, limit_px,
-                auto_cfg.get("product_type", "INTRADAY"), token, client_id, tag=f"ent_{r['id']}"
-            )
-            ord_id = ord_res.get("orderId") or "ERR"
-            ord_note = ord_res.get("status") if ord_res.get("ok") else f"ORDER ERROR: {ord_res.get('error')}"
-            if not ord_res.get("ok"):
-                t_rec = {
-                    "trade_id": f"AT_{r['id']}", "signal_id": r["id"], "date": r.get("date"),
-                    "entry_time": now_ist.strftime("%H:%M:%S"), "exit_time": now_ist.strftime("%H:%M:%S"),
-                    "entry_ts": now_ist.timestamp(), "index": idx_nm, "expiry": exp_str,
-                    "strike": strike, "option_type": opt_type, "side": side,
-                    "symbol": c_info["symbol"], "security_id": c_info["security_id"], "segment": c_info["segment"],
-                    "initial_lots": lots, "lots": 0, "lot_size": lot_size, "initial_qty": qty, "qty": 0, "mode": "LIVE",
-                    "entry_price": entry_ref, "last_price": entry_ref, "peak_price": entry_ref,
-                    "sl_price": float(r.get("option_stop") or entry_ref * 0.8),
-                    "t1_price": float(r.get("option_target1") or entry_ref * 1.25),
-                    "t2_price": float(r.get("option_target2") or entry_ref * 1.50),
-                    "t1_hit": False, "t1_booked_lots": 0, "t1_booked_qty": 0, "t1_booked_price": None,
-                    "partial_realized_pnl": 0.0, "time_stop_min": r.get("time_stop_min") or 30,
-                    "status": "ORDER_FAILED", "exit_price": None, "exit_reason": ord_note,
-                    "unrealized_pnl": 0.0, "realized_pnl": 0.0, "pnl_pct": 0.0, "entry_order_id": ord_id,
-                }
-                trades.append(t_rec)
-                save_auto_trades(trades)
-                continue
-            # v17.6: Sync real broker fill price via GET /v2/orders/{orderId} and re-anchor SL/T1/T2
-            _fill_info = fetch_dhan_order_fill(ord_id, token, client_id, wait_sec=1.5)
-            if _fill_info and _fill_info["avg_price"] > 0:
-                _old_ref = entry_ref
-                entry_ref = _fill_info["avg_price"]
-                ord_note = f"{_fill_info['status']} @ ₹{entry_ref:.2f}"
-                if _fill_info["filled_qty"] > 0:
-                    qty = _fill_info["filled_qty"]
-                if _old_ref > 0:
-                    _ratio = entry_ref / _old_ref
-                    for _k in ("option_stop", "option_target1", "option_target2"):
-                        if r.get(_k):
-                            r[_k] = round(float(r[_k]) * _ratio, 2)
-        else:
-            ord_id = f"PAPER_{int(time.time())}"
-            ord_note = "PAPER_FILLED"
-
-        if churn_on:
-            c_tgt = float(auto_cfg.get("churn_target_pts") or 15.0)
-            c_sl = float(auto_cfg.get("churn_sl_pts") or 15.0)
-            c_be = float(auto_cfg.get("churn_be_lock_pts") or 8.0)
-            sl_px = round(max(0.05, entry_ref - c_sl), 2)
-            t1_px = round(entry_ref + c_tgt, 2)
-            t2_px = round(entry_ref + c_tgt * 1.5, 2)
-            plan_txt = f"CHURN SCALP: Book 100% at +{c_tgt:.0f} pts (₹{t1_px:.2f}) | SL -{c_sl:.0f} pts (₹{sl_px:.2f}) | BE Lock at +{c_be:.0f} pts"
-        else:
-            sl_px = round(float(r.get("option_stop") or entry_ref * 0.8), 2)
-            t1_px = round(float(r.get("option_target1") or entry_ref * 1.25), 2)
-            t2_px = round(float(r.get("option_target2") or entry_ref * 1.50), 2)
-            plan_txt = (
-                f"1-Lot Plan: Trail SL to Cost at T1 (₹{t1_px:.2f}) & Hold 100% for T2 (₹{t2_px:.2f})"
-                if lots == 1
-                else f"Multi-Lot Split Plan: Sell {lots // 2} of {lots} lots at T1 (₹{t1_px:.2f}) & Trail remaining {lots - (lots // 2)} lot(s) at Cost to T2 (₹{t2_px:.2f})"
-            )
-
-        t_rec = {
-            "trade_id": f"AT_{r['id']}", "signal_id": r["id"], "date": r.get("date"),
-            "entry_time": now_ist.strftime("%H:%M:%S"), "exit_time": None,
-            "entry_ts": now_ist.timestamp(), "exit_ts": None, "index": idx_nm, "expiry": exp_str,
-            "strike": strike, "option_type": opt_type, "side": side,
-            "symbol": c_info["symbol"], "security_id": c_info["security_id"], "segment": c_info["segment"],
-            "initial_lots": lots, "lots": lots, "lot_size": lot_size, "initial_qty": qty, "qty": qty,
-            "mode": "LIVE" if is_live_api else "PAPER", "churn_mode": churn_on,
-            "entry_price": round(entry_ref, 2), "last_price": round(entry_ref, 2), "peak_price": round(entry_ref, 2),
-            "sl_price": sl_px, "t1_price": t1_px, "t2_price": t2_px,
-            "t1_hit": False, "t1_booked_lots": 0, "t1_booked_qty": 0, "t1_booked_price": None,
-            "partial_realized_pnl": 0.0, "time_stop_min": r.get("time_stop_min") or 30,
-            "status": "OPEN", "exit_price": None, "exit_reason": "",
-            "unrealized_pnl": 0.0, "realized_pnl": 0.0, "pnl_pct": 0.0,
-            "entry_order_id": ord_id, "order_note": ord_note, "plan_summary": plan_txt,
-        }
-        trades.append(t_rec)
-        open_trades.append(t_rec)
-        initiated.append(t_rec)
-
-        if alert_cfg.get("enabled"):
-            msg = (
-                f"🤖 AUTO-TRADE INITIATED ({t_rec['mode']})\n"
-                f"{idx_nm} | BUY {t_rec['symbol']}\n"
-                f"Lots: {lots} ({qty} qty) @ ₹{t_rec['entry_price']:.2f} | Order ID: {ord_id}\n"
-                f"Auto SL: ₹{t_rec['sl_price']:.2f} | T1: ₹{t_rec['t1_price']:.2f} | T2: ₹{t_rec['t2_price']:.2f}\n"
-                f"Strategy: {plan_txt}"
-            )
-            fire_alert(f"auto_init_{t_rec['trade_id']}", msg, 60, alert_cfg)
-
-    if initiated:
-        save_auto_trades(trades)
-    return initiated
-
-
-def partial_book_at_t1(t, mark_px, auto_cfg, token, client_id, alert_cfg, now_ist):
-    """When lots >= 2 and T1 is hit: sell half the lots (cur_lots // 2) at T1 and trail remaining lots' SL to entry cost."""
-    cur_lots = int(t.get("lots") or 1)
-    lot_sz = int(t.get("lot_size") or 75)
-    ent = float(t.get("entry_price") or mark_px)
-    mark_px = round(max(0.05, float(mark_px)), 2)
-
-    # Trail stop-loss to entry cost (breakeven) for whatever lots remain
-    t["t1_hit"] = True
-    t["sl_price"] = round(max(float(t.get("sl_price") or 0.0), ent), 2)
-
-    if cur_lots < 2:
-        # 1 Lot rule: do not sell at T1; trail SL to entry cost and hold 100% for T2!
-        if alert_cfg.get("enabled"):
-            msg = (
-                f"🛡️ T1 HIT (1-LOT TRAIL ACTIVE) — {t.get('mode')}\n"
-                f"{t.get('index')} | {t.get('symbol')}\n"
-                f"Live ₹{mark_px:.2f} >= T1 ₹{t.get('t1_price', 0):.2f} | Holding 1 lot ({t.get('qty')} qty) for T2 ₹{t.get('t2_price', 0):.2f}\n"
-                f"Stop-Loss trailed to Entry Cost: ₹{t['sl_price']:.2f} (Risk-Free Runner)"
-            )
-            fire_alert(f"auto_t1_trail_{t['trade_id']}", msg, 60, alert_cfg)
-        return
-
-    # >= 2 Lots rule: sell half of the lots (cur_lots // 2) at T1 and trail the remaining lots to T2
-    lots_to_sell = max(1, cur_lots // 2)
-    qty_to_sell = lots_to_sell * lot_sz
-    rem_lots = cur_lots - lots_to_sell
-    rem_qty = rem_lots * lot_sz
-
-    if t.get("mode") == "LIVE" and t.get("security_id"):
-        lim_px = round(max(0.05, mark_px * 0.985) * 20.0) / 20.0
-        ord_res = place_dhan_option_order(
-            t["security_id"], t.get("segment", "NSE_FNO"), "SELL", qty_to_sell, lim_px,
-            auto_cfg.get("product_type", "INTRADAY"), token, client_id, tag=f"t1_{t['signal_id']}"
-        )
-        t["t1_order_id"] = ord_res.get("orderId") or f"ERR:{ord_res.get('error', '')[:40]}"
-    else:
-        t["t1_order_id"] = f"PAPER_T1_{int(time.time())}"
-
-    part_pnl = round((mark_px - ent) * qty_to_sell, 2)
-    t["t1_booked_lots"] = lots_to_sell
-    t["t1_booked_qty"] = qty_to_sell
-    t["t1_booked_price"] = mark_px
-    t["partial_realized_pnl"] = round(float(t.get("partial_realized_pnl") or 0.0) + part_pnl, 2)
-    t["realized_pnl"] = t["partial_realized_pnl"]
-    t["lots"] = rem_lots
-    t["qty"] = rem_qty
-    t["unrealized_pnl"] = round((mark_px - ent) * rem_qty, 2)
-
-    try:
-        dr = load_daily_risk(now_ist)
-        dr["pnl"] = round(float(dr.get("pnl", 0.0)) + part_pnl, 2)
-        save_daily_risk(dr)
-    except Exception:
-        pass
-
-    if alert_cfg.get("enabled"):
-        msg = (
-            f"🎯 T1 PARTIAL PROFIT BOOKED ({t.get('mode')})\n"
-            f"{t.get('index')} | {t.get('symbol')}\n"
-            f"Sold {lots_to_sell} of {cur_lots} lots ({qty_to_sell} qty) @ ₹{mark_px:.2f} | Banked P&L: ₹{part_pnl:+,.2f}\n"
-            f"Remaining Runner: {rem_lots} lot(s) ({rem_qty} qty) trailing at Cost SL ₹{t['sl_price']:.2f} → Target T2 ₹{t.get('t2_price', 0):.2f}"
-        )
-        fire_alert(f"auto_t1_part_{t['trade_id']}", msg, 60, alert_cfg)
-
-
-def close_auto_trade_record(t, exit_px, reason, auto_cfg, token, client_id, alert_cfg, now_ist):
-    """Close remaining open lots of an auto-trade (fires SELL order if in LIVE mode) and update total realized P&L."""
-    exit_px = round(max(0.05, float(exit_px)), 2)
-    rem_qty = int(t.get("qty") or 0)
-    if t.get("mode") == "LIVE" and t.get("security_id") and rem_qty > 0:
-        lim_px = round(max(0.05, exit_px * 0.985) * 20.0) / 20.0
-        ord_res = place_dhan_option_order(
-            t["security_id"], t.get("segment", "NSE_FNO"), "SELL", rem_qty, lim_px,
-            auto_cfg.get("product_type", "INTRADAY"), token, client_id, tag=f"ex_{t['signal_id']}"
-        )
-        t["exit_order_id"] = ord_res.get("orderId") or f"ERR:{ord_res.get('error', '')[:40]}"
-    else:
-        t["exit_order_id"] = f"PAPER_EX_{int(time.time())}"
-
-    ent = float(t.get("entry_price") or 0.0)
-    init_qty = int(t.get("initial_qty") or rem_qty or 1)
-    rem_pnl = round((exit_px - ent) * rem_qty, 2)
-    part_pnl = float(t.get("partial_realized_pnl") or 0.0)
-    total_pnl = round(part_pnl + rem_pnl, 2)
-    pnl_pct = round((total_pnl / (ent * init_qty) * 100.0) if (ent > 0 and init_qty > 0) else 0.0, 2)
-
-    t["status"] = "CLOSED"
-    t["exit_price"] = exit_px
-    t["last_price"] = exit_px
-    t["exit_time"] = now_ist.strftime("%H:%M:%S")
-    t["exit_ts"] = now_ist.timestamp()
-    t["exit_reason"] = reason + (f" (after T1 partial +{t.get('t1_booked_lots')}L @ ₹{t.get('t1_booked_price'):.2f})" if t.get("t1_booked_lots") else "")
-    t["realized_pnl"] = total_pnl
-    t["unrealized_pnl"] = 0.0
-    t["pnl_pct"] = pnl_pct
-
-    try:
-        dr = load_daily_risk(now_ist)
-        dr["pnl"] = round(float(dr.get("pnl", 0.0)) + rem_pnl, 2)
-        dr["trades"] = int(dr.get("trades", 0)) + 1
-        save_daily_risk(dr)
-    except Exception:
-        pass
-
-    if alert_cfg.get("enabled"):
-        em = "🎯" if total_pnl > 0 else "🛑"
-        msg = (
-            f"{em} AUTO-TRADE CLOSED ({t.get('mode')}) — {t['exit_reason']}\n"
-            f"{t.get('index')} | {t.get('symbol')}\n"
-            f"Entry ₹{ent:.2f} → Exit ₹{exit_px:.2f} ({pnl_pct:+.1f}%) | Total Lots: {t.get('initial_lots', t.get('lots'))}\n"
-            f"Total Realized P&L: ₹{total_pnl:+,.2f}"
-        )
-        fire_alert(f"auto_cls_{t['trade_id']}_{int(time.time())}", msg, 1, alert_cfg)
-
-
-def check_opposite_reversal_exit(t, m, sig):
-    """Returns (should_exit, reason) if an opposite Institutional Reversal, opposite Validated Signal,
-    or confirmed Exhaustion + opposite Pre-Chart Ignition fires against an open position."""
-    if m is None:
-        return False, ""
-    side = t.get("side", "CE")  # "CE" (long Call) or "PE" (long Put)
-    rev = m.get("reversal") or {}
-    ign = m.get("ignition") or {}
-    exh = m.get("exh") or {}
-    val_sig = (sig or {}).get("signal", "WAIT")
-
-    if side == "CE":
-        if rev.get("dir") == -1:
-            return True, f"OPPOSITE REVERSAL EXIT ({rev.get('label')})"
-        if val_sig == "SELL":
-            return True, "OPPOSITE VALIDATED SELL SIGNAL"
-        b_exh = int(((exh.get("buyer") or {}).get("score")) or 0) if exh.get("ready") else 0
-        if b_exh >= 67 and ign.get("dir") == -1 and int(ign.get("score") or 0) >= 3:
-            return True, f"PROFIT PROTECT EXIT (Buyer Exhaustion {b_exh}/100 + {ign.get('label')})"
-    else:
-        if rev.get("dir") == 1:
-            return True, f"OPPOSITE REVERSAL EXIT ({rev.get('label')})"
-        if val_sig == "BUY":
-            return True, "OPPOSITE VALIDATED BUY SIGNAL"
-        s_exh = int(((exh.get("seller") or {}).get("score")) or 0) if exh.get("ready") else 0
-        if s_exh >= 67 and ign.get("dir") == 1 and int(ign.get("score") or 0) >= 3:
-            return True, f"PROFIT PROTECT EXIT (Seller Exhaustion {s_exh}/100 + {ign.get('label')})"
-
-    return False, ""
-
-
-def update_auto_trades_live(idx_name, current_expiry, option_df, auto_cfg, token, client_id, alert_cfg, now_ist, m=None, sig=None):
-    """Refresh live LTP/Bid, unrealized P&L, immediate Reversal Exit, 1-lot trail / multi-lot T1 split, T2 Chandelier trail, and auto-exits."""
-    trades = load_auto_trades()
-    changed = False
-    exp_iso = str(current_expiry)[:10]
-
-    for t in trades:
-        if t.get("status") != "OPEN":
-            continue
-        if t.get("index") == idx_name and str(t.get("expiry"))[:10] == exp_iso and option_df is not None and not option_df.empty:
-            match = option_df[option_df["Strike"].astype(float).sub(float(t["strike"])).abs() < 0.01]
-            if not match.empty:
-                side = t.get("side", "CE")
-                bid = _n(match.iloc[0].get(f"{side}_Bid"))
-                ltp = _n(match.iloc[0].get(f"{side}_LTP"))
-                mark = bid if bid > 0 else ltp
-                if mark > 0:
-                    ent = float(t.get("entry_price") or mark)
-                    rem_qty = int(t.get("qty") or 1)
-                    init_qty = int(t.get("initial_qty") or rem_qty or 1)
-                    part_pnl = float(t.get("partial_realized_pnl") or 0.0)
-                    t["last_price"] = round(mark, 2)
-                    t["peak_price"] = round(max(float(t.get("peak_price") or mark), mark), 2)
-                    t["unrealized_pnl"] = round((mark - ent) * rem_qty, 2)
-                    comb_pnl = part_pnl + t["unrealized_pnl"]
-                    t["pnl_pct"] = round((comb_pnl / (ent * init_qty) * 100.0) if (ent > 0 and init_qty > 0) else 0.0, 2)
-                    changed = True
-
-                    # 0. IMMEDIATE REVERSAL / OPPOSITE-SIGNAL EXIT (Protects profit & frees slot to wait for next validated signal)
-                    if auto_cfg.get("exit_on_reversal", True) and (now_ist.timestamp() - float(t.get("entry_ts") or 0)) >= 45:
-                        rev_exit, rev_why = check_opposite_reversal_exit(t, m, sig)
-                        if rev_exit:
-                            close_auto_trade_record(t, mark, rev_why, auto_cfg, token, client_id, alert_cfg, now_ist)
-                            continue
-
-                    # 0b. CHURN-MODE EARLY BREAKEVEN LOCK (+8 pts -> Entry + 1.5 pts) & FIXED-POINT SCALP EXIT
-                    if t.get("churn_mode"):
-                        c_be = float(auto_cfg.get("churn_be_lock_pts") or 8.0)
-                        if (mark - ent) >= c_be and not t.get("step1_locked"):
-                            t["step1_locked"] = True
-                            be_plus = round(ent + 1.5, 2)
-                            if be_plus > float(t.get("sl_price") or 0.0):
-                                t["sl_price"] = be_plus
-                        if mark >= float(t.get("t1_price") or 999999.0):
-                            t["t1_hit"] = True
-                            close_auto_trade_record(t, mark, f"CHURN SCALP TARGET HIT (+{mark - ent:.1f} pts)", auto_cfg, token, client_id, alert_cfg, now_ist)
-                            continue
-                    else:
-                        # STEP-1 EARLY BREAKEVEN LOCK (+10% gain locks SL at Entry + 2% so a +10% winner never turns into a red loss)
-                        if mark >= round(ent * 1.10, 2) and not t.get("step1_locked") and not t.get("t1_hit"):
-                            t["step1_locked"] = True
-                            be_plus = round(ent * 1.02, 2)
-                            if be_plus > float(t.get("sl_price") or 0.0):
-                                t["sl_price"] = be_plus
-
-                        # 1. Check T1 hit first (so multi-lot trades book 50% at T1 and trail SL to cost):
-                        if mark >= float(t.get("t1_price") or 999999.0) and not t.get("t1_hit"):
-                            if auto_cfg.get("t1_rule") == "BOOK_100_T1":
-                                t["t1_hit"] = True
-                                close_auto_trade_record(t, mark, "TARGET_1 FULL EXIT", auto_cfg, token, client_id, alert_cfg, now_ist)
-                                continue
-                            else:
-                                partial_book_at_t1(t, mark, auto_cfg, token, client_id, alert_cfg, now_ist)
-
-                    # 1b. Post-T1 Ratcheting Runner Trail (never let a +30% post-T1 runner round-trip all the way back to flat entry)
-                    if t.get("t1_hit") and not t.get("t2_hit"):
-                        post_t1_sl = round(max(ent * 1.02, float(t["peak_price"]) * 0.88), 2)
-                        if post_t1_sl > float(t.get("sl_price") or 0.0):
-                            t["sl_price"] = post_t1_sl
-
-                    # 2. Check T2 hit & Chandelier High-Water-Mark Runner Trail:
-                    t2_px = float(t.get("t2_price") or 999999.0)
-                    if mark >= t2_px:
-                        if auto_cfg.get("t2_runner_rule", "CHANDELIER") == "BOOK_T2":
-                            close_auto_trade_record(t, mark, "TARGET_2 HIT", auto_cfg, token, client_id, alert_cfg, now_ist)
-                            continue
-                        else:
-                            trail_pct = float(auto_cfg.get("t2_trail_pct") or 12.0) / 100.0
-                            chandelier_sl = round(max(t2_px * 0.96, float(t["peak_price"]) * (1.0 - trail_pct)), 2)
-                            if chandelier_sl > float(t.get("sl_price") or 0.0):
-                                t["sl_price"] = chandelier_sl
-                            if not t.get("t2_hit"):
-                                t["t2_hit"] = True
-                                if alert_cfg.get("enabled"):
-                                    fire_alert(
-                                        f"auto_t2_trail_{t['trade_id']}",
-                                        f"🚀 T2 SURPASSED — CHANDELIER RUNNER ACTIVE ({t.get('mode')})\n"
-                                        f"{t.get('index')} | {t.get('symbol')} | Live ₹{mark:.2f} (Peak ₹{t['peak_price']:.2f})\n"
-                                        f"Trailing Stop locked at ₹{t['sl_price']:.2f} ({trail_pct*100:.0f}% below peak). Will auto-close on Reversal or Trail hit!",
-                                        60, alert_cfg,
-                                    )
-                    elif t.get("t2_hit"):
-                        trail_pct = float(auto_cfg.get("t2_trail_pct") or 12.0) / 100.0
-                        chandelier_sl = round(max(t2_px * 0.96, float(t["peak_price"]) * (1.0 - trail_pct)), 2)
-                        if chandelier_sl > float(t.get("sl_price") or 0.0):
-                            t["sl_price"] = chandelier_sl
-
-                    # 3. Check Stop-Loss (Initial SL, Step-1 Breakeven Lock, T1 Runner Trail, or T2 Chandelier Trail SL)
-                    if mark <= float(t.get("sl_price") or 0.0):
-                        rsn = (
-                            "T2 CHANDELIER TRAIL STOP" if t.get("t2_hit")
-                            else ("T1 RUNNER PROFIT TRAIL" if t.get("t1_hit")
-                                  else ("STEP-1 BREAKEVEN LOCK (+2%)" if t.get("step1_locked") else "STOP_LOSS HIT"))
-                        )
-                        close_auto_trade_record(t, mark, rsn, auto_cfg, token, client_id, alert_cfg, now_ist)
-                        continue
-
-                    # 4. Check 15:20 IST intraday EOD square-off
-                    if market_open_now(now_ist) and (now_ist.hour * 60 + now_ist.minute) >= (15 * 60 + 20):
-                        close_auto_trade_record(t, mark, "EOD 15:20 AUTO SQUARE-OFF", auto_cfg, token, client_id, alert_cfg, now_ist)
-                        continue
-
-    if changed:
-        save_auto_trades(trades)
-    return trades
-
-
-def emergency_kill_all_auto_trades(auto_cfg, token, client_id, alert_cfg, now_ist):
-    """Turn OFF automation and immediately close all OPEN positions at latest mark price."""
-    auto_cfg["enabled"] = False
-    save_auto_cfg(auto_cfg)
-    trades = load_auto_trades()
-    closed_count = 0
-    for t in trades:
-        if t.get("status") == "OPEN":
-            px = float(t.get("last_price") or t.get("entry_price") or 0.05)
-            close_auto_trade_record(t, px, "EMERGENCY KILL-SWITCH (CLOSE ALL)", auto_cfg, token, client_id, alert_cfg, now_ist)
-            closed_count += 1
-    save_auto_trades(trades)
-    return closed_count
-
-
-# ============================================================
-# v17.7 BUILT-IN FAST BACKGROUND EXIT MONITOR (SINGLE-FILE CLOUD READY)
-# ============================================================
-_WS_FEED_URL = "wss://api-feed.dhan.co"
-_WS_EXCH_MAP = {0: "IDX_I", 1: "NSE_EQ", 2: "NSE_FNO", 3: "NSE_CURRENCY", 4: "BSE_EQ", 5: "MCX_COMM", 7: "BSE_CURRENCY", 8: "BSE_FNO"}
-
-
-def _ws_parse_packets(buf: bytes):
-    out, n, off = [], len(buf), 0
-    while off + 8 <= n:
-        code, mlen, exch, sid = struct.unpack_from("<BHBI", buf, off)
-        seg = _WS_EXCH_MAP.get(exch, "NSE_FNO")
-        s_str = str(sid)
-        if code in (2, 4):
-            plen = mlen if mlen >= (16 if code == 2 else 50) else (16 if code == 2 else 50)
-            if off + 12 <= n:
-                ltp = struct.unpack_from("<f", buf, off + 8)[0]
-                if math.isfinite(ltp) and ltp > 0:
-                    out.append({"code": code, "segment": seg, "security_id": s_str, "ltp": round(ltp, 2), "bid": 0.0})
-        elif code == 8:
-            plen = mlen if mlen >= 162 else 162
-            if off + 12 <= n:
-                ltp = struct.unpack_from("<f", buf, off + 8)[0]
-                bid_px = 0.0
-                if off + 82 <= n:
-                    _, _, _, _, b1, _ = struct.unpack_from("<IIHHff", buf, off + 62)
-                    if math.isfinite(b1) and ltp > 0 and (0.5 * ltp <= b1 <= 1.5 * ltp):
-                        bid_px = round(b1, 2)
-                if math.isfinite(ltp) and ltp > 0:
-                    out.append({"code": 8, "segment": seg, "security_id": s_str, "ltp": round(ltp, 2), "bid": bid_px})
-        elif code == 50:
-            plen = mlen if mlen >= 10 else 10
-            dc = struct.unpack_from("<H", buf, off + 8)[0] if off + 10 <= n else 0
-            out.append({"code": 50, "disconnect_code": dc})
-        else:
-            plen = mlen if mlen >= 8 else (n - off)
-        if plen <= 0:
-            break
-        off += plen
-    return out
-
-
-def _ws_eval_tick(t, mark_px, auto_cfg, token, client_id, alert_cfg, now_ist):
-    """Apply tick-level SL, Breakeven Lock, T1 Split, T2 Chandelier, and 15:20 EOD exit rules."""
-    if t.get("status") != "OPEN" or mark_px <= 0:
-        return False
-    ent = float(t.get("entry_price") or mark_px)
-    rem_qty = int(t.get("qty") or 1)
-    init_qty = int(t.get("initial_qty") or rem_qty or 1)
-    part_pnl = float(t.get("partial_realized_pnl") or 0.0)
-    t["last_price"] = round(mark_px, 2)
-    t["peak_price"] = round(max(float(t.get("peak_price") or mark_px), mark_px), 2)
-    t["unrealized_pnl"] = round((mark_px - ent) * rem_qty, 2)
-    comb_pnl = part_pnl + t["unrealized_pnl"]
-    t["pnl_pct"] = round((comb_pnl / (ent * init_qty) * 100.0) if (ent > 0 and init_qty > 0) else 0.0, 2)
-    crit = False
-
-    if t.get("churn_mode"):
-        c_be = float(auto_cfg.get("churn_be_lock_pts") or 8.0)
-        if (mark_px - ent) >= c_be and not t.get("step1_locked"):
-            t["step1_locked"] = True
-            be_plus = round(ent + 1.5, 2)
-            if be_plus > float(t.get("sl_price") or 0.0):
-                t["sl_price"] = be_plus
-                crit = True
-        if mark_px >= float(t.get("t1_price") or 999999.0):
-            t["t1_hit"] = True
-            close_auto_trade_record(t, mark_px, f"[FAST] CHURN SCALP TARGET (+{mark_px - ent:.1f} pts)", auto_cfg, token, client_id, alert_cfg, now_ist)
-            return True
-    else:
-        if mark_px >= round(ent * 1.10, 2) and not t.get("step1_locked") and not t.get("t1_hit"):
-            t["step1_locked"] = True
-            be_plus = round(ent * 1.02, 2)
-            if be_plus > float(t.get("sl_price") or 0.0):
-                t["sl_price"] = be_plus
-                crit = True
-        if mark_px >= float(t.get("t1_price") or 999999.0) and not t.get("t1_hit"):
-            if auto_cfg.get("t1_rule") == "BOOK_100_T1":
-                t["t1_hit"] = True
-                close_auto_trade_record(t, mark_px, "[FAST] TARGET_1 FULL EXIT", auto_cfg, token, client_id, alert_cfg, now_ist)
-                return True
-            else:
-                partial_book_at_t1(t, mark_px, auto_cfg, token, client_id, alert_cfg, now_ist)
-                crit = True
-        if t.get("t1_hit") and not t.get("t2_hit"):
-            post_sl = round(max(ent * 1.02, float(t["peak_price"]) * 0.88), 2)
-            if post_sl > float(t.get("sl_price") or 0.0):
-                t["sl_price"] = post_sl
-                crit = True
-        t2_px = float(t.get("t2_price") or 999999.0)
-        if mark_px >= t2_px:
-            if auto_cfg.get("t2_runner_rule", "CHANDELIER") == "BOOK_T2":
-                close_auto_trade_record(t, mark_px, "[FAST] TARGET_2 HIT", auto_cfg, token, client_id, alert_cfg, now_ist)
-                return True
-            else:
-                tp = float(auto_cfg.get("t2_trail_pct") or 12.0) / 100.0
-                ch_sl = round(max(t2_px * 0.96, float(t["peak_price"]) * (1.0 - tp)), 2)
-                if ch_sl > float(t.get("sl_price") or 0.0):
-                    t["sl_price"] = ch_sl
-                    crit = True
-                if not t.get("t2_hit"):
-                    t["t2_hit"] = True
-                    crit = True
-        elif t.get("t2_hit"):
-            tp = float(auto_cfg.get("t2_trail_pct") or 12.0) / 100.0
-            ch_sl = round(max(t2_px * 0.96, float(t["peak_price"]) * (1.0 - tp)), 2)
-            if ch_sl > float(t.get("sl_price") or 0.0):
-                t["sl_price"] = ch_sl
-                crit = True
-
-    if mark_px <= float(t.get("sl_price") or 0.0):
-        rsn = (
-            "[FAST] T2 CHANDELIER TRAIL STOP" if t.get("t2_hit")
-            else ("[FAST] T1 RUNNER PROFIT TRAIL" if t.get("t1_hit")
-                  else ("[FAST] STEP-1 BREAKEVEN LOCK (+2%)" if t.get("step1_locked") else "[FAST] STOP_LOSS HIT"))
-        )
-        close_auto_trade_record(t, mark_px, rsn, auto_cfg, token, client_id, alert_cfg, now_ist)
-        return True
-
-    if market_open_now(now_ist) and (now_ist.hour * 60 + now_ist.minute) >= (15 * 60 + 20):
-        close_auto_trade_record(t, mark_px, "[FAST] EOD 15:20 AUTO SQUARE-OFF", auto_cfg, token, client_id, alert_cfg, now_ist)
-        return True
-
-    return crit
-
-
-def _ws_rest_quotes(pairs, token, client_id):
-    payload = {}
-    for seg, sid in pairs:
-        try:
-            payload.setdefault(seg, []).append(int(sid))
-        except ValueError:
-            continue
-    if not payload:
-        return {}
-    out = {}
-    try:
-        r = requests.post(f"{BASE_URL}/marketfeed/quote", headers=auth_headers(token, client_id), json=payload, timeout=6)
-        if not r.ok:
-            return out
-        data = (r.json() or {}).get("data") or {}
-        for seg, smap in data.items():
-            if not isinstance(smap, dict):
-                continue
-            for sid, q in smap.items():
-                ltp = float(q.get("last_price") or 0.0)
-                bd = (q.get("depth") or {}).get("buy") or []
-                bid = float(bd[0].get("price") or 0.0) if bd else 0.0
-                mk = bid if (bid > 0 and ltp > 0 and 0.5 * ltp <= bid <= 1.5 * ltp) else ltp
-                if mk > 0:
-                    out[str(sid)] = mk
-    except Exception:
-        pass
-    return out
-
-
-def _bg_exit_thread_main(state, token, client_id, tg_token, tg_chat, hook):
-    alert_cfg = {"enabled": bool(tg_token and tg_chat), "tg_token": tg_token, "tg_chat": tg_chat, "hook": hook}
-
-    async def _ws_loop():
-        ws_url = f"{_WS_FEED_URL}?version=2&token={token}&clientId={client_id}&authType=2"
-        subscribed = set()
-        last_sync, last_reload, dirty = 0.0, 0.0, False
-        trades, acfg = load_auto_trades(), load_auto_cfg()
-        while not state.get("stop"):
-            try:
-                async with _ws_lib.connect(ws_url, ping_interval=None, max_size=2**22) as ws:
-                    state["connected"] = True
-                    state["mode"] = "Sub-Second WebSocket"
-                    subscribed.clear()
-                    while not state.get("stop"):
-                        now_ts = time.time()
-                        now_ist = datetime.now(IST)
-                        if now_ts - last_reload >= 2.0:
-                            if dirty:
-                                save_auto_trades(trades)
-                                dirty, last_sync = False, now_ts
-                            trades, acfg = load_auto_trades(), load_auto_cfg()
-                            last_reload = now_ts
-                            desired = {
-                                (str(t.get("segment") or "NSE_FNO"), str(t.get("security_id")))
-                                for t in trades if t.get("status") == "OPEN" and t.get("security_id")
-                            }
-                            state["open_watched"] = len(desired)
-                            to_sub, to_unsub = desired - subscribed, subscribed - desired
-                            if to_sub:
-                                await ws.send(json.dumps({
-                                    "RequestCode": 21, "InstrumentCount": len(to_sub),
-                                    "InstrumentList": [{"ExchangeSegment": s, "SecurityId": i} for s, i in sorted(to_sub)],
-                                }))
-                                subscribed |= to_sub
-                            if to_unsub:
-                                await ws.send(json.dumps({
-                                    "RequestCode": 22, "InstrumentCount": len(to_unsub),
-                                    "InstrumentList": [{"ExchangeSegment": s, "SecurityId": i} for s, i in sorted(to_unsub)],
-                                }))
-                                subscribed -= to_unsub
-                        try:
-                            raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
-                        except asyncio.TimeoutError:
-                            if market_open_now(now_ist) and (now_ist.hour * 60 + now_ist.minute) >= (15 * 60 + 20):
-                                for t in trades:
-                                    if t.get("status") == "OPEN":
-                                        px = float(t.get("last_price") or t.get("entry_price") or 0.05)
-                                        close_auto_trade_record(t, px, "[FAST] EOD 15:20 AUTO SQUARE-OFF", acfg, token, client_id, alert_cfg, now_ist)
-                                        dirty = True
-                            if dirty and (now_ts - last_sync >= 2.0):
-                                save_auto_trades(trades)
-                                dirty, last_sync = False, now_ts
-                            continue
-                        if not isinstance(raw, (bytes, bytearray)):
-                            continue
-                        urgent = False
-                        for pkt in _ws_parse_packets(raw):
-                            if pkt.get("code") == 50:
-                                raise ConnectionResetError(f"Dhan WS disconnect {pkt.get('disconnect_code')}")
-                            sid = pkt.get("security_id")
-                            mk = pkt["bid"] if pkt.get("bid", 0) > 0 else pkt.get("ltp", 0)
-                            if not sid or mk <= 0:
-                                continue
-                            state["last_tick"] = datetime.now(IST).strftime("%H:%M:%S")
-                            for t in trades:
-                                if t.get("status") == "OPEN" and str(t.get("security_id")) == sid:
-                                    if _ws_eval_tick(t, mk, acfg, token, client_id, alert_cfg, datetime.now(IST)):
-                                        urgent = True
-                                    dirty = True
-                        if urgent or (dirty and time.time() - last_sync >= 2.0):
-                            save_auto_trades(trades)
-                            dirty, last_sync = False, time.time()
-            except Exception as exc:
-                state["connected"] = False
-                state["last_err"] = str(exc)[:100]
-                if dirty:
-                    save_auto_trades(trades)
-                    dirty = False
-                await asyncio.sleep(4.0)
-
-    def _rest_loop():
-        state["mode"] = "Fast 1.5s Quote Backup"
-        state["connected"] = True
-        while not state.get("stop"):
-            try:
-                trades = load_auto_trades()
-                acfg = load_auto_cfg()
-                open_t = [t for t in trades if t.get("status") == "OPEN" and t.get("security_id")]
-                state["open_watched"] = len(open_t)
-                if open_t:
-                    pairs = {(str(t.get("segment") or "NSE_FNO"), str(t["security_id"])) for t in open_t}
-                    quotes = _ws_rest_quotes(pairs, token, client_id)
-                    now_ist = datetime.now(IST)
-                    chg = False
-                    for t in open_t:
-                        mk = quotes.get(str(t["security_id"]), 0.0)
-                        if mk > 0:
-                            state["last_tick"] = now_ist.strftime("%H:%M:%S")
-                            _ws_eval_tick(t, mk, acfg, token, client_id, alert_cfg, now_ist)
-                            chg = True
-                    if chg:
-                        save_auto_trades(trades)
-            except Exception as exc:
-                state["last_err"] = str(exc)[:100]
-            time.sleep(1.5)
-
-    if _ws_lib is not None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(_ws_loop())
-    else:
-        _rest_loop()
-
-
-@st.cache_resource(show_spinner=False)
-def start_fast_exit_monitor(token, client_id, tg_token, tg_chat, hook):
-    """Starts ONE singleton background exit monitor per Streamlit server (never duplicates WebSockets)."""
-    state = {"mode": "Starting...", "connected": False, "open_watched": 0, "last_tick": "—", "last_err": "", "stop": False}
-    if not token or not client_id:
-        state["mode"] = "Waiting for Dhan keys"
-        return state
-    th = threading.Thread(
-        target=_bg_exit_thread_main,
-        args=(state, token, client_id, tg_token, tg_chat, hook),
-        daemon=True,
-        name="bbg_fast_exit_monitor",
-    )
-    th.start()
-    return state
-
-
 SCORECARD_FILE = os.path.join(DATA_DIR, "bbg_scorecard_v14.json")
 ALERT_FILE = os.path.join(DATA_DIR, "bbg_alerts_sent_v15.json")
 SIGNAL_DEDUP_MIN = 30
@@ -4176,19 +2697,28 @@ def process_alert_queue(cfg, max_per_run=4):
     return results
 
 
+MIN_ALERT_COOLDOWN_MIN = 5   # safety floor: a cooldown of 0 would resend on every 30s autorefresh
+
+
 def fire_alert(key, text, cooldown_min, cfg):
     if not cfg.get("enabled") or not (cfg.get("tg_token") and cfg.get("tg_chat") or cfg.get("hook")):
         return []
+    cooldown_min = max(float(cooldown_min or 0), MIN_ALERT_COOLDOWN_MIN)
     now_ts = time.time()
     state = _load_json(ALERT_FILE, {})
     state = {k: v for k, v in state.items() if now_ts - float(v) < ALERT_STATE_KEEP_SEC}
     if now_ts - float(state.get(key, 0)) < cooldown_min * 60:
         return []
+    # Reserve the key BEFORE sending so a second session/tab rerunning at the same moment skips it.
+    state[key] = now_ts
+    _save_json(ALERT_FILE, state)
     res = send_alert(text, cfg.get("tg_token", ""), cfg.get("tg_chat", ""), cfg.get("hook", ""))
-    if delivery_succeeded(res, cfg):
-        state[key] = now_ts
-        _save_json(ALERT_FILE, state)
-    else:
+    if not delivery_succeeded(res, cfg):
+        # Release the reservation; the retry queue will resend (and re-mark the key on success).
+        state = _load_json(ALERT_FILE, {})
+        if state.get(key) == now_ts:
+            state.pop(key, None)
+            _save_json(ALERT_FILE, state)
         queue_failed_alert(key, text, "; ".join(msg for _, ok, msg in res if not ok) or "delivery failed")
     return res
 
@@ -4196,48 +2726,41 @@ def fire_alert(key, text, cooldown_min, cfg):
 def signal_alert_text(r):
     tgt = f"{r['target']:,.0f}" if r.get("target") else "-"
     sl = f"{r['sl']:,.0f}" if r.get("sl") else "-"
-    is_buy = (r.get("option_type") == "CALL") if r.get("option_type") else (r.get("signal") == "BUY")
-    action = "BUY CALL" if is_buy else "BUY PUT"
-    em = "🟢" if is_buy else "🔴"
-
-    if r.get("kind") != "VALIDATED" or r.get("option_strike") is None:
-        rsn = (r.get("reason") or "Filtered out")[:90]
-        return f"❌ REJECTED — {r['index']} {action}\nSpot: {r['entry']:,.0f} | {rsn}\n{r['time']} IST"
-
-    tags = []
+    rr = f"1:{r['rr']:.2f}" if r.get("rr") else "-"
+    kind_label = "✅ VALIDATED OPTION-BUY SIGNAL" if r["kind"] == "VALIDATED" else "❌ REJECTED SIGNAL (NOT ACTIONABLE)"
     if r.get("playbook"):
-        tags.append(f"0DTE PB-{r['playbook']} HALF SIZE")
-    if r.get("reversal_label") and r.get("reversal_label") != "NONE":
-        tags.append("REVERSAL")
-    tag_str = f" [{' | '.join(tags)}]" if tags else ""
-
-    opt_code = "CE" if r.get("option_type") == "CALL" else "PE"
-    return (
-        f"{em} {action} — {r['index']}{tag_str}\n"
-        f"Strike: {r.get('option_strike'):g} {opt_code} (Exp {r.get('option_expiry')})\n"
-        f"Entry: ₹{r.get('option_entry_ref', 0):.2f} | SL: ₹{r.get('option_stop', 0):.2f}\n"
-        f"T1: ₹{r.get('option_target1', 0):.2f} | T2: ₹{r.get('option_target2', 0):.2f}\n"
-        f"Spot: {r['entry']:,.0f} | Tgt: {tgt} | SL: {sl}\n"
-        f"Time: {r['time']} IST"
-    )
+        kind_label += f" [EXPIRY PLAYBOOK {r['playbook']} | time stop {r.get('time_stop_min')} min | HALF SIZE]"
+    reason_txt = f"\nReason: {r['reason']}" if r.get("reason") else ""
+    if r.get("kind") == "VALIDATED" and r.get("option_strike") is not None:
+        action = "BUY CALL" if r.get("option_type") == "CALL" else "BUY PUT"
+        option = (f"\nContract: {r.get('index')} {r.get('option_strike'):g} {r.get('option_type')} | Expiry {r.get('option_expiry')}"
+                  f"\nQuote bid/ask: ₹{r.get('option_bid', 0):.2f} / ₹{r.get('option_ask', 0):.2f}"
+                  f" | spread {r.get('option_spread_pct', 0):.1f}% | Δ {r.get('option_delta', 0):+.2f} | IV {r.get('option_iv', 0):.1f}%"
+                  f"\nManual entry reference: ≤ ₹{r.get('option_entry_ref', 0):.2f} (ask snapshot, not a fill)"
+                  f"\nOption premium plan: SL ₹{r.get('option_stop', 0):.2f} | T1 ₹{r.get('option_target1', 0):.2f} | T2 ₹{r.get('option_target2', 0):.2f}"
+                  f"\nMax planned loss/unit ≈ ₹{(r.get('option_entry_ref') or 0) - (r.get('option_stop') or 0):.2f}")
+    else:
+        action, option = ("BUY CALL" if r.get("signal") == "BUY" else "BUY PUT"), "\nNo approved option contract; do not trade."
+    return (f"{kind_label}\n{r['index']} | {action} | Underlying {r['entry']:,.2f}\n"
+            f"Underlying confirmation levels: target {tgt} | invalidation/stop {sl} | R:R {rr}\n"
+            f"Regime: {r.get('market_regime', 'not classified')} (advisory) | Futures footprint: {r.get('fp_bias') or 'n/a'}\n"
+            f"AI confidence {r['confidence']}% | Chain agreement {r['net']:+d}{option}{reason_txt}\n"
+            f"{r['time']} IST. Manual execution only. Recheck quote freshness/liquidity; levels are planning estimates, not guaranteed fills.")
 
 
 def outcome_alert_text(r):
     if str(r.get("event_type", "")).startswith("OPTION_"):
-        em = "🛑" if r.get("event_type") == "OPTION_STOP_LOSS" else "🎯"
-        opt_code = "CE" if r.get("option_type") == "CALL" else "PE"
-        return (
-            f"{em} {r.get('event_type')} — {r.get('index')}\n"
-            f"{r.get('option_strike'):g} {opt_code} @ ₹{r.get('premium_mark', r.get('option_last_mark', 0)):.2f} "
-            f"(SL ₹{r.get('option_stop', 0):.2f} | T1 ₹{r.get('option_target1', 0):.2f})\n"
-            f"Time: {r.get('time', '')} IST"
-        )
+        action = "BUY CALL" if r.get("option_type") == "CALL" else "BUY PUT"
+        return (f"{'🛑' if r.get('event_type') == 'OPTION_STOP_LOSS' else '🎯'} OPTION PREMIUM EVENT: {r.get('event_type')}\n"
+                f"{r.get('index')} | {action} | {r.get('option_strike')} {r.get('option_type')} | expiry {r.get('option_expiry')}\n"
+                f"Latest observed exit-side bid/LTP ₹{r.get('premium_mark', r.get('option_last_mark', 0)):.2f} | SL ₹{r.get('option_stop', 0):.2f} | T1 ₹{r.get('option_target1', 0):.2f} | T2 ₹{r.get('option_target2', 0):.2f}\n"
+                f"Snapshot time {r.get('time', '')} IST. Bid is used where available (LTP fallback); polling can miss fast moves, so verify live bid/ask and manage manually.")
     action = "BUY CALL" if r.get("signal") == "BUY" else "BUY PUT"
-    return (
-        f"🏁 {r['outcome']} — {r['index']} ({action})\n"
-        f"Spot: {r['entry']:,.0f} | MFE: +{r['mfe']:.0f} | MAE: -{r['mae']:.0f}\n"
-        f"Time: {r.get('resolved_time', r['time'])} IST"
-    )
+    return (f"🏁 UNDERLYING LEVEL EVENT: {r['outcome']}\n"
+            f"{r['index']} | {action} candidate {r.get('option_strike', 'N/A')} {r.get('option_type', '')}\n"
+            f"Underlying signal level {r['entry']:,.0f} | target/stop {r.get('target')} / {r.get('sl')}\n"
+            f"Underlying MFE: +{r['mfe']} pts | MAE: -{r['mae']} pts\n"
+            f"Event time: {r.get('resolved_time', r['time'])} IST. This is NOT confirmation that option premium target/SL was hit; check live option quote manually.")
 
 
 def post_webhook(url, payload):
@@ -4344,51 +2867,16 @@ def fp_fields(m, direction):
             "fp_vwap_dist": fp.get("vwap_dist") if ok else None, "fp_orb": fp.get("orb") if ok else None, "fp_against": against}
 
 
-def idea_key(r):
-    """v17.6 (from v16.1): deduplicates repeated signals of the same intraday idea for unbiased scorecard stats."""
-    try:
-        if r.get("kind") == "VALIDATED" and r.get("target") is not None and r.get("sl") is not None:
-            return (f"{r.get('date')}|{r.get('index')}|{r.get('expiry')}|{r.get('signal')}|"
-                    f"{round(float(r['target']))}|{round(float(r['sl']))}")
-        return (f"{r.get('date')}|{r.get('index')}|{r.get('expiry')}|{r.get('signal')}|{r.get('kind')}|"
-                f"{rejection_category(r)}|{int(float(r.get('ts', 0)) // 3600)}")
-    except (TypeError, ValueError):
-        return str(r.get("id"))
-
-
-def unique_ideas(recs):
-    return [r for r in recs if not r.get("is_repeat")]
-
-
-def backfill_ideas(card):
-    seen, n = set(), 0
-    for r in sorted(card, key=lambda x: x.get("ts", 0)):
-        key = r.get("idea_key") or idea_key(r)
-        if r.get("idea_key") is None:
-            r["idea_key"] = key
-            n += 1
-        if r.get("is_repeat") is None:
-            r["is_repeat"] = key in seen
-            n += 1
-        seen.add(key)
-    return n
-
-
 def make_record(kind, idx_name, expiry, m, sig, ai, tone, now):
-    direction = sig["signal"] if kind == "VALIDATED" else (sig.get("proposed_signal") if sig.get("proposed_signal") in ("BUY", "SELL") else sig["ai_signal"])
+    direction = sig["signal"] if kind == "VALIDATED" else sig["ai_signal"]
     ex = m.get("exh") or {}
     ready = bool(ex.get("ready"))
     own = (ex["buyer"] if direction == "BUY" else ex["seller"]) if ready else None
     note = sig["note"] if kind == "REJECTED" else ""
     buyer_plan = select_buyer_contract(m, direction, xctx_allowed(m, direction)) if kind == "VALIDATED" and direction in ("BUY", "SELL") else None
     trade_key = f"{idx_name}|{str(expiry)[:10]}|{direction}|{buyer_plan.get('option_type') if buyer_plan else 'NA'}|{buyer_plan.get('strike') if buyer_plan else 'NA'}"
-    if buyer_plan:
-        trk = {"strike": buyer_plan["strike"], "side": buyer_plan["side"], "ask0": buyer_plan["ask"], "bid0": buyer_plan["bid"]}
-    else:
-        trk = pick_tracking_contract(m, direction) if direction in ("BUY", "SELL") else None
-    rec = {
+    return {
         "id": hashlib.sha256(f"{now.timestamp()}|{trade_key}|{kind}".encode()).hexdigest()[:12], "trade_key": trade_key,
-        "app_version": APP_VERSION,
         "kind": kind, "ts": now.timestamp(), "date": now.date().isoformat(), "time": now.strftime("%H:%M:%S"),
         "index": idx_name, "expiry": str(expiry)[:10], "signal": direction, "entry": round(float(m["spot"]), 2),
         "target": sig["target"] if kind == "VALIDATED" else None, "sl": sig["sl"] if kind == "VALIDATED" else None,
@@ -4405,10 +2893,6 @@ def make_record(kind, idx_name, expiry, m, sig, ai, tone, now):
         "exh_buyer": ex["buyer"]["score"] if ready else None, "exh_seller": ex["seller"]["score"] if ready else None,
         "exh_own_flag": own["flag"] if own else None, "tone": tone, "news_score": ai.get("news_score"),
         "reason": note,
-        "ignition_label": (m.get("ignition") or {}).get("label"),
-        "ignition_reasons": ", ".join((m.get("ignition") or {}).get("reasons", [])),
-        "reversal_label": (m.get("reversal") or {}).get("label"),
-        "reversal_reasons": ", ".join((m.get("reversal") or {}).get("reasons", [])),
         "playbook": sig.get("playbook") if kind == "VALIDATED" else None,
         "expiry_day": bool(sig.get("expiry_day")),
         "time_stop_min": sig.get("time_stop_min") if kind == "VALIDATED" else None,
@@ -4430,11 +2914,10 @@ def make_record(kind, idx_name, expiry, m, sig, ai, tone, now):
         "option_target2": buyer_plan.get("target2_premium") if buyer_plan else None,
         "option_last_mark": buyer_plan.get("ltp") if buyer_plan else None,
         "option_event_state": "SIGNAL_VALIDATED" if buyer_plan else None,
-        # Auto-monitoring lifecycle (v16.8): validated signals automatically track option SL/T1/T2 without manual confirmation.
-        "manual_entry_confirmed": bool(kind == "VALIDATED" and buyer_plan is not None),
-        "trade_state": "POSITION_OPEN" if (kind == "VALIDATED" and buyer_plan is not None) else ("SIGNAL_ONLY" if buyer_plan else "NO_CONTRACT"),
-        "option_mfe_pct": 0.0,
-        "option_mae_pct": 0.0,
+        "touch_alerted": False,
+        # Manual-trading lifecycle: a signal is not a position until the user confirms an actual fill.
+        "manual_entry_confirmed": False,
+        "trade_state": "SIGNAL_ONLY" if buyer_plan else "NO_CONTRACT",
         "actual_entry_price": None,
         "actual_entry_qty": None,
         "actual_entry_ts": None,
@@ -4442,16 +2925,7 @@ def make_record(kind, idx_name, expiry, m, sig, ai, tone, now):
         "actual_exit_ts": None,
         "actual_fees": 0.0,
         "actual_net_pnl": None,
-        # v17.6: Real option-bid paper tracking across +5/15/30/60m for BOTH validated and rejected signals
-        "trk_strike": trk["strike"] if trk else None, "trk_side": trk["side"] if trk else None,
-        "trk_ask0": trk["ask0"] if trk else None, "trk_bid0": trk["bid0"] if trk else None,
-        "p5": None, "p15": None, "p30": None, "p60": None, "p_close": None,
-        "trk_last_bid": None, "trk_last_ts": None, "trk_max_bid": None, "trk_min_bid": None,
-        "last_spot": None,
     }
-    rec["idea_key"] = idea_key(rec)
-    rec["is_repeat"] = False
-    return rec
 
 
 def maybe_log_signal(recs, idx_name, expiry, m, sig, ai, tone, now):
@@ -4464,15 +2938,12 @@ def maybe_log_signal(recs, idx_name, expiry, m, sig, ai, tone, now):
                    and now.timestamp() - r.get("ts", 0) < SIGNAL_DEDUP_MIN * 60 for r in recs)
 
     new = []
-    rej_dir = sig.get("proposed_signal") if sig.get("proposed_signal") in ("BUY", "SELL") else sig["ai_signal"]
     if sig["signal"] in ("BUY", "SELL"):
         if not recent("VALIDATED", sig["signal"]):
             new.append(make_record("VALIDATED", idx_name, expiry, m, sig, ai, tone, now))
-    elif rej_dir in ("BUY", "SELL"):
-        if not recent("REJECTED", rej_dir):
+    elif sig["ai_signal"] in ("BUY", "SELL"):
+        if not recent("REJECTED", sig["ai_signal"]):
             new.append(make_record("REJECTED", idx_name, expiry, m, sig, ai, tone, now))
-    for rec in new:
-        rec["is_repeat"] = any(x.get("idea_key") == rec["idea_key"] for x in recs)
     recs.extend(new)
     return new
 
@@ -4488,70 +2959,39 @@ def update_outcomes(recs, idx_name, spot, now, candles, intraday=None, option_df
     bars = sorted(intraday or [], key=lambda b: b["ts"])
     stamp = now.strftime("%H:%M:%S")
     for r in recs:
-        if r["index"] != idx_name:
-            continue
-        if r["resolved"]:
-            if r.get("sclose") is None and r["date"] in closes:
-                r["sclose"] = round(float(closes[r["date"]]), 2)
-                if r.get("outcome") == "DATA_GAP" and r.get("target") is not None:
-                    r["outcome"] = r["first_touch"] if r.get("first_touch") in ("TARGET", "STOP") else "TIMEOUT"
-                changed = True
+        if r["resolved"] or r["index"] != idx_name:
             continue
         d = _dir(r["signal"])
         el = (now.timestamp() - r["ts"]) / 60.0
         same_day = r["date"] == today
         has_levels = r["target"] is not None and r["sl"] is not None
-        # Auto option-premium tracking (v16.8): every open VALIDATED signal automatically monitors option SL, T1, and T2
-        if (r.get("kind") == "VALIDATED" and r.get("option_strike") is not None and
+        # Premium-based option events use the latest option-chain LTP snapshot only. This is polling,
+        # not tick-level surveillance; quote gaps can miss intrabar touches.
+        if (r.get("kind") == "VALIDATED" and r.get("manual_entry_confirmed") is True and
+                r.get("trade_state") == "POSITION_OPEN" and r.get("option_strike") is not None and
                 r.get("option_expiry") == str(current_expiry)[:10] and option_df is not None and not option_df.empty and live):
             match = option_df[option_df["Strike"].astype(float).sub(float(r["option_strike"])).abs() < 0.001]
             side = r.get("option_side") or ("CE" if r.get("option_type") == "CALL" else "PE")
             if not match.empty:
+                # For a long option, the bid is the more realistic immediate exit-side quote.
                 mark = _n(match.iloc[0].get(f"{side}_Bid"))
                 if mark <= 0:
                     mark = _n(match.iloc[0].get(f"{side}_LTP"))
                 if mark > 0:
                     r["option_last_mark"] = round(mark, 2)
-                    eref = _n(r.get("option_entry_ref"))
-                    if eref > 0:
-                        ret_pct = (mark - eref) / eref * 100.0
-                        r["option_mfe_pct"] = round(max(float(r.get("option_mfe_pct") or 0.0), ret_pct), 2)
-                        r["option_mae_pct"] = round(max(float(r.get("option_mae_pct") or 0.0), -ret_pct), 2)
                     event = None
-                    cur_ev = r.get("option_event_state")
-                    if mark <= _n(r.get("option_stop")) and cur_ev not in ("STOP_LOSS", "TARGET_2", "EXITED"):
-                        # If T1 was already hit earlier, lock as T1 trail instead of full stop loss
-                        if cur_ev != "TARGET_1":
-                            event = "OPTION_STOP_LOSS"
-                            r["option_event_state"] = "STOP_LOSS"
-                    elif mark >= _n(r.get("option_target2")) and cur_ev not in ("TARGET_2", "STOP_LOSS", "EXITED"):
+                    if mark <= _n(r.get("option_stop")) and r.get("option_event_state") not in ("STOP_LOSS", "TARGET_2", "EXITED") and r.get("trade_state") == "POSITION_OPEN":
+                        event = "OPTION_STOP_LOSS"
+                        r["option_event_state"] = "STOP_LOSS"
+                    elif mark >= _n(r.get("option_target2")) and r.get("option_event_state") not in ("TARGET_2", "STOP_LOSS", "EXITED") and r.get("trade_state") == "POSITION_OPEN":
                         event = "OPTION_TARGET_2"
                         r["option_event_state"] = "TARGET_2"
-                    elif mark >= _n(r.get("option_target1")) and cur_ev not in ("TARGET_1", "TARGET_2", "STOP_LOSS", "EXITED"):
+                    elif mark >= _n(r.get("option_target1")) and r.get("option_event_state") not in ("TARGET_1", "TARGET_2", "STOP_LOSS", "EXITED") and r.get("trade_state") == "POSITION_OPEN":
                         event = "OPTION_TARGET_1"
                         r["option_event_state"] = "TARGET_1"
                     if event:
                         touched_now.append({**r, "event_type": event, "premium_mark": round(mark, 2),
                                             "outcome": event, "time": stamp, "resolved_time": stamp})
-                    changed = True
-        # v17.6: paper-track real option bid (+5/15/30/60m & peak/min) for EVERY logged signal (validated & rejected)
-        if (same_day and live and r.get("trk_strike") is not None and option_df is not None and not option_df.empty
-                and str(r.get("expiry")) == str(current_expiry)[:10]):
-            tm = option_df[option_df["Strike"].astype(float).sub(float(r["trk_strike"])).abs() < 0.001]
-            if not tm.empty:
-                tside = r.get("trk_side") or "CE"
-                bid_now = _n(tm.iloc[0].get(f"{tside}_Bid"))
-                if bid_now <= 0:
-                    bid_now = _n(tm.iloc[0].get(f"{tside}_LTP"))
-                if bid_now > 0:
-                    bid_now = round(bid_now, 2)
-                    r["trk_last_bid"], r["trk_last_ts"] = bid_now, now.timestamp()
-                    r["trk_max_bid"] = bid_now if r.get("trk_max_bid") is None else max(r["trk_max_bid"], bid_now)
-                    r["trk_min_bid"] = bid_now if r.get("trk_min_bid") is None else min(r["trk_min_bid"], bid_now)
-                    for h in PATH_HORIZONS:
-                        tol = 4 if h == 5 else HORIZON_TOL_MIN
-                        if r.get(f"p{h}") is None and h <= el <= h + tol:
-                            r[f"p{h}"] = bid_now
                     changed = True
         if same_day:
             later = [b for b in bars if b["ts"] >= r["ts"]]
@@ -4561,17 +3001,12 @@ def update_outcomes(recs, idx_name, spot, now, candles, intraday=None, option_df
                 r["mfe"] = round(max(r["mfe"], best), 2)
                 r["mae"] = round(max(r["mae"], worst), 2)
                 if r["first_touch"] is None and has_levels:
-                    req_t1_pts = min(0.55 * abs(r["target"] - r["entry"]), 0.26 * float(r.get("sd") or 230.0))
                     hit_t = (b["h"] >= r["target"]) if d > 0 else (b["l"] <= r["target"])
                     hit_s = (b["l"] <= r["sl"]) if d > 0 else (b["h"] >= r["sl"])
-                    if hit_t or r["mfe"] >= req_t1_pts:
-                        r["first_touch"] = "TARGET"
-                    elif hit_s:
+                    if hit_s:
                         r["first_touch"] = "STOP"
-                b_el = (b["ts"] - r["ts"]) / 60.0
-                for h in OUTCOME_HORIZONS:
-                    if r[f"s{h}"] is None and h <= b_el <= h + HORIZON_TOL_MIN:
-                        r[f"s{h}"] = round(b["c"], 2)
+                    elif hit_t:
+                        r["first_touch"] = "TARGET"
             if later:
                 changed = True
             if live:
@@ -4599,20 +3034,6 @@ def update_outcomes(recs, idx_name, spot, now, candles, intraday=None, option_df
         if past_close:
             if r["date"] in closes:
                 r["sclose"] = round(float(closes[r["date"]]), 2)
-            elif same_day and bars:
-                r["sclose"] = round(float(bars[-1]["c"]), 2)
-            elif same_day and spot > 0:
-                r["sclose"] = round(float(spot), 2)
-            if r.get("p_close") is None and r.get("trk_last_bid") is not None:
-                r["p_close"] = r["trk_last_bid"]
-            touched = r["first_touch"] in ("TARGET", "STOP")
-            if r.get("sclose") is None and not touched:
-                try:
-                    age_days = (now.date() - date.fromisoformat(r["date"])).days
-                except (TypeError, ValueError):
-                    age_days = DATA_GAP_AFTER_DAYS
-                if age_days < DATA_GAP_AFTER_DAYS:
-                    continue
             r["resolved"] = True
             if r["first_touch"] in ("TARGET", "STOP"):
                 r["outcome"] = r["first_touch"]
@@ -4644,47 +3065,6 @@ def scorecard_summary(recs):
                          "Hit % (moved the signal's way)": round(sum(1 for v, _ in vals if v > 0) / n * 100, 1) if n else None,
                          "Avg move (pts)": round(sum(v for v, _ in vals) / n, 1) if n else None,
                          "Avg move (σ)": round(sum(v / sd for v, sd in vals if sd) / n, 2) if n else None})
-    return pd.DataFrame(rows)
-
-
-def baseline_summary(recs, key="s60"):
-    """v17.6 (from v16.1): Hit rate against 'Always BUY' market drift with 95% Wilson confidence intervals."""
-    marked = [r for r in recs if r.get(key) is not None and r.get("signal") in ("BUY", "SELL") and r.get("entry") is not None]
-    if not marked:
-        return pd.DataFrame()
-    rows = []
-    n = len(marked)
-    ups = sum(1 for r in marked if r[key] - r["entry"] > 0)
-    lo, hi = wilson_interval(ups, n)
-    rows.append({"Group": "Always BUY (market drift)", "n": n, "Days": len({r["date"] for r in marked}),
-                 "Hit %": round(ups / n * 100, 1), "95% Low": round(lo, 1), "95% High": round(hi, 1),
-                 "Avg Move (pts)": round(sum(r[key] - r["entry"] for r in marked) / n, 1)})
-    for kind in ("VALIDATED", "REJECTED"):
-        sub = [r for r in marked if r.get("kind") == kind]
-        if not sub:
-            continue
-        k = len(sub)
-        w = sum(1 for r in sub if fav_points(r, key) > 0)
-        lo, hi = wilson_interval(w, k)
-        rows.append({"Group": f"{kind} (signal direction)", "n": k, "Days": len({r["date"] for r in sub}),
-                     "Hit %": round(w / k * 100, 1), "95% Low": round(lo, 1), "95% High": round(hi, 1),
-                     "Avg Move (pts)": round(sum(fav_points(r, key) for r in sub) / k, 1)})
-    return pd.DataFrame(rows)
-
-
-def option_paper_summary(recs):
-    """v17.6 (from v16.1): Real option-bid paper P&L (Ask at entry -> Bid at +5/15/30/60m & Close)."""
-    rows = []
-    labels = (("p5", "5 min"), ("p15", "15 min"), ("p30", "30 min"), ("p60", "60 min"), ("p_close", "Close"))
-    for kind in ("VALIDATED", "REJECTED"):
-        rs = [r for r in recs if r.get("kind") == kind and r.get("trk_ask0")]
-        for key, lab in labels:
-            vals = [(float(r[key]) - float(r["trk_ask0"])) / float(r["trk_ask0"]) * 100.0 for r in rs if r.get(key) is not None]
-            n = len(vals)
-            rows.append({"Type": kind, "Horizon": lab, "n": n,
-                         "Hit % (Bid > Ask-in)": round(sum(1 for v in vals if v > 0) / n * 100, 1) if n else None,
-                         "Avg Return %": round(sum(vals) / n, 2) if n else None,
-                         "Median Return %": round(float(np.median(vals)), 2) if n else None})
     return pd.DataFrame(rows)
 
 
@@ -4760,8 +3140,7 @@ def scorecard_to_df(recs):
         row = {k: r.get(k) for k in ("id", "kind", "date", "time", "index", "expiry", "signal", "entry", "target", "sl", "rr",
                                     "confidence", "net", "lean", "status", "bias", "pcr", "atm_iv", "sd", "flow_conc", "exh_buyer",
                                     "exh_seller", "exh_own_flag", "tone", "news_score", "reason", "rejection_category", "gex_regime", "regime_stable", "zero_gamma_dist_sigma", "excess_basis", "rr_25", "rr_shift", "bf_25", "s15", "s30", "s60",
-                                    "sclose", "first_touch", "mfe", "mae", "samples", "max_gap_min", "resolved", "outcome", "touch_alerted", "fp_bias", "fp_score", "fp_quad30", "fp_vwap_dist", "fp_orb", "fp_against",
-                                    "app_version", "idea_key", "is_repeat", "trk_strike", "trk_side", "trk_ask0", "trk_bid0", "p5", "p15", "p30", "p60", "p_close", "trk_max_bid", "trk_min_bid")}
+                                    "sclose", "first_touch", "mfe", "mae", "samples", "max_gap_min", "resolved", "outcome", "touch_alerted", "fp_bias", "fp_score", "fp_quad30", "fp_vwap_dist", "fp_orb", "fp_against")}
         for nm, v in (r.get("checks") or {}).items():
             row[f"check:{nm}"] = v
         for key in ("s15", "s30", "s60", "sclose"):
@@ -4893,7 +3272,7 @@ def esc(x):
 # SIDEBAR
 # ============================================================
 with st.sidebar:
-    st.markdown("### BBG // BUYER TERMINAL v17.8 ALL-IN-ONE")
+    st.markdown("### BBG // BUYER TERMINAL v15.1 HARDENED")
     dhan_token = clean(get_secret("DHAN_ACCESS_TOKEN", DEFAULT_DHAN_TOKEN))
     client_id = clean(get_secret("DHAN_CLIENT_ID", DEFAULT_CLIENT_ID))
     groq_key = get_secret("GROQ_API_KEY", DEFAULT_GROQ_KEY).strip()
@@ -4932,7 +3311,7 @@ with st.sidebar:
                  help="VETO AGAINST (v16 default) only blocks opposing futures flow and does not fail if footprint data is missing. REQUIRE ALIGNED blocks signals unless futures flow is aligned and available (the old v15 default). OFF disables the filter.")
     st.toggle("ENGINE-LED SIGNALS (AI advisory only)", value=bool(PARAM_DEFAULTS["engine_led"]), key="p_engine_led",
               help="ON (v16): direction comes from the option-chain engine and the AI council only comments. OFF: original v15 behaviour where the AI must say BUY/SELL and approve.")
-    st.selectbox("REGIME GATE", ["STRICT (trend only)", "SOFT (block against trend)", "OFF"], index=0, key="p_regime_gate",
+    st.selectbox("REGIME GATE", ["SOFT (block against trend)", "STRICT (trend only)", "OFF"], index=0, key="p_regime_gate",
                  help="STRICT is the old v15 rule (needs a clear trend). SOFT only blocks trades that fight a clear trend. OFF is advisory.")
     st.toggle("SESSION GUARD (no entries first 10 min / last 25 min)", value=bool(PARAM_DEFAULTS["session_guard"]), key="p_session_guard")
     st.toggle("EXPIRY MODE (auto on expiry day: half size, 2 trades, 2:30 pm cut-off, playbooks A/B/C)", value=bool(PARAM_DEFAULTS["expiry_mode"]), key="p_expiry_mode",
@@ -4958,7 +3337,7 @@ groq_model = GROQ_MODELS[0]
 live_news = True
 news = st.session_state.get("macro_note", "")      # optional note typed in the AI Council tab
 horizon_days, iv_shock, use_skew = 0.25, 15, True  # premium-scanner scenario settings
-USE_SURFACE_CHECK["on"] = False                    # observe-only (v17.4): prevents lagging basis from vetoing GAMMA BLAST trends
+USE_SURFACE_CHECK["on"] = False                    # synthetic-basis check is observe-only
 TIME_BASIS["mode"] = "calendar"
 exh_lookback = 15
 weekly_alert = True
@@ -4987,6 +3366,10 @@ vel = update_oi_velocity(m, key=f"{idx_name}|{expiry}")
 hist = record_snapshot(m, f"{idx_name}|{expiry}", store=data_ok)
 _rr0 = next((h.get("rr_25") for h in hist if h.get("rr_25") is not None), None)
 m["rr_shift"] = round(m["rr_25"] - _rr0, 2) if _rr0 is not None else 0.0
+m["exh"] = exhaustion(hist, m, prev_close, exh_lookback)
+m["exh_flag"] = exh_flag(m["exh"])
+m["market_regime"] = classify_market_regime(hist, m["spot"], info["step"], daily_sigma(m))
+m["iv_pct"] = log_iv_and_percentile(idx_name, m["atm_iv"], now_ist, data_ok)
 
 m["fp"] = {"ok": False, "why": "footprint.py not loaded: " + FP_IMPORT_ERR, "bias": "UNAVAILABLE"}
 fp_pc = {"ok": False}
@@ -4994,7 +3377,7 @@ if FP is not None and is_trading_day(now_ist):
     try:
         _day = now_ist.date().isoformat()
         _fut = _fp_future(idx_name, get_secret(f"FUT_ID_{FP.UNDERLYING.get(idx_name, idx_name)}", "").strip(), _day)
-        _bars = _fp_candles(_fut["security_id"], dhan_token, client_id, _day, _fut.get("segment") or ("BSE_FNO" if idx_name == "SENSEX" else "NSE_FNO"))
+        _bars = _fp_candles(_fut["security_id"], dhan_token, client_id, _day, _fut.get("segment", "NSE_FNO"))
         m["fp"] = FP.compute_footprint(_bars, daily_sigma(m), prev_close)
         m["fp"]["future"] = _fut
     except Exception as _e:
@@ -5004,14 +3387,6 @@ if FP is not None and is_trading_day(now_ist):
     except Exception:
         fp_pc = {"ok": False}
 m["fp_text"] = FP.footprint_text(m["fp"], fp_pc) if FP is not None else "- Futures footprint: unavailable"
-
-apply_rolling_flow_blend(m, hist)
-m["ignition"] = pre_chart_ignition(m, hist)
-m["exh"] = exhaustion(hist, m, prev_close, exh_lookback)
-m["exh_flag"] = exh_flag(m["exh"])
-m["market_regime"] = classify_market_regime(hist, m["spot"], info["step"], daily_sigma(m))
-m["reversal"] = detect_institutional_reversal(m, hist)
-m["iv_pct"] = log_iv_and_percentile(idx_name, m["atm_iv"], now_ist, data_ok)
 
 news_items, news_status, news_stale = [], ["LIVE NEWS: off"], False
 if live_news:
@@ -5133,34 +3508,9 @@ if alerts_on and tg_token and tg_chat:
             f"bigmove_{idx_name}_{now_ist.date().isoformat()}_{int(abs(move['pct']))}",
             f"⚠️ LARGE MOVE: {idx_name} is {move['pct']:+.2f}% vs previous close "
             f"({prev_close:,.0f} → {spot:,.0f}). Review any open positions. Analysis only, not trading advice.",
-            0, alert_cfg)
-    _rev_now = m.get("reversal") or {}
-    if _rev_now.get("dir", 0) != 0 and market_open_now(now_ist):
-        _rev_lvl = int(_rev_now.get("level") or spot)
-        _rev_key = f"rev_{idx_name}_{now_ist.date().isoformat()}_{_rev_now['type']}_{_rev_lvl}"
-        _rev_plan = select_buyer_contract(m, "BUY" if _rev_now["dir"] == 1 else "SELL", xctx_allowed(m, "BUY" if _rev_now["dir"] == 1 else "SELL"))
-        _rev_opt_txt = (
-            f"\nCandidate Contract: {idx_name} {_rev_plan['strike']:g} {_rev_plan['option_type']} exp {expiry} "
-            f"(Ask ₹{_rev_plan['ask']:.2f} | SL ₹{_rev_plan['stop_premium']:.2f} | T1 ₹{_rev_plan['target1_premium']:.2f})"
-            if _rev_plan else ""
-        )
-        _rev_msg = (
-            f"🚨 PRE-CHART TREND REVERSAL ALERT\n"
-            f"{idx_name} | {_rev_now['label']}\n"
-            f"Spot: {spot:,.2f} | Structural Wall: {_rev_lvl:,} | Action: {_rev_now['action']}\n"
-            f"Footprints: {', '.join(_rev_now.get('reasons', []))}"
-            f"{_rev_opt_txt}\n"
-            f"If holding an existing {'CALL' if _rev_now['dir'] == -1 else 'PUT'}, tighten stop / book profit. {now_ist.strftime('%H:%M:%S')} IST."
-        )
-        alert_results += fire_alert(_rev_key, _rev_msg, 30, alert_cfg)
+            24 * 60, alert_cfg)
     # Retry previously failed Telegram/webhook deliveries on subsequent app reruns.
     alert_results += process_alert_queue(alert_cfg)
-
-fast_mon = start_fast_exit_monitor(dhan_token, client_id, tg_token if alerts_on else "", tg_chat if alerts_on else "", log_hook)
-auto_cfg = load_auto_cfg()
-update_auto_trades_live(idx_name, expiry, m["df"], auto_cfg, dhan_token, client_id, alert_cfg, now_ist, m=m, sig=sig)
-if auto_cfg.get("enabled") and market_open_now(now_ist) and (new_recs or auto_cfg.get("churn_mode")):
-    auto_initiate_from_signals(new_recs, auto_cfg, dhan_token, client_id, alert_cfg, now_ist, live_sig=sig, idx_name=idx_name, expiry=expiry)
 
 # ============================================================
 # DASHBOARD HEADER
@@ -5169,7 +3519,7 @@ st.markdown(f"## {idx_name} // SPOT {spot:,.2f}" + (f"  ({spot - prev_close:+,.2
 
 _mkt = "OPEN" if market_open_now(now_ist) else "CLOSED"
 st.caption(f"{now_ist.strftime('%a %d %b %Y %H:%M:%S')} IST | market {_mkt} | regime {(m.get('market_regime') or {}).get('label', '—')} (advisory) | futures footprint {(m.get('fp') or {}).get('bias', '—')} | assumption-based GEX {m['gex_regime']} | AI: {gate_label}")
-st.info("OPTION-BUYER MODE: BUY CALL / BUY PUT / WAIT only. Validated signals automatically monitor live option premium SL / T1 / T2 and push alerts to Telegram while the app refreshes.")
+st.info("OPTION-BUYER MODE: BUY CALL / BUY PUT / WAIT only. Manual execution only. Premium monitoring starts only after you confirm an actual entry in Manual Trades. Alerts and monitoring are best-effort while the app refreshes; do not rely on them as your only risk control.")
 
 if not data_ok:
     st.warning(f"DATA GATE CLOSED: {gate_reason}. Figures below may be stale or off-hours; the AI council, history snapshots "
@@ -5186,7 +3536,7 @@ st.caption(f"DATA HEALTH: {_hc['OK']} OK · {_hc['WARN']} warn · {_hc['FAIL']} 
 
 tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
     "🛡️ Trade Desk", "📊 Dashboard & Engine", "📐 Day Levels", "🧭 Exhaustion", "🎯 Premium Scanner",
-    "🤖 AI Council & News", "📋 Option Chain", "📒 Scorecard", "🩺 Data Health", "📈 GEX & Skew", "🏦 Footprint", "⚡ Auto Trade & P&L"])
+    "🤖 AI Council & News", "📋 Option Chain", "📒 Scorecard", "🩺 Data Health", "📈 GEX & Skew", "🧾 Manual Trades", "🏦 Footprint"])
 
 with tab1:
     status = m["status"]
@@ -5361,22 +3711,11 @@ with tab6:
 
 
 with tab7:
-    st.markdown("#### 📒 SIGNAL SCORECARD (DEDUPLICATED + REAL OPTION-BID TRACKING)")
+    st.markdown("#### 📒 SIGNAL SCORECARD")
     recs = st.session_state["scorecard"]
     if recs:
-        backfill_ideas(recs)
-        recs_u = unique_ideas(recs)
-        st.caption(f"{len(recs)} logged rows = **{len(recs_u)} unique trade ideas** (30-min repeats excluded from stats below).")
-        _bl = baseline_summary(recs_u)
-        if not _bl.empty:
-            st.markdown("##### Against Market Drift ('Always BUY' 60-min Baseline)")
-            show_df(_bl, hide_index=True)
-        show_df(scorecard_summary(recs_u), hide_index=True)
-        _op = option_paper_summary(recs_u)
-        if not _op.empty and _op["n"].sum() > 0:
-            st.markdown("##### Real Option-Bid Paper P&L (Ask-in → Bid-out across +5/15/30/60m)")
-            show_df(_op, hide_index=True)
-        _ts = touch_stats(recs_u)
+        show_df(scorecard_summary(recs), hide_index=True)
+        _ts = touch_stats(recs)
         t1, t2, t3, t4, t5 = st.columns(5)
         t1.metric("TARGET HITS", _ts["target"])
         t2.metric("STOP HITS", _ts["stop"])
@@ -5508,6 +3847,96 @@ with tab9:
                 st.caption("Biases aligned across indices." if _b.nunique() == 1 else "Biases diverge across indices.")
 
 with tab10:
+    st.markdown("#### 🧾 MANUAL OPTION TRADE JOURNAL")
+    st.caption("A validated signal is not a position. Confirm only after your manual order actually fills. Monitoring remains best-effort and depends on the app refreshing.")
+    _records = st.session_state.get("scorecard", [])
+    _eligible = [r for r in _records if r.get("kind") == "VALIDATED" and r.get("option_strike") is not None
+                 and not r.get("manual_entry_confirmed") and r.get("trade_state", "SIGNAL_ONLY") not in ("EXITED", "CANCELLED")
+                 and 0 <= time.time() - float(r.get("ts", 0)) <= 30 * 60]
+    if _eligible:
+        st.markdown("##### Confirm an actual entry")
+        for _r in _eligible[-10:][::-1]:
+            _label = f"{_r.get('index')} {_r.get('option_strike')} {_r.get('option_type')} exp {_r.get('option_expiry')} — signal {_r.get('time')} IST — ref ₹{_r.get('option_entry_ref') or 0:.2f}"
+            with st.expander(_label):
+                with st.form(f"confirm_trade_{_r['id']}"):
+                    _fill = st.number_input("Actual average entry premium ₹", min_value=0.05, value=float(_r.get("option_entry_ref") or 1.0), step=0.05, key=f"fill_{_r['id']}")
+                    _qty = st.number_input("Quantity in option units (not lots)", min_value=1, value=1, step=1, key=f"qty_{_r['id']}")
+                    _fees_est = st.number_input("Estimated total entry fees ₹ (optional)", min_value=0.0, value=0.0, step=1.0, key=f"fees_{_r['id']}")
+                    _confirmed = st.form_submit_button("CONFIRM MANUAL ENTRY")
+                if _confirmed:
+                    _r["manual_entry_confirmed"] = True
+                    _r["trade_state"] = "POSITION_OPEN"
+                    _r["actual_entry_price"] = round(float(_fill), 2)
+                    _r["actual_entry_qty"] = int(_qty)
+                    _r["actual_entry_ts"] = time.time()
+                    _r["actual_fees"] = float(_fees_est)
+                    _r["option_stop"] = round(max(0.05, float(_fill) * (1 - BUYER_STOP_PCT / 100.0)), 2)
+                    _r["option_target1"] = round(float(_fill) * (1 + BUYER_TARGET1_PCT / 100.0), 2)
+                    _r["option_target2"] = round(float(_fill) * (1 + BUYER_TARGET2_PCT / 100.0), 2)
+                    _r["option_event_state"] = "POSITION_OPEN"
+                    save_scorecard(_records)
+                    _entry_msg = (f"🟢 MANUAL ENTRY CONFIRMED\n{_r.get('index')} {('BUY CALL' if _r.get('option_type') == 'CALL' else 'BUY PUT')} "
+                                  f"{_r.get('option_strike')} {_r.get('option_type')} exp {_r.get('option_expiry')}\n"
+                                  f"Actual entry ₹{float(_fill):.2f} × {int(_qty)} units | premium SL ₹{_r['option_stop']:.2f} | "
+                                  f"T1 ₹{_r['option_target1']:.2f} | T2 ₹{_r['option_target2']:.2f}\n"
+                                  "Manual tracking only; verify live prices and contract lot size.")
+                    if alerts_on and tg_token and tg_chat:
+                        _ar = fire_alert(f"manual_entry_{_r['id']}", _entry_msg, 24*60, alert_cfg)
+                        st.caption(f"Entry alert delivery result: {_ar or 'queued / cooldown / not sent'}")
+                    st.success("Entry recorded. Premium monitoring will begin on subsequent refreshes.")
+                    st.rerun()
+                if st.button("CANCEL / DID NOT ENTER", key=f"cancel_trade_{_r['id']}"):
+                    _r["trade_state"] = "CANCELLED"
+                    _r["manual_entry_confirmed"] = False
+                    save_scorecard(_records)
+                    st.info("Signal marked as not entered; premium monitoring will not run for it.")
+                    st.rerun()
+    else:
+        st.info("No unconfirmed validated option signals are available to confirm. New validated signals will appear here.")
+
+    _open_positions = [r for r in _records if r.get("trade_state") == "POSITION_OPEN" and r.get("manual_entry_confirmed")]
+    st.markdown("##### Open positions")
+    if _open_positions:
+        st.warning("This dashboard refreshes one selected index/expiry at a time. For reliable quote updates, keep the currently monitored position's index and expiry selected. Switching away can pause its premium monitoring; this is not an independent background monitor.")
+        for _r in _open_positions[::-1]:
+            if _r.get("index") != idx_name or str(_r.get("option_expiry")) != str(expiry)[:10]:
+                st.warning(f"Monitoring paused for {_r.get('index')} {_r.get('option_strike')} {_r.get('option_type')} exp {_r.get('option_expiry')}: select that index and expiry to refresh its option quote.")
+            _last = float(_r.get("option_last_mark") or 0.0)
+            _ent = float(_r.get("actual_entry_price") or 0.0)
+            _qty = int(_r.get("actual_entry_qty") or 0)
+            _u_pnl = (_last - _ent) * _qty if _last > 0 and _ent > 0 else None
+            st.write(f"**{_r.get('index')} { _r.get('option_strike')} {_r.get('option_type')} exp {_r.get('option_expiry')}** | entry ₹{_ent:.2f} × {_qty} | last observed bid/LTP ₹{_last:.2f} | indicative gross P&L " + (f"₹{_u_pnl:+,.2f}" if _u_pnl is not None else "n/a"))
+            with st.form(f"close_trade_{_r['id']}"):
+                _exit = st.number_input("Actual average exit premium ₹", min_value=0.05, value=float(_last if _last > 0 else _ent), step=0.05, key=f"exit_{_r['id']}")
+                _exit_fees = st.number_input("Total fees for whole trade ₹", min_value=0.0, value=0.0, step=1.0, key=f"exitfees_{_r['id']}")
+                _close = st.form_submit_button("RECORD EXIT / CLOSE POSITION")
+            if _close:
+                _r["actual_exit_price"] = round(float(_exit), 2)
+                _r["actual_exit_ts"] = time.time()
+                _r["actual_fees"] = float(_r.get("actual_fees") or 0.0) + float(_exit_fees)
+                _r["actual_net_pnl"] = round((float(_exit) - _ent) * _qty - float(_r["actual_fees"]), 2)
+                _r["trade_state"] = "EXITED"
+                _r["option_event_state"] = "EXITED"
+                save_scorecard(_records)
+                _exit_msg = (f"🏁 MANUAL POSITION CLOSED\n{_r.get('index')} {_r.get('option_strike')} {_r.get('option_type')} exp {_r.get('option_expiry')}\n"
+                             f"Entry ₹{_ent:.2f} | exit ₹{float(_exit):.2f} | units {_qty} | fees ₹{_r['actual_fees']:.2f} | NET P&L ₹{_r['actual_net_pnl']:+,.2f}")
+                if alerts_on and tg_token and tg_chat:
+                    fire_alert(f"manual_exit_{_r['id']}", _exit_msg, 24*60, alert_cfg)
+                st.success(f"Exit recorded. Net P&L ₹{_r['actual_net_pnl']:+,.2f}")
+                st.rerun()
+    else:
+        st.info("No manually confirmed open positions.")
+
+    _closed = [r for r in _records if r.get("trade_state") == "EXITED" and r.get("actual_net_pnl") is not None]
+    if _closed:
+        st.markdown("##### Closed trade results")
+        _closed_df = pd.DataFrame([{"Time": r.get("time"), "Index": r.get("index"), "Contract": f"{r.get('option_strike')} {r.get('option_type')}", "Entry ₹": r.get("actual_entry_price"), "Exit ₹": r.get("actual_exit_price"), "Units": r.get("actual_entry_qty"), "Fees ₹": r.get("actual_fees"), "Net P&L ₹": r.get("actual_net_pnl")} for r in _closed])
+        show_df(_closed_df, hide_index=True)
+        st.metric("REALIZED NET P&L (RECORDED TRADES)", f"₹{sum(float(r.get('actual_net_pnl') or 0) for r in _closed):+,.2f}")
+        st.caption("This is only as accurate as the entry, exit and fee values you record. It is not a backtest or a forecast.")
+
+
+with tab11:
     st.markdown("#### Institutional footprint: index futures (price, volume, open interest) and session VWAP")
     _fp = m.get("fp") or {}
     if not _fp.get("ok"):
@@ -5591,13 +4020,7 @@ with tab0:
     r1.metric("SESSION", _phase)
     r2.metric("DAYS TO EXPIRY", f"{m['dte']}", "EXPIRY DAY: size down" if m["dte"] == 0 else None, delta_color="off")
     r3.metric("MARKET REGIME", (m.get("market_regime") or {}).get("label", "—"))
-    _ign = m.get("ignition") or {}
-    _rev = m.get("reversal") or {}
-    if _rev.get("dir", 0) != 0:
-        r4.metric("REVERSAL / IGNITION", _rev.get("label", "NONE"), ", ".join(_rev.get("reasons", []))[:65], delta_color="off")
-        st.warning(f"**{_rev['label']}** — Institutional footprints detected at **{_rev['level']:,.0f}** ({', '.join(_rev.get('reasons', []))}). Suggested action: **{_rev['action']}**.")
-    else:
-        r4.metric("PRE-CHART IGNITION", _ign.get("label", "NONE"), ", ".join(_ign.get("reasons", []))[:60] or "awaiting basis/skew surge", delta_color="off")
+    r4.metric("DEALER GAMMA (assumed)", m["gex_regime"])
 
     # ---- 2b. Expiry Desk
     st.markdown("##### Expiry Desk")
@@ -5610,7 +4033,7 @@ with tab0:
         e2.metric("TRADES LEFT TODAY", f"{max(0, EXPIRY_MAX_TRADES - _risk['trades'])}", f"cap {EXPIRY_MAX_TRADES}", delta_color="off")
         e3.metric("NEW ENTRIES UNTIL", "2:30 pm", "ATM or 1 strike ITM only", delta_color="off")
         e4.metric("PIN (max pain)", f"{_xc['pin']:,.0f}", "PINNED: do not buy decay" if _xc.get("pinned") else f"{m['spot'] - _xc['pin']:+,.0f} vs spot", delta_color="off")
-        _a, _b, _g = _xc.get("A", {}), _xc.get("B", {}), _xc.get("G", {})
+        _a, _b = _xc.get("A", {}), _xc.get("B", {})
         _dirtxt = {1: "UP", -1: "DOWN", 0: "none"}
         _pbrows = [
             {"Playbook": "A  Morning scalp (9:30-11:00)", "Window open": "YES" if _xc.get("a_window") else "no",
@@ -5620,8 +4043,6 @@ with tab0:
             {"Playbook": "C  Late wall break + pin guard (1:30-2:30)", "Window open": "YES" if (_xc.get("b_window") and _xc.get("late")) else "no",
              "Trigger": _dirtxt[_b.get("dir", 0)] + (" (confirmed)" if _b.get("confirmed") else ""),
              "Reading": ("PINNED near max pain: no buying" if _xc.get("pinned") else _b.get("state", ""))},
-            {"Playbook": "G  0DTE Gamma Unpin + Ignition (9:25-2:30)", "Window open": "YES" if not _xc.get("cutoff") else "no",
-             "Trigger": _dirtxt[_g.get("dir", 0)] + (" (confirmed)" if _g.get("confirmed") else ""), "Reading": _g.get("state", "")},
         ]
         show_df(pd.DataFrame(_pbrows), hide_index=True)
         if _s and _s.get("playbook"):
@@ -5639,9 +4060,8 @@ with tab0:
     v1.metric("ATM IV", f"{m['atm_iv']:.1f}%",
               f"{_ivp['pct']}th pct of last 30d ({_ivp['n']} samples)" if _ivp["pct"] is not None
               else f"percentile building ({_ivp['n']}/30 samples)", delta_color="off")
-    _pk_rv = parkinson_intraday_vol(intraday)
-    v2.metric("REALISED VOL (10d / Intraday)", f"{_rv:.1f}% / {_pk_rv:.1f}%" if (_rv and _pk_rv) else (f"{_rv:.1f}%" if _rv else "n/a"),
-              f"IV minus 10d RV {m['atm_iv'] - _rv:+.1f} pts" if _rv else None, delta_color="off")
+    v2.metric("REALISED VOL (10d)", f"{_rv:.1f}%" if _rv else "n/a",
+              f"IV minus RV {m['atm_iv'] - _rv:+.1f} pts" if _rv else None, delta_color="off")
     v3.metric("ATM STRADDLE", f"{_straddle:,.0f}", f"expected daily move ±{_sd_pts:,.0f} pts", delta_color="off")
     v4.metric("EXPECTED MOVE TO EXPIRY (±)", f"{m['exp_move']:,.0f}", f"{m['lower_1sigma']:,.0f} to {m['upper_1sigma']:,.0f}", delta_color="off")
     st.caption("When IV is well above recent realised volatility, buyers need a bigger move than the market has recently delivered just to break even. "
@@ -5723,264 +4143,3 @@ with tab0:
         st.warning("CAUTION: " + ", ".join(r["Check"] for r in _warns) + ". Entry is your call; consider smaller size.")
     else:
         st.success("GO: all checks pass. Execute manually and respect your stop.")
-
-
-# ============================================================
-# v17.1 AUTO TRADE & LIVE P&L TAB
-# ============================================================
-with tab11:
-    st.markdown("#### ⚡ AUTOMATED TRADE EXECUTION & LIVE P&L DESK")
-    st.caption(
-        "Dynamic Lot-Split Rules: If Lot Size == 1, trails SL to Entry Cost at T1 and holds 100% until T2. "
-        "If Lot Size >= 2, automatically sells half your lots (lots // 2) at T1 and trails the remaining runner lots at Entry Cost until T2."
-    )
-
-    _acfg = load_auto_cfg()
-    _atrades = load_auto_trades()
-    _open_at = [t for t in _atrades if t.get("status") == "OPEN"]
-    _closed_at = [t for t in _atrades if t.get("status") == "CLOSED"]
-    _today_str = now_ist.date().isoformat()
-    _today_closed = [t for t in _closed_at if t.get("date") == _today_str]
-
-    _unreal_pnl = sum(float(t.get("unrealized_pnl") or 0.0) for t in _open_at)
-    _part_open_today = sum(float(t.get("partial_realized_pnl") or 0.0) for t in _open_at if t.get("date") == _today_str)
-    _real_today = sum(float(t.get("realized_pnl") or 0.0) for t in _today_closed) + _part_open_today
-    _total_today = _unreal_pnl + _real_today
-    _wins_today = sum(1 for t in _today_closed if float(t.get("realized_pnl") or 0.0) > 0)
-    _win_rate_td = (_wins_today / len(_today_closed) * 100.0) if _today_closed else 0.0
-
-    # ---- Top Banner: Automation Status + Emergency Kill-Switch Button
-    _st_col = "#00e676" if _acfg.get("enabled") else "#ff1744"
-    _st_txt = f"🟢 AUTOMATION ARMED ({_acfg.get('mode')})" if _acfg.get("enabled") else "🔴 AUTOMATION STOPPED (DISARMED)"
-    _fm_ok = bool(fast_mon.get("connected"))
-    _fm_col = "#00e676" if _fm_ok else "#ffab00"
-    _fm_txt = f"⚡ FAST EXIT MONITOR: {fast_mon.get('mode', 'Starting')} ({'LIVE' if _fm_ok else 'RECONNECTING'}) | Watching {fast_mon.get('open_watched', 0)} open trade(s) | Last tick: {fast_mon.get('last_tick', '—')}"
-    st.markdown(
-        f"<div style='border:2px solid {_st_col};background:#0f0f0f;padding:12px 16px;border-radius:6px;margin-bottom:8px;'>"
-        f"<span style='font-size:1.3rem;font-weight:800;color:{_st_col};'>{esc(_st_txt)}</span>"
-        f"&nbsp;&nbsp;|&nbsp;&nbsp;<span style='color:#ddd;'>Active Indices: <b>{esc(', '.join(_acfg.get('allowed_indices') or ['None']))}</b> "
-        f"| Open Trades: <b>{len(_open_at)}/{_acfg.get('max_open_positions', 1)}</b></span><br>"
-        f"<span style='font-size:0.9rem;color:{_fm_col};'>{esc(_fm_txt)}</span></div>",
-        unsafe_allow_html=True,
-    )
-
-    # ---- Live P&L Metrics Row
-    p1, p2, p3, p4, p5 = st.columns(5)
-    p1.metric("LIVE OPEN P&L ₹", f"₹{_unreal_pnl:+,.2f}", f"{len(_open_at)} active trade(s)", delta_color="off")
-    p2.metric("TODAY REALIZED P&L ₹", f"₹{_real_today:+,.2f}", f"{len(_today_closed)} closed (+T1 partial)", delta_color="off")
-    p3.metric("TODAY NET P&L ₹", f"₹{_total_today:+,.2f}", delta_color="off")
-    p4.metric("TODAY WIN RATE", f"{_win_rate_td:.1f}%" if _today_closed else "—", f"{_wins_today}/{len(_today_closed)} won", delta_color="off")
-    p5.metric("CURRENT INDEX LOT SIZE", f"{DEFAULT_LOT_SIZES.get(idx_name, 75)} units/lot", idx_name, delta_color="off")
-
-    st.markdown("---")
-
-    # ---- Controls: 1. Selecting Index, 2. Lot Sizes, 3. ON/OFF Switch & Emergency Close-All Kill-Switch
-    st.markdown("##### 🎛️ 1. Select Index · 2. Lot Sizes · 3. Master ON/OFF & Emergency Kill-Switch")
-    ctl_left, ctl_right = st.columns([2, 1])
-
-    with ctl_left:
-        with st.form("auto_trade_settings_form"):
-            _new_enabled = st.toggle(
-                "⚡ MASTER AUTOMATION ON / OFF (Auto-initiate trades when a VALIDATED signal fires)",
-                value=bool(_acfg.get("enabled")),
-            )
-            _mode_opts = ["PAPER (Simulated Live Quotes)", "LIVE (Dhan v2 Order API)"]
-            _cur_m_idx = 1 if str(_acfg.get("mode", "")).startswith("LIVE") else 0
-            _new_mode = st.selectbox("EXECUTION MODE", _mode_opts, index=_cur_m_idx)
-
-            _new_indices = st.multiselect(
-                "1️⃣ SELECT INDEX / INDICES FOR AUTO-TRADING",
-                options=list(INDEX_MAP.keys()),
-                default=[x for x in (_acfg.get("allowed_indices") or ["NIFTY 50"]) if x in INDEX_MAP],
-                help="Only validated signals on the indices selected here will automatically initiate trades.",
-            )
-
-            st.markdown("**2️⃣ LOT SIZES PER TRADE (1 Lot = Trail to T2 | ≥2 Lots = 50% Partial Book at T1 & Trail Rest to T2)**")
-            l1, l2, l3, l4, l5 = st.columns(5)
-            _lots_Now = _acfg.get("lots_by_index") or {}
-            _lot_n50 = l1.number_input(f"NIFTY 50 (×{DEFAULT_LOT_SIZES['NIFTY 50']})", min_value=1, max_value=50, value=int(_lots_Now.get("NIFTY 50", 1)), step=1)
-            _lot_bnk = l2.number_input(f"BANKNIFTY (×{DEFAULT_LOT_SIZES['NIFTY BANK']})", min_value=1, max_value=50, value=int(_lots_Now.get("NIFTY BANK", 1)), step=1)
-            _lot_fin = l3.number_input(f"FINNIFTY (×{DEFAULT_LOT_SIZES['FINNIFTY']})", min_value=1, max_value=50, value=int(_lots_Now.get("FINNIFTY", 1)), step=1)
-            _lot_mid = l4.number_input(f"MIDCP (×{DEFAULT_LOT_SIZES['MIDCPNIFTY']})", min_value=1, max_value=50, value=int(_lots_Now.get("MIDCPNIFTY", 1)), step=1)
-            _lot_sen = l5.number_input(f"SENSEX (×{DEFAULT_LOT_SIZES['SENSEX']})", min_value=1, max_value=50, value=int(_lots_Now.get("SENSEX", 1)), step=1)
-
-            o1, o2, o3 = st.columns(3)
-            _new_prod = o1.selectbox("PRODUCT TYPE", ["INTRADAY", "MARGIN"], index=0 if _acfg.get("product_type") == "INTRADAY" else 1)
-            _new_max_pos = o2.number_input("MAX SIMULTANEOUS OPEN TRADES", min_value=1, max_value=5, value=int(_acfg.get("max_open_positions", 1)), step=1)
-            _t1_choices = [
-                "Smart Split (1 Lot: Trail to T2 | ≥2 Lots: Book Half at T1 & Trail Rest to T2)",
-                "Book 100% Full Exit at T1",
-            ]
-            _new_t1_mode = o3.selectbox(
-                "T1 PROFIT RULE",
-                _t1_choices,
-                index=1 if _acfg.get("t1_rule") == "BOOK_100_T1" else 0,
-            )
-
-            r_col1, r_col2, r_col3 = st.columns(3)
-            _new_rev_exit = r_col1.toggle(
-                "🔄 AUTO-CLOSE ON REVERSAL SIGNAL (Protect Profit & Wait for Next Validated Signal)",
-                value=bool(_acfg.get("exit_on_reversal", True)),
-            )
-            _t2_choices = [
-                "Chandelier Trail Beyond T2 (Lock T2 & Trail Below Peak Until Reversal)",
-                "Fixed Exit 100% at T2",
-            ]
-            _new_t2_mode = r_col2.selectbox(
-                "T2 RUNNER RULE",
-                _t2_choices,
-                index=1 if _acfg.get("t2_runner_rule") == "BOOK_T2" else 0,
-            )
-            _new_trail_pct = r_col3.number_input(
-                "CHANDELIER TRAIL % BELOW PEAK",
-                min_value=5.0, max_value=35.0, value=float(_acfg.get("t2_trail_pct", 15.0)), step=2.5,
-            )
-
-            st.markdown("**⚡ CONTINUOUS SCALP / CHURN MODE (Book 10–20 pts & keep churning until 15:20 IST)**")
-            ch1, ch2, ch3, ch4, ch5 = st.columns(5)
-            _new_churn = ch1.toggle("🔄 CHURN MODE ON", value=bool(_acfg.get("churn_mode", False)))
-            _new_c_tgt = ch2.number_input("TARGET PTS", min_value=5.0, max_value=50.0, value=float(_acfg.get("churn_target_pts", 15.0)), step=1.0)
-            _new_c_sl = ch3.number_input("SL PTS", min_value=5.0, max_value=50.0, value=float(_acfg.get("churn_sl_pts", 15.0)), step=1.0)
-            _new_c_be = ch4.number_input("BE LOCK PTS", min_value=3.0, max_value=30.0, value=float(_acfg.get("churn_be_lock_pts", 8.0)), step=1.0)
-            _new_c_cd = ch5.number_input("COOLDOWN (MIN)", min_value=1, max_value=30, value=int(_acfg.get("churn_cooldown_min", 3)), step=1)
-
-            _save_btn = st.form_submit_button("💾 SAVE AUTO-TRADE SETTINGS", use_container_width=True)
-            if _save_btn:
-                _updated_cfg = {
-                    "enabled": bool(_new_enabled),
-                    "mode": _new_mode,
-                    "allowed_indices": _new_indices if _new_indices else ["NIFTY 50"],
-                    "lots_by_index": {
-                        "NIFTY 50": int(_lot_n50),
-                        "NIFTY BANK": int(_lot_bnk),
-                        "FINNIFTY": int(_lot_fin),
-                        "MIDCPNIFTY": int(_lot_mid),
-                        "SENSEX": int(_lot_sen),
-                    },
-                    "product_type": _new_prod,
-                    "max_open_positions": int(_new_max_pos),
-                    "t1_rule": "BOOK_100_T1" if _new_t1_mode.startswith("Book 100%") else "AUTO_SPLIT",
-                    "exit_on_reversal": bool(_new_rev_exit),
-                    "t2_runner_rule": "BOOK_T2" if _new_t2_mode.startswith("Fixed") else "CHANDELIER",
-                    "t2_trail_pct": float(_new_trail_pct),
-                    "churn_mode": bool(_new_churn),
-                    "churn_target_pts": float(_new_c_tgt),
-                    "churn_sl_pts": float(_new_c_sl),
-                    "churn_be_lock_pts": float(_new_c_be),
-                    "churn_cooldown_min": int(_new_c_cd),
-                }
-                save_auto_cfg(_updated_cfg)
-                st.success("Auto-trade settings saved!")
-                st.rerun()
-
-    with ctl_right:
-        st.markdown("##### 🚨 3️⃣ Emergency Kill-Switch")
-        st.warning("Clicking **STOP AUTOMATION & CLOSE ALL ACTIVE TRADES** immediately disarms automation and squares off all open positions at the latest market price.")
-        if st.button("🛑 STOP AUTOMATION & CLOSE ALL ACTIVE TRADES", type="primary", use_container_width=True, key="btn_kill_all"):
-            _n_closed = emergency_kill_all_auto_trades(_acfg, dhan_token, client_id, alert_cfg, now_ist)
-            st.error(f"Automation DISARMED. Closed {_n_closed} open trade(s).")
-            st.rerun()
-
-        if _acfg.get("enabled"):
-            if st.button("⏸️ PAUSE AUTOMATION ONLY (Keep Open Trades)", use_container_width=True, key="btn_pause_auto"):
-                _acfg["enabled"] = False
-                save_auto_cfg(_acfg)
-                st.info("Automation paused. Existing open trades will still be monitored.")
-                st.rerun()
-        else:
-            if st.button("▶️ ARM / START AUTOMATION NOW", use_container_width=True, key="btn_start_auto"):
-                _acfg["enabled"] = True
-                save_auto_cfg(_acfg)
-                st.success("Automation ARMED!")
-                st.rerun()
-
-        if _acfg.get("churn_mode"):
-            if st.button("🔄 STOP CHURN MODE (Switch to Normal T1/T2)", use_container_width=True, key="btn_churn_off"):
-                _acfg["churn_mode"] = False
-                save_auto_cfg(_acfg)
-                st.info("Churn Mode OFF. Switched back to Normal T1/T2 Mode.")
-                st.rerun()
-        else:
-            if st.button("⚡ START CHURN MODE (15pt Scalps Till 15:20)", use_container_width=True, key="btn_churn_on"):
-                _acfg["churn_mode"] = True
-                _acfg["enabled"] = True
-                save_auto_cfg(_acfg)
-                st.success("CHURN MODE ARMED! Will scalp 15 pts continuously until 15:20 IST.")
-                st.rerun()
-
-    st.markdown("---")
-
-    # ---- Active Open Trades Section (with individual 1-click Close button)
-    st.markdown("##### 🟢 Active Open Trades (Live P&L & Partial-Split Status)")
-    if _open_at:
-        for _t in _open_at[::-1]:
-            _upnl = float(_t.get("unrealized_pnl") or 0.0)
-            _ppnl = float(_t.get("partial_realized_pnl") or 0.0)
-            _comb_pnl = _upnl + _ppnl
-            _upct = float(_t.get("pnl_pct") or 0.0)
-            _pcol = "#00e676" if _comb_pnl >= 0 else "#ff1744"
-            _init_l = int(_t.get("initial_lots") or _t.get("lots") or 1)
-            _cur_l = int(_t.get("lots") or 1)
-            _t1_badge = (
-                f" | 🏦 <b>T1 Banked: {_t.get('t1_booked_lots')}L @ ₹{_t.get('t1_booked_price', 0):.2f} (₹{_ppnl:+,.2f})</b>"
-                if _t.get("t1_booked_lots")
-                else (" | 🛡️ <b>1-Lot T1 Hit: SL Trailed to Cost</b>" if _t.get("t1_hit") else "")
-            )
-            c_info, c_btn = st.columns([4, 1])
-            with c_info:
-                st.markdown(
-                    f"<div style='border:1px solid {_pcol};background:#111;padding:10px 14px;border-radius:5px;'>"
-                    f"<b>{esc(_t.get('index'))} — {esc(_t.get('symbol'))}</b> &nbsp;[{esc(_t.get('mode'))}] "
-                    f"| Open Lots: <b>{_cur_l}/{_init_l}</b> ({_t.get('qty')} qty) | Entry: <b>₹{_t.get('entry_price', 0):.2f}</b> "
-                    f"→ Live: <b>₹{_t.get('last_price', 0):.2f}</b> (Peak ₹{_t.get('peak_price', 0):.2f}){_t1_badge}<br>"
-                    f"<span style='color:{_pcol};font-size:1.1rem;font-weight:700;'>Open P&L: ₹{_upnl:+,.2f} | Total Trade P&L: ₹{_comb_pnl:+,.2f} ({_upct:+.1f}%)</span> "
-                    f"&nbsp;|&nbsp; Auto SL: <b>₹{_t.get('sl_price', 0):.2f}</b> {'[COST TRAIL]' if _t.get('t1_hit') else ''} "
-                    f"| T1: <b>₹{_t.get('t1_price', 0):.2f}</b> | T2: <b>₹{_t.get('t2_price', 0):.2f}</b></div>",
-                    unsafe_allow_html=True,
-                )
-            with c_btn:
-                if st.button(f"❌ Close {int(_t['strike'])} {_t['side']}", key=f"cls_one_{_t['trade_id']}", use_container_width=True):
-                    _all_t = load_auto_trades()
-                    for _x in _all_t:
-                        if _x.get("trade_id") == _t["trade_id"] and _x.get("status") == "OPEN":
-                            close_auto_trade_record(
-                                _x, float(_x.get("last_price") or _x.get("entry_price") or 0.05),
-                                "MANUAL BUTTON CLOSE", _acfg, dhan_token, client_id, alert_cfg, now_ist
-                            )
-                    save_auto_trades(_all_t)
-                    st.success(f"Closed {_t.get('symbol')}.")
-                    st.rerun()
-    else:
-        st.info("No active open trades right now. When a VALIDATED signal fires on an enabled index while Automation is ON, it will appear here automatically.")
-
-    # ---- Closed Auto-Trades Log & CSV Export
-    st.markdown("##### 📜 Auto-Trade Execution Log & Closed P&L")
-    if _atrades:
-        _at_df = pd.DataFrame([
-            {
-                "Date": t.get("date"), "Entry Time": t.get("entry_time"), "Exit Time": t.get("exit_time") or "OPEN",
-                "Mode": t.get("mode"), "Index": t.get("index"), "Contract": t.get("symbol"),
-                "Initial Lots": t.get("initial_lots", t.get("lots")), "Open Lots": t.get("lots") if t.get("status") == "OPEN" else 0,
-                "T1 Booked Lots": t.get("t1_booked_lots", 0), "T1 Booked ₹": t.get("t1_booked_price"),
-                "Entry ₹": t.get("entry_price"), "Last/Exit ₹": t.get("exit_price") or t.get("last_price"),
-                "Peak ₹": t.get("peak_price"), "SL ₹": t.get("sl_price"), "T1 ₹": t.get("t1_price"), "T2 ₹": t.get("t2_price"),
-                "Status": t.get("status"), "Exit Reason": t.get("exit_reason"),
-                "P&L %": t.get("pnl_pct"),
-                "Net P&L ₹": t.get("realized_pnl") if t.get("status") == "CLOSED" else (float(t.get("unrealized_pnl") or 0.0) + float(t.get("partial_realized_pnl") or 0.0)),
-                "Order ID": t.get("entry_order_id"),
-            }
-            for t in _atrades[::-1]
-        ])
-        show_df(_at_df, hide_index=True)
-        b_dl, b_clr = st.columns([1, 1])
-        b_dl.download_button(
-            "📄 Download Auto-Trades CSV",
-            _at_df.to_csv(index=False),
-            file_name="auto_trades_log.csv",
-            mime="text/csv",
-        )
-        if b_clr.button("🗑️ Clear Closed History (Keep Open Trades)", key="btn_clr_at"):
-            save_auto_trades([t for t in _atrades if t.get("status") == "OPEN"])
-            st.rerun()
-    else:
-        st.caption("No auto-trades recorded yet.")
