@@ -1,5 +1,5 @@
 """
-VIPUL OPTIONS BUYER SIGNAL TERMINAL v16.0 (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
+VIPUL OPTIONS BUYER SIGNAL TERMINAL v19.0 (CROSS-MARKET + OI ACCELERATION + OPTION-BID ATTRIBUTION) (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
 v15.1 adds an INSTITUTIONAL FOOTPRINT layer (needs footprint.py next to this file):
  - Index-futures price / volume / open-interest flow + session VWAP decide whether money is really moving your way
  - Footprint filter: VETO AGAINST (default) / REQUIRE ALIGNED / OFF; blocked signals are still logged with footprint fields
@@ -64,7 +64,7 @@ try:
 except ImportError:
     Groq = None
 
-st.set_page_config(page_title="Vipul Options Buyer Terminal v16.0", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Vipul Options Buyer Terminal v19.0", layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
 # CSS
@@ -365,6 +365,8 @@ def _fetch_chain_raw(scrip, seg, expiry, token, client_id):
             "PE_Bid": _n(pe.get("top_bid_price")), "PE_Ask": _n(pe.get("top_ask_price")),
             "CE_Vol": _n(ce.get("volume")), "PE_Vol": _n(pe.get("volume")),
             "CE_Delta": _n(ce_g.get("delta")), "PE_Delta": _n(pe_g.get("delta")),
+            "CE_Theta": _n(ce_g.get("theta")), "PE_Theta": _n(pe_g.get("theta")),
+            "CE_Vega": _n(ce_g.get("vega")), "PE_Vega": _n(pe_g.get("vega")),
         })
     df = pd.DataFrame(rows)
     if df.empty:
@@ -1222,6 +1224,120 @@ Return ONLY this JSON:
 # ============================================================
 # SIGNAL VALIDATION
 # ============================================================
+
+# ============================================================
+# v19.0 UPGRADES: CROSS-MARKET CONFIRMATION + OI ACCELERATION + PRICE STRUCTURE
+# ============================================================
+HEAVYWEIGHTS = {
+    "HDFCBANK": 1333,
+    "RELIANCE": 2885,
+    "ICICIBANK": 4963,
+    "INFY": 1594,
+    "TCS": 11536,
+}
+
+
+@st.cache_data(ttl=45, show_spinner=False)
+def fetch_cross_market(token, client_id):
+    """Fetch live India VIX (IDX_I: 21) and Top-5 NIFTY heavyweights (NSE_EQ) for cross-market confirmation."""
+    out = {"ok": False, "vix": None, "vix_chg_pct": None, "adv": 0, "dec": 0, "breadth_bias": "NEUTRAL", "details": []}
+    try:
+        r = requests.post(
+            f"{BASE_URL}/marketfeed/quote",
+            headers=auth_headers(token, client_id),
+            json={"IDX_I": [21], "NSE_EQ": list(HEAVYWEIGHTS.values())},
+            timeout=8,
+        )
+        if not r.ok:
+            return out
+        data = r.json().get("data") or {}
+        vix_q = (data.get("IDX_I") or {}).get("21") or {}
+        v_ltp = _n(vix_q.get("last_price"))
+        v_net = _n(vix_q.get("net_change"))
+        if v_ltp > 0:
+            out["vix"] = round(v_ltp, 2)
+            v_prev = v_ltp - v_net
+            if v_prev > 0:
+                out["vix_chg_pct"] = round(v_net / v_prev * 100.0, 2)
+
+        eq_data = data.get("NSE_EQ") or {}
+        adv = dec = 0
+        for sym, sid in HEAVYWEIGHTS.items():
+            q = eq_data.get(str(sid)) or {}
+            ltp, net = _n(q.get("last_price")), _n(q.get("net_change"))
+            if ltp > 0:
+                prev = ltp - net
+                pct = (net / prev * 100.0) if prev > 0 else 0.0
+                if pct > 0.10:
+                    adv += 1
+                elif pct < -0.10:
+                    dec += 1
+                out["details"].append(f"{sym} {pct:+.2f}%")
+        out["adv"], out["dec"] = adv, dec
+        if adv >= 4:
+            out["breadth_bias"] = "BULLISH"
+        elif dec >= 4:
+            out["breadth_bias"] = "BEARISH"
+        elif adv >= 3 and dec <= 1:
+            out["breadth_bias"] = "BULLISH"
+        elif dec >= 3 and adv <= 1:
+            out["breadth_bias"] = "BEARISH"
+        out["ok"] = (out["vix"] is not None) or len(out["details"]) >= 3
+    except Exception:
+        pass
+    return out
+
+
+def compute_oi_acceleration(hist, m):
+    """Multi-window (3m, 5m, 15m) near-spot OI velocity (% per min) and acceleration (3m vs 15m)."""
+    out = {"ready": False, "dir": 0, "accel": 0.0, "v3": 0.0, "v5": 0.0, "v15": 0.0, "label": "NEUTRAL"}
+    if not hist or len(hist) < 3:
+        return out
+    now_s = hist[-1]
+    win = near_window(m["spot"], m["step"])
+    rates = {}
+    for mins in (3, 5, 15):
+        ref = _nearest(hist[:-1], now_s["ts"] - mins * 60)
+        dt_m = (now_s["ts"] - ref["ts"]) / 60.0
+        if dt_m < max(1.5, mins * 0.4):
+            rates[mins] = None
+            continue
+        fl = lb_flows(ref, now_s, m["spot"], win)
+        ce_net = (fl["ce_build"] - fl["ce_unw"]) / fl["ce_base"] * 100.0 if fl["ce_base"] > 0 else 0.0
+        pe_net = (fl["pe_build"] - fl["pe_unw"]) / fl["pe_base"] * 100.0 if fl["pe_base"] > 0 else 0.0
+        rates[mins] = (pe_net - ce_net) / dt_m  # positive = bullish flow rate (% per min)
+    if rates[3] is None or rates[15] is None:
+        return out
+    accel = rates[3] - rates[15]
+    out.update({
+        "ready": True,
+        "v3": round(rates[3], 3),
+        "v5": round(rates[5], 3) if rates[5] is not None else 0.0,
+        "v15": round(rates[15], 3),
+        "accel": round(accel, 3),
+    })
+    if accel >= 0.08 and rates[3] > 0:
+        out["dir"], out["label"] = 1, f"BULLISH ACCEL ({accel:+.2f}%/m)"
+    elif accel <= -0.08 and rates[3] < 0:
+        out["dir"], out["label"] = -1, f"BEARISH ACCEL ({accel:+.2f}%/m)"
+    return out
+
+
+def price_structure_vote(intraday, spot):
+    """Intraday 1-min EMA9 vs EMA21 structure vote."""
+    bars = [b for b in (intraday or []) if b.get("c", 0) > 0]
+    if len(bars) < 22:
+        return 0, "insufficient intraday bars"
+    closes = pd.Series([float(b["c"]) for b in bars[-80:]])
+    ema9 = float(closes.ewm(span=9, adjust=False).mean().iloc[-1])
+    ema21 = float(closes.ewm(span=21, adjust=False).mean().iloc[-1])
+    s_now = float(spot) if spot else float(closes.iloc[-1])
+    if ema9 > ema21 and s_now >= ema21:
+        return 1, f"uptrend (spot {s_now:,.0f} >= EMA21 {ema21:,.0f}, EMA9 > EMA21)"
+    if ema9 < ema21 and s_now <= ema21:
+        return -1, f"downtrend (spot {s_now:,.0f} <= EMA21 {ema21:,.0f}, EMA9 < EMA21)"
+    return 0, f"mixed (EMA9 {ema9:,.0f} vs EMA21 {ema21:,.0f})"
+
 FAMILIES = ("flow", "positioning", "volatility")
 
 
@@ -1246,25 +1362,31 @@ def chain_checks(m):
     mt = j["micro_turn"]
     add("Micro-turn", 1 if "BULLISH" in mt else -1 if "BEARISH" in mt else 0, mt, "flow")
 
-    if e["wr_known"]:
-        wgap = e["pe_write_share"] - e["ce_write_share"]
-        add("Premium-confirmed writing", 1 if wgap >= WRITE_EDGE else -1 if wgap <= -WRITE_EDGE else 0,
-            f"puts written {e['pe_write_share']:.0%} vs calls written {e['ce_write_share']:.0%} of new OI "
-            f"(write = OI up and premium down vs prev close; confounded by the index's own move)", "flow")
+    # v19.0: Multi-window OI Acceleration (replaces noisy previous-close writing check)
+    acc = m.get("oi_accel") or {}
+    if acc.get("ready"):
+        add("OI Velocity & Acceleration (3m vs 15m)", int(acc.get("dir", 0)),
+            f"3m {acc['v3']:+.2f}%/m vs 15m {acc['v15']:+.2f}%/m ({acc['label']})", "flow")
     else:
-        add("Premium-confirmed writing", 0, "no previous-close premiums available", "flow")
+        add("OI Velocity & Acceleration (3m vs 15m)", 0, "collecting 15m history", "flow")
 
+    # Lagging positional metrics kept observe-only (counted=False)
     li = j["ladder_imbalance"]
-    add("Ladder OI imbalance", 1 if li >= 0.10 else -1 if li <= -0.10 else 0, f"{li:+.3f} (PE-heavy is +)", "positioning")
-    add("PCR (whole chain)", 1 if m["pcr"] > 1.2 else -1 if m["pcr"] < 0.8 else 0, f"{m['pcr']:.2f}", "positioning")
-    add("Bias score", 1 if m["score"] > 55 else -1 if m["score"] < 45 else 0, f"{m['score']}/100 {m['bias']}", "positioning")
+    checks.append({"name": "Ladder OI imbalance", "v": 1 if li >= 0.10 else -1 if li <= -0.10 else 0,
+                   "counted": False, "detail": f"{li:+.3f} [observe only]", "family": "positioning"})
+    checks.append({"name": "PCR (whole chain)", "v": 1 if m["pcr"] > 1.2 else -1 if m["pcr"] < 0.8 else 0,
+                   "counted": False, "detail": f"{m['pcr']:.2f} [observe only]", "family": "positioning"})
 
-    if m["dte"] > 2:
-        add("Spot vs max pain", 0, f"{m['dte']}d to expiry: max-pain pull is weak, neutral", "volatility")
-    else:
-        mp_gap = m["spot"] - m["max_pain"]
-        add("Spot vs max pain", -1 if mp_gap > m["step"] else 1 if mp_gap < -m["step"] else 0,
-            f"spot {m['spot']:,.0f} vs max pain {m['max_pain']:,.0f} ({mp_gap:+,.0f})", "volatility")
+    # Cross-Market Breadth (Top-5 Heavyweights)
+    cm = m.get("cross_market") or {}
+    cm_v = 1 if cm.get("breadth_bias") == "BULLISH" else -1 if cm.get("breadth_bias") == "BEARISH" else 0
+    add("Cross-Market Breadth (Top-5 Heavyweights)", cm_v,
+        f"Adv {cm.get('adv', 0)} / Dec {cm.get('dec', 0)} | VIX {cm.get('vix') or 'n/a'} ({cm.get('vix_chg_pct') or 0:+.1f}%)"
+        if cm.get("ok") else "cross-market quote unavailable", "positioning")
+
+    # Intraday Price Structure (EMA9 vs EMA21)
+    ps_v, ps_d = price_structure_vote(m.get("intraday_bars"), m.get("spot"))
+    add("Intraday Price Structure (EMA9/21)", ps_v, ps_d, "volatility")
 
     thr = max(BASIS_MIN_PTS, 0.0004 * m["spot"])
     ex_b = m.get("excess_basis", 0.0)
@@ -1316,10 +1438,12 @@ def select_buyer_contract(m, direction, allowed=None):
         return None
     best = min(rows, key=lambda x: x["score"])
     premium = best["ask"]  # conservative manual-entry reference; never treat this as a fill
+    dte_now = int(m.get("dte", 99))
+    sl_p, t1_p, t2_p = (18.0, 30.0, 60.0) if dte_now == 0 else (20.0, 22.0, 38.0)
     best["entry_ref"] = round(premium, 2)
-    best["stop_premium"] = round(max(0.05, premium * (1 - BUYER_STOP_PCT / 100.0)), 2)
-    best["target1_premium"] = round(premium * (1 + BUYER_TARGET1_PCT / 100.0), 2)
-    best["target2_premium"] = round(premium * (1 + BUYER_TARGET2_PCT / 100.0), 2)
+    best["stop_premium"] = round(max(0.05, premium * (1 - sl_p / 100.0)), 2)
+    best["target1_premium"] = round(premium * (1 + t1_p / 100.0), 2)
+    best["target2_premium"] = round(premium * (1 + t2_p / 100.0), 2)
     best["max_loss_per_unit"] = round(premium - best["stop_premium"], 2)
     best["risk_note"] = "Premium levels are fixed-percentage planning levels, not exchange orders or a modelled fill. Re-check live bid/ask before entry."
     return best
@@ -1854,6 +1978,32 @@ def build_signal(m, ai, data_ok=True, gate_reason=""):
                 new_t = entry + cap if sig == "BUY" else entry - cap
                 notes.append(f"Target trimmed from {target:,.0f} to {new_t:,.0f} (more than {P('target_cap'):.1f} daily sigma away is not a realistic intraday target).")
                 target = new_t
+
+    # v19.0 Cross-market VIX spike guard: do not buy CALLs if India VIX is spiking >= +4% and breadth is bearish
+    _cm = m.get("cross_market") or {}
+    if sig == "BUY" and _cm.get("ok"):
+        if (_cm.get("vix_chg_pct") or 0.0) >= 4.0 and _cm.get("breadth_bias") == "BEARISH":
+            notes.append(f"BUY rejected: India VIX spiking ({_cm['vix_chg_pct']:+.1f}%) with bearish heavyweight breadth.")
+            sig = "WAIT"
+
+    # v19.0 Time-Windowed Bear Rally-Fade (11:30-14:45 IST, EMA9 < EMA21, +10m bounce >= +15 pts, 15m scalp)
+    if sig == "WAIT" and data_ok:
+        _bars = [b for b in (m.get("intraday_bars") or []) if b.get("c", 0) > 0]
+        if len(_bars) >= 22:
+            _cl = pd.Series([float(b["c"]) for b in _bars[-40:]])
+            _e9 = float(_cl.ewm(span=9, adjust=False).mean().iloc[-1])
+            _e21 = float(_cl.ewm(span=21, adjust=False).mean().iloc[-1])
+            _s10 = float(_cl.iloc[-1]) - float(_cl.iloc[-11]) if len(_cl) >= 11 else 0.0
+            _now_m = datetime.now(IST).hour * 60 + datetime.now(IST).minute
+            _fp_b = (m.get("fp") or {}).get("bias")
+            if (11 * 60 + 30) <= _now_m <= (14 * 60 + 45) and _e9 < _e21 and _s10 >= 15.0 and _fp_b != "BULLISH":
+                _bp_try = select_buyer_contract(m, "SELL", xctx_allowed(m, "SELL"))
+                if _bp_try is not None:
+                    sig, direction = "SELL", -1
+                    target = entry - max(0.35 * daily_sigma(m), 0.75 * m["step"])
+                    sl = entry + max(0.22 * daily_sigma(m), 0.50 * m["step"])
+                    playbook, time_stop = "FADE", 15
+                    notes.append(f"v19 Bear Rally-Fade (11:30-14:45, EMA9 < EMA21, +10m bounce {_s10:+.1f} pts): 15m scalp.")
 
     if sig != "WAIT":
         risk = abs(entry - sl)
@@ -3272,7 +3422,7 @@ def esc(x):
 # SIDEBAR
 # ============================================================
 with st.sidebar:
-    st.markdown("### BBG // BUYER TERMINAL v15.1 HARDENED")
+    st.markdown("### BBG // BUYER TERMINAL v19.0")
     dhan_token = clean(get_secret("DHAN_ACCESS_TOKEN", DEFAULT_DHAN_TOKEN))
     client_id = clean(get_secret("DHAN_CLIENT_ID", DEFAULT_CLIENT_ID))
     groq_key = get_secret("GROQ_API_KEY", DEFAULT_GROQ_KEY).strip()
@@ -3370,6 +3520,8 @@ m["exh"] = exhaustion(hist, m, prev_close, exh_lookback)
 m["exh_flag"] = exh_flag(m["exh"])
 m["market_regime"] = classify_market_regime(hist, m["spot"], info["step"], daily_sigma(m))
 m["iv_pct"] = log_iv_and_percentile(idx_name, m["atm_iv"], now_ist, data_ok)
+m["oi_accel"] = compute_oi_acceleration(hist, m)
+m["cross_market"] = fetch_cross_market(dhan_token, client_id) if is_trading_day(now_ist) else {"ok": False}
 
 m["fp"] = {"ok": False, "why": "footprint.py not loaded: " + FP_IMPORT_ERR, "bias": "UNAVAILABLE"}
 fp_pc = {"ok": False}
@@ -3448,6 +3600,12 @@ if m.get("dte") == 0 and P("expiry_mode") and is_trading_day(now_ist):
         _xi = fetch_intraday_candles(info["scrip"], info["seg"], dhan_token, client_id)
     except Exception:
         _xi = []
+if not _xi and is_trading_day(now_ist):
+    try:
+        _xi = fetch_intraday_candles(info["scrip"], info["seg"], dhan_token, client_id)
+    except Exception:
+        _xi = []
+m["intraday_bars"] = _xi
 m["xctx"] = expiry_context(m, _xi, hist, now_ist)
 sig = build_signal(m, ai, data_ok, gate_reason) if (ai_ok or P("engine_led")) else None
 scan, smeta = premium_scanner(m, horizon_days, iv_shock, skew=use_skew)
@@ -4019,8 +4177,13 @@ with tab0:
     r1, r2, r3, r4 = st.columns(4)
     r1.metric("SESSION", _phase)
     r2.metric("DAYS TO EXPIRY", f"{m['dte']}", "EXPIRY DAY: size down" if m["dte"] == 0 else None, delta_color="off")
-    r3.metric("MARKET REGIME", (m.get("market_regime") or {}).get("label", "—"))
-    r4.metric("DEALER GAMMA (assumed)", m["gex_regime"])
+    _cm_td = m.get("cross_market") or {}
+    _oa_td = m.get("oi_accel") or {}
+    r3.metric("CROSS-MARKET (VIX / BREADTH)",
+              f"VIX {_cm_td['vix']}" if _cm_td.get("vix") else "n/a",
+              f"{_cm_td.get('breadth_bias', 'NEUTRAL')} ({_cm_td.get('adv', 0)}/{_cm_td.get('dec', 0)})", delta_color="off")
+    r4.metric("OI ACCELERATION (3m vs 15m)", _oa_td.get("label", "NEUTRAL"),
+              f"Regime: {(m.get('market_regime') or {}).get('label', '—')}", delta_color="off")
 
     # ---- 2b. Expiry Desk
     st.markdown("##### Expiry Desk")
