@@ -1,5 +1,5 @@
 """
-VIPUL OPTIONS BUYER SIGNAL TERMINAL v19.0 (CROSS-MARKET + OI ACCELERATION + OPTION-BID ATTRIBUTION) (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
+VIPUL OPTIONS BUYER SIGNAL TERMINAL v20.0 (MONTE CARLO + CROSS-MARKET + OI ACCELERATION + OPTION-BID ATTRIBUTION) (v15.1 + Trade Desk, engine-led signals, session guard, daily risk lock)
 v15.1 adds an INSTITUTIONAL FOOTPRINT layer (needs footprint.py next to this file):
  - Index-futures price / volume / open-interest flow + session VWAP decide whether money is really moving your way
  - Footprint filter: VETO AGAINST (default) / REQUIRE ALIGNED / OFF; blocked signals are still logged with footprint fields
@@ -64,7 +64,7 @@ try:
 except ImportError:
     Groq = None
 
-st.set_page_config(page_title="Vipul Options Buyer Terminal v19.0", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Vipul Options Buyer Terminal v20.0", layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
 # CSS
@@ -2512,6 +2512,104 @@ def premium_scanner(m, horizon_days=0.25, iv_shock=15.0, skew=True):
     return out, meta
 
 
+
+def monte_carlo_option_paths(m, plan, horizon_min=30, n_paths=20000, n_steps=30,
+                             iv_mean_reversion=0.20, iv_shock_pct=8.0,
+                             jump_probability=0.01, jump_sigma_pct=0.35,
+                             slippage_pct=0.5, fees_per_unit=0.0, seed=7):
+    """Advisory physical-measure scenario simulation for a LONG option.
+
+    Spot follows GBM with current ATM IV as the diffusion anchor, plus rare
+    normally-distributed jump shocks. IV follows a simple mean-reverting
+    log-vol process. Option values are Black-Scholes repriced and rescaled to
+    the live ask reference. It is a scenario engine, not calibrated forecasting.
+    """
+    required = ("strike", "side", "entry_ref", "stop_premium", "target1_premium", "target2_premium", "iv")
+    if not isinstance(plan, dict) or any(plan.get(k) is None for k in required):
+        raise ValueError("A complete selected buyer contract is required.")
+    S0 = float(m.get("spot") or 0.0)
+    K = float(plan["strike"])
+    entry = float(plan["entry_ref"])
+    iv0_pct = float(plan["iv"] or m.get("atm_iv") or 0.0)
+    if min(S0, K, entry, iv0_pct) <= 0:
+        raise ValueError("Spot, strike, entry premium and IV must be positive.")
+    if horizon_min <= 0 or n_paths < 1000 or n_steps < 2:
+        raise ValueError("Use a positive horizon, at least 1,000 paths and 2+ steps.")
+    is_call = str(plan["side"]).upper() == "CE"
+    T0 = max(float(m.get("t_years") or (max(int(m.get("dte", 0)), 0) / 365.0)), 1.0 / (365.0 * 24.0 * 60.0))
+    dt_year = (horizon_min / (365.0 * 24.0 * 60.0)) / n_steps
+    rng = np.random.default_rng(int(seed))
+    spot = np.full(n_paths, S0, dtype=float)
+    iv = np.full(n_paths, iv0_pct / 100.0, dtype=float)
+    entry_model = bs_price(S0, K, T0, iv0_pct, is_call)
+    if not np.isfinite(entry_model) or entry_model <= 1e-8:
+        raise ValueError("Black-Scholes anchor is not usable for this contract.")
+    stop = float(plan["stop_premium"])
+    t1, t2 = float(plan["target1_premium"]), float(plan["target2_premium"])
+    barrier = np.zeros(n_paths, dtype=np.int8)  # -1 stop, 1 target1, 2 target2
+    hit_step = np.full(n_paths, -1, dtype=np.int16)
+    terminal_premium = np.full(n_paths, entry, dtype=float)
+    mu = 0.0  # physical-measure scenario: zero directional drift; no edge is assumed.
+    for step_i in range(1, n_steps + 1):
+        z = rng.standard_normal(n_paths)
+        jump = rng.random(n_paths) < (jump_probability * (horizon_min / 375.0 / n_steps))
+        jz = rng.standard_normal(n_paths)
+        spot *= np.exp((mu - 0.5 * iv * iv) * dt_year + iv * np.sqrt(dt_year) * z
+                       + jump * (jz * (jump_sigma_pct / 100.0)))
+        # Mean-reverting log-IV shock; shock scale is expressed as a fraction of IV.
+        iv_z = rng.standard_normal(n_paths)
+        log_iv = np.log(np.maximum(iv, 1e-5))
+        log_iv += iv_mean_reversion * (np.log(max(iv0_pct / 100.0, 1e-5)) - log_iv) * (horizon_min / n_steps / 30.0)
+        log_iv += iv_z * (iv_shock_pct / 100.0) * np.sqrt(horizon_min / n_steps / 30.0)
+        iv = np.clip(np.exp(log_iv), 0.03, 2.50)
+        remaining_T = max(T0 - dt_year * step_i, 1.0 / (365.0 * 24.0 * 60.0))
+        sig = iv
+        sq = sig * np.sqrt(remaining_T)
+        d1 = (np.log(np.maximum(spot, 1e-8) / K) + (RISK_FREE - DIV_YIELD + 0.5 * sig * sig) * remaining_T) / np.maximum(sq, 1e-12)
+        d2 = d1 - sq
+        # vectorized normal CDF via erf
+        cdf = np.vectorize(math.erf, otypes=[float])
+        nd1 = 0.5 * (1.0 + cdf(d1 / np.sqrt(2.0)))
+        nd2 = 0.5 * (1.0 + cdf(d2 / np.sqrt(2.0)))
+        if is_call:
+            theoretical = spot * np.exp(-DIV_YIELD * remaining_T) * nd1 - K * np.exp(-RISK_FREE * remaining_T) * nd2
+        else:
+            theoretical = K * np.exp(-RISK_FREE * remaining_T) * (1.0 - nd2) - spot * np.exp(-DIV_YIELD * remaining_T) * (1.0 - nd1)
+        premium = np.maximum(0.01, entry * np.maximum(theoretical, 0.0) / entry_model)
+        terminal_premium = premium
+        fresh = barrier == 0
+        stop_hit = fresh & (premium <= stop)
+        target2_hit = fresh & (premium >= t2)
+        target1_hit = fresh & (premium >= t1) & ~target2_hit
+        barrier[stop_hit] = -1; hit_step[stop_hit] = step_i
+        barrier[target2_hit] = 2; hit_step[target2_hit] = step_i
+        barrier[target1_hit] = 1; hit_step[target1_hit] = step_i
+    # Conservative exit-side adjustment for long options; fee is per option unit.
+    exit_mark = terminal_premium * (1.0 - max(0.0, slippage_pct) / 100.0) - max(0.0, fees_per_unit)
+    pnl_pct = (exit_mark / entry - 1.0) * 100.0
+    resolved = barrier != 0
+    # For barrier paths, estimate exit at the relevant premium barrier (with costs).
+    barrier_exit = np.where(barrier == -1, stop, np.where(barrier == 1, t1, np.where(barrier == 2, t2, terminal_premium)))
+    barrier_pnl = (barrier_exit * (1.0 - max(0.0, slippage_pct) / 100.0) - max(0.0, fees_per_unit) - entry) / entry * 100.0
+    outcomes = np.where(resolved, barrier_pnl, pnl_pct)
+    q = np.percentile(outcomes, [5, 25, 50, 75, 95])
+    tail5 = outcomes[outcomes <= q[0]]
+    var95 = float(max(0.0, -q[0]))
+    es95 = float(max(0.0, -tail5.mean())) if len(tail5) else 0.0
+    return {
+        "paths": int(n_paths), "horizon_min": int(horizon_min),
+        "stop_first_pct": float(np.mean(barrier == -1) * 100.0),
+        "target1_first_pct": float(np.mean(barrier == 1) * 100.0),
+        "target2_first_pct": float(np.mean(barrier == 2) * 100.0),
+        "no_barrier_pct": float(np.mean(~resolved) * 100.0),
+        "positive_net_pct": float(np.mean(outcomes > 0) * 100.0),
+        "median_net_pct": float(q[2]), "p05_net_pct": float(q[0]), "p95_net_pct": float(q[4]),
+        "var95_pct": var95, "es95_pct": es95,
+        "median_spot": float(np.median(spot)), "spot_p05": float(np.percentile(spot, 5)),
+        "spot_p95": float(np.percentile(spot, 95)),
+        "assumptions": "Zero excess spot drift; current contract IV anchored to ATM-style GBM diffusion; mean-reverting IV shocks; rare Gaussian jumps; Black-Scholes repricing scaled to ask; costs applied to exit. No empirical calibration or overnight gap model.",
+    }
+
 def fmt_scanner(df):
     d = df.copy()
     for c in ("x0.5σ", "x1σ", "x1.5σ", "xWall", "x1σ crush", "x1σ spike", "xWrong"):
@@ -4229,6 +4327,46 @@ with tab0:
     v4.metric("EXPECTED MOVE TO EXPIRY (±)", f"{m['exp_move']:,.0f}", f"{m['lower_1sigma']:,.0f} to {m['upper_1sigma']:,.0f}", delta_color="off")
     st.caption("When IV is well above recent realised volatility, buyers need a bigger move than the market has recently delivered just to break even. "
                "The percentile is built from samples this app records while it is open, so it needs weeks to become meaningful; keep BBG_DATA_DIR on a persistent disk.")
+
+
+    # ---- Monte Carlo: advisory distribution for the selected long-option contract
+    st.markdown("##### 🎲 Monte Carlo premium-risk lab (advisory only)")
+    _mc_plan = (_s or {}).get("buyer_plan") if _s and _s.get("signal") in ("BUY", "SELL") else None
+    if not _mc_plan:
+        st.info("Monte Carlo needs a current BUY CALL / BUY PUT candidate that passes the existing contract selector. It does not create or approve a trade.")
+    else:
+        st.caption(f"Candidate: {idx_name} {_mc_plan['strike']:g} {_mc_plan['option_type']} | ask reference ₹{_mc_plan['entry_ref']:.2f} | stop ₹{_mc_plan['stop_premium']:.2f} | T1 ₹{_mc_plan['target1_premium']:.2f} | T2 ₹{_mc_plan['target2_premium']:.2f}")
+        mc1, mc2, mc3, mc4 = st.columns(4)
+        _mc_h = mc1.selectbox("HORIZON (minutes)", [15, 30, 45, 60, 90, 120], index=1, key="mc_horizon")
+        _mc_n = mc2.selectbox("PATHS", [5000, 10000, 20000, 50000], index=2, key="mc_paths")
+        _mc_slip = mc3.number_input("EXIT SLIPPAGE %", min_value=0.0, max_value=5.0, value=0.5, step=0.1, key="mc_slip")
+        _mc_fee = mc4.number_input("FEES / UNIT ₹", min_value=0.0, max_value=100.0, value=0.0, step=0.5, key="mc_fee")
+        if st.button("RUN MONTE CARLO", key="run_mc", type="primary"):
+            try:
+                _mc_res = monte_carlo_option_paths(m, _mc_plan, horizon_min=int(_mc_h), n_paths=int(_mc_n),
+                                                   n_steps=min(int(_mc_h), 60), slippage_pct=float(_mc_slip),
+                                                   fees_per_unit=float(_mc_fee), seed=int(now_ist.timestamp()) % 1000000)
+                st.session_state["mc_result"] = {"key": f"{idx_name}|{expiry}|{_mc_plan['side']}|{_mc_plan['strike']}|{_mc_h}", "result": _mc_res}
+            except Exception as _mce:
+                st.error(f"Monte Carlo could not run: {str(_mce)[:220]}")
+        _mc_saved = st.session_state.get("mc_result") or {}
+        _mc_key = f"{idx_name}|{expiry}|{_mc_plan['side']}|{_mc_plan['strike']}|{_mc_h}"
+        if _mc_saved.get("key") == _mc_key:
+            _mr = _mc_saved["result"]
+            a1, a2, a3, a4 = st.columns(4)
+            a1.metric("STOP FIRST", f"{_mr['stop_first_pct']:.1f}%")
+            a2.metric("T1 FIRST", f"{_mr['target1_first_pct']:.1f}%")
+            a3.metric("T2 FIRST", f"{_mr['target2_first_pct']:.1f}%")
+            a4.metric("NO BARRIER", f"{_mr['no_barrier_pct']:.1f}%")
+            b1, b2, b3, b4 = st.columns(4)
+            b1.metric("POSITIVE NET PATHS", f"{_mr['positive_net_pct']:.1f}%")
+            b2.metric("MEDIAN NET", f"{_mr['median_net_pct']:+.1f}%")
+            b3.metric("5TH PCT NET", f"{_mr['p05_net_pct']:+.1f}%")
+            b4.metric("95% EXPECTED SHORTFALL", f"{_mr['es95_pct']:.1f}%")
+            st.caption(f"Underlying terminal 5th–95th percentile: {_mr['spot_p05']:,.1f}–{_mr['spot_p95']:,.1f}; median {_mr['median_spot']:,.1f}. {int(_mr['paths']):,} paths over {_mr['horizon_min']} minutes.")
+            with st.expander("Monte Carlo model assumptions and limitations"):
+                st.write(_mr["assumptions"])
+                st.warning("These are model-conditional scenario frequencies, not calibrated real-world probabilities. Public option quotes, IV dynamics, jumps, intraminute barriers, spreads and gaps are simplified. Do not use these outputs to override the signal engine, risk veto, daily lock, manual checklist or your actual premium stop. The engine does not size positions from Monte Carlo.")
 
     # ---- 4. Level map
     st.markdown("##### Level map (confluence zones)")
