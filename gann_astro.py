@@ -215,7 +215,9 @@ def _jd_utc(dt_ist):
 
 
 def _sid_lon(jd, planet_id):
-    res, _ = swe.calc_ut(jd, planet_id, swe.FLG_SIDEREAL | swe.FLG_SPEED)
+    # FLG_MOSEPH uses the built-in Moshier ephemeris (no external .se1 files needed on Streamlit Cloud)
+    flags = swe.FLG_MOSEPH | swe.FLG_SIDEREAL | swe.FLG_SPEED
+    res, _ = swe.calc_ut(jd, planet_id, flags)
     return float(res[0]) % 360.0, float(res[3])
 
 
