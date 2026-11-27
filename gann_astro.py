@@ -862,6 +862,12 @@ def compute_10day_roadmap(start_dt_ist):
                 "Sun-Moon Yoga": st_["sm_yoga"],
                 "Regime": f"{'🔥 TREND' if st_['regime'] == 'TREND' else '🛡️ FADE'} ({st_['elements']})",
                 "Trap Flags": "⚠️ " + ", ".join(traps) if traps else "✅ Clean",
+                "Trading Plan": (
+                    "🔴 Cut Size 50% — Wait for Wall Reversals" if len(traps) >= 2
+                    else ("🟡 Caution 50% — Strict 2-Bar Only" if len(traps) == 1
+                          else ("🟢 100% Size — Ride Trend Breakouts" if st_["regime"] == "TREND"
+                                else "🟢 100% Size — Fade Gann Walls"))
+                ),
                 "Sector Focus": st_["sector_focus"],
             })
             added += 1
@@ -958,4 +964,63 @@ def build_crisp_gann_astro_signal(spot, gann, tb, vedic):
         "signal": f"⛔ NO TRADE  |  BOX {gann['s1']:,.0f} – {gann['r1']:,.0f}",
         "badge": "NO TRADE", "color": "#ffab00", "lot_mult": lot_mult,
         "action": f"{trig}  |  {size_note}",
+    }
+
+
+def build_plain_vedic_verdict(v):
+    """Converts all Vedic metrics into a 2-second plain-English trading verdict."""
+    if not v or not v.get("ok"):
+        return {
+            "headline": "⛔ ASTRO ENGINE OFFLINE",
+            "color": "#ffab00",
+            "badge": "NO DATA",
+            "style": "Install pysweph to enable live Vedic analysis.",
+            "traps_txt": "N/A",
+            "action": "Check requirements.txt.",
+        }
+
+    traps = []
+    if v.get("is_bhadra"):
+        traps.append("Bhadra Stop-Hunt Trap")
+    if v.get("is_kaal_trap"):
+        traps.append(f"{v.get('kaal_short')} Window")
+    if v.get("is_bad_sm_yoga"):
+        traps.append(f"Bad Yoga ({v.get('sm_yoga', '').split(' ')[0]})")
+    if v.get("sbc_mal_count", 0) >= 2:
+        traps.append(f"SBC Malefic Obstruction ({v['sbc_mal_count']} planets)")
+    if v.get("latta") and v.get("latta") != "Clear":
+        traps.append("Latta Sudden Kick")
+    if v.get("hora_rel") == "ENEMY":
+        traps.append("Enemy Hora (Whipsaw)")
+
+    is_trend = v.get("regime") == "TREND"
+    style = (
+        "DIRECTIONAL TREND — Ride confirmed 5m 2-bar breakouts past D-R1 / D-S1."
+        if is_trend
+        else "RANGE / FADE WALLS — Ignore mid-range chop; trade 2-bar reactions only at D-S1 or D-R1."
+    )
+
+    if len(traps) >= 2:
+        headline = f"🔴 HIGH TRAP RISK  |  CUT SIZE TO 50%  |  {'TREND' if is_trend else 'FADE WALLS'}"
+        color, badge = "#ff1744", "50% SIZE — DEFENSIVE"
+    elif len(traps) == 1:
+        headline = f"🟡 CAUTION ({traps[0].upper()})  |  TRADE 50% SIZE  |  {'TREND' if is_trend else 'FADE WALLS'}"
+        color, badge = "#ffab00", "50% SIZE — CAUTION"
+    else:
+        if is_trend:
+            headline = "🟢 CLEAN TREND ENVIRONMENT  |  100% SIZE ALLOWED"
+            color, badge = "#00e676", "100% SIZE — TREND"
+        else:
+            headline = "🟢 CLEAN FADE-WALLS ENVIRONMENT  |  100% SIZE AT WALLS"
+            color, badge = "#00e676", "100% SIZE — FADE WALLS"
+
+    traps_txt = " + ".join(traps) if traps else "None — Clear Runway"
+    action = f"STYLE: {style}  |  ACTIVE TRAPS: {traps_txt}  |  SECTORS: {v.get('sector_focus', 'Broad Market')}"
+    return {
+        "headline": headline,
+        "color": color,
+        "badge": badge,
+        "style": style,
+        "traps_txt": traps_txt,
+        "action": action,
     }
