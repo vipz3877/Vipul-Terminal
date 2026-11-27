@@ -217,8 +217,10 @@ def _jd_utc(dt_ist):
 def _sid_lon(jd, planet_id):
     # FLG_MOSEPH uses the built-in Moshier ephemeris (no external .se1 files needed on Streamlit Cloud)
     flags = swe.FLG_MOSEPH | swe.FLG_SIDEREAL | swe.FLG_SPEED
-    res, _ = swe.calc_ut(jd, planet_id, flags)
-    return float(res[0]) % 360.0, float(res[3])
+    out = swe.calc_ut(jd, planet_id, flags)
+    # Handle both (xx_tuple, retflag) and flat 6-tuple return formats across swisseph builds
+    xx = out[0] if (isinstance(out, (tuple, list)) and len(out) > 0 and isinstance(out[0], (tuple, list))) else out
+    return float(xx[0]) % 360.0, float(xx[3])
 
 
 def _approx_mumbai_sun(dt_ist):
