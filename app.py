@@ -4647,7 +4647,7 @@ def _render_gann_tab():
 
 @_ga_fragment
 def _render_vedic_tab():
-    st.markdown("#### 🌌 FULL-FLEDGED VEDIC FINANCIAL ASTROLOGY (P.V.R. NARASIMHA RAO ENGINE)")
+    st.markdown("#### 🌌 VEDIC MARKET WEATHER & FORWARD PREDICTIONS (MUMBAI IST)")
     if GA is None:
         st.error(f"gann_astro.py not loaded: {GA_ERR}")
         return
@@ -4669,68 +4669,41 @@ def _render_vedic_tab():
         st.warning(_v.get("error", "pysweph not installed."))
         return
 
-    # Row 1: Full 5-Limb Panchanga + Kaal/Upagraha
-    _tithi_tone = "bear" if _v["is_bhadra"] else "bull"
-    _sm_tone = "bear" if _v["is_bad_sm_yoga"] else "bull"
-    _kaal_tone = "bear" if _v["is_kaal_trap"] else "bull"
+    # 1. PLAIN-ENGLISH 2-SECOND TRADING VERDICT BANNER
+    _vd = GA.build_plain_vedic_verdict(_v)
     st.markdown(
-        f"<div class='ga-grid-4'>"
-        f"<div class='ga-card {_tithi_tone}'><div class='ga-lbl'>TITHI & KARANA</div><div class='ga-val'>{esc(_v['tithi'])}</div><div class='ga-sub'>Karana: <b>{esc(_v['karana'])}</b>  |  Lord: {esc(_v['tithi_lord'])} ({esc(_v['tithi_group'])})</div></div>"
-        f"<div class='ga-card info'><div class='ga-lbl'>NAKSHATRA & SECTOR</div><div class='ga-val'>{esc(_v['nakshatra_name'])}</div><div class='ga-sub'>Ruler: <b>{esc(_v['nakshatra_lord'])}</b>  |  {esc(_v['sector_focus'])}</div></div>"
-        f"<div class='ga-card {_sm_tone}'><div class='ga-lbl'>SUN-MOON YOGA (27)</div><div class='ga-val'>{esc(_v['sm_yoga'])}</div><div class='ga-sub'>Tara Bala: {esc(_v['tara_bala'])}</div></div>"
-        f"<div class='ga-card {_kaal_tone}'><div class='ga-lbl'>KAAL & UPAGRAHA TRAP</div><div class='ga-val'>{esc(_v['kaal_short'])}</div><div class='ga-sub'>{esc(_v['kaal_detail'])}</div></div>"
-        f"</div>",
+        f"<div class='bbg-panel' style='border:2px solid {_vd['color']};'>"
+        f"<div style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:6px;'>"
+        f"<span class='bbg-title'>PLAIN-ENGLISH ASTRO VERDICT (NO DECODING NEEDED)</span>"
+        f"<span class='ga-badge' style='background:{_vd['color']};color:#000;'>{esc(_vd['badge'])}</span></div>"
+        f"<div class='bbg-big' style='color:{_vd['color']};font-size:21px;'>{esc(_vd['headline'])}</div>"
+        f"<div class='bbg-desc'>{esc(_vd['action'])}</div></div>",
         unsafe_allow_html=True,
     )
 
-    # Row 2: 4-Element Visual Balance Bar
+    # 2. SIMPLE 3-CARD EXECUTIVE SUMMARY (STYLE, TRAP STATUS, FOCUS SECTORS)
     _t_pct = round(_v["trend_score"] / 7.0 * 100.0, 1)
     _f_pct = round(100.0 - _t_pct, 1)
-    st.markdown(
-        f"<div class='ga-bar-wrap'>"
-        f"<div style='display:flex;justify-content:space-between;font-size:12px;'>"
-        f"<span style='color:#00e676;font-weight:700;'>🔥 TREND (Fire+Earth): {_v['trend_score']}/7 ({_t_pct:.0f}%)</span>"
-        f"<span style='color:#29b6f6;font-weight:700;'>HL: {esc(_v['hl_rashi'])} | GL: {esc(_v['gl_rashi'])} | Retro: {esc(_v['retros'])} | Combust: {esc(_v['combust'])}</span>"
-        f"<span style='color:#ffab00;font-weight:700;'>🛡️ FADE WALLS (Air+Water): {_v['fade_score']}/7 ({_f_pct:.0f}%)</span></div>"
-        f"<div class='ga-track' style='display:flex;overflow:hidden;'>"
-        f"<div style='width:{_t_pct}%;background:#00e676;height:100%;'></div>"
-        f"<div style='width:{_f_pct}%;background:#ffab00;height:100%;'></div>"
-        f"</div>"
-        f"<div class='ga-scale'><span>{esc(_v['kaal_summary'])}</span></div></div>",
-        unsafe_allow_html=True,
-    )
-
-    # Row 3: SBC Vedha, Latta Kick & Compound Hora
-    _sbc_tone = "bear" if _v["sbc_mal_count"] >= 2 else ("warn" if _v["sbc_mal_count"] == 1 else "bull")
-    _lat_tone = "bear" if _v["latta"] != "Clear" else "bull"
-    _h_tone = "bull" if _v["hora_rel"] == "FRIEND" else ("bear" if _v["hora_rel"] == "ENEMY" else "info")
+    _trap_tone = "bear" if _vd["traps_txt"] != "None — Clear Runway" else "bull"
+    _reg_tone = "bull" if _v["regime"] == "TREND" else "warn"
     st.markdown(
         f"<div class='ga-grid-3'>"
-        f"<div class='ga-card {_sbc_tone}'><div class='ga-lbl'>SARVATOBHADRA VEDHA (28★)</div><div class='ga-val' style='font-size:15px;'>Malefic: {esc(_v['sbc_mal_vedha'])}</div><div class='ga-sub'>Benefic: {esc(_v['sbc_ben_vedha'])}</div></div>"
-        f"<div class='ga-card {_lat_tone}'><div class='ga-lbl'>LATTA (PLANETARY KICK)</div><div class='ga-val' style='font-size:15px;'>{esc(_v['latta'])}</div><div class='ga-sub'>Special Aspects: {esc(_v['moon_aspects'])}</div></div>"
-        f"<div class='ga-card {_h_tone}'><div class='ga-lbl'>COMPOUND HORA FRIENDSHIP</div><div class='ga-val' style='font-size:15px;'>{esc(_v['hora_verdict'])}</div><div class='ga-sub'>Rashi Ingress: {esc(_v['rashi_ingress'])}</div></div>"
+        f"<div class='ga-card {_reg_tone}'><div class='ga-lbl'>1. MARKET STYLE</div><div class='ga-val'>{'🔥 TREND BREAKOUTS' if _v['regime'] == 'TREND' else '🛡️ FADE GANN WALLS'}</div><div class='ga-sub'>Trend {_t_pct:.0f}% vs Fade {_f_pct:.0f}% ({esc(_v['elements'])})</div></div>"
+        f"<div class='ga-card {_trap_tone}'><div class='ga-lbl'>2. ACTIVE TRAPS NOW</div><div class='ga-val' style='font-size:15px;'>{esc(_vd['traps_txt'])}</div><div class='ga-sub'>Kaal Windows: {esc(_v['kaal_summary'])}</div></div>"
+        f"<div class='ga-card info'><div class='ga-lbl'>3. FOCUS SECTORS & TURN</div><div class='ga-val' style='font-size:15px;'>{esc(_v['sector_focus'])}</div><div class='ga-sub'>Rashi Ingress: {esc(_v['rashi_ingress'])}</div></div>"
         f"</div>",
         unsafe_allow_html=True,
     )
 
-    # Row 4: Macro Yogas + Argala on Moon
-    st.markdown(
-        f"<div class='ga-grid-2'>"
-        f"<div class='ga-card warn' style='min-height:68px;'><div class='ga-lbl'>MACRO YOGAS (6/8 SHADASHTAK & 5/9 NAVPANCHAM)</div><div class='ga-val' style='font-size:14px;'>{esc(_v['yogas'])}</div></div>"
-        f"<div class='ga-card info' style='min-height:68px;'><div class='ga-lbl'>ARGALA & VIRODHARGALA ON MOON (2/4/11 vs 12/10/3)</div><div class='ga-val' style='font-size:14px;'>{esc(_v['argala_moon'])}</div></div>"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
-
-    # Interactive 5-View Switcher (including 10-Day Forward Prediction Roadmap)
+    # 3. INTERACTIVE TABLES (10-DAY ROADMAP & INTRADAY TURNS FIRST)
     _v_view = st.radio(
         "VEDIC VIEW",
         [
             "📅 10-Day Forward Roadmap",
             "⚡ Intraday Reversal Windows",
-            "⏰ Compound Hora Schedule",
-            "🔀 Tajaka Ithasala / Eesarpha",
-            "🪐 Graha Dignities & Avasthas",
+            "⏰ Hourly Flow (Hora Schedule)",
+            "🔀 Tajaka Applying Aspects",
+            "🪐 Planetary Dignities & Strength",
         ],
         horizontal=True,
         label_visibility="collapsed",
@@ -4743,15 +4716,35 @@ def _render_vedic_tab():
             show_df(_v["turns_df"], hide_index=True)
         else:
             st.info("No intraday turn windows calculated.")
-    elif _v_view == "⏰ Compound Hora Schedule":
+    elif _v_view == "⏰ Hourly Flow (Hora Schedule)":
         show_df(_v["hora_df"], hide_index=True)
-    elif _v_view == "🔀 Tajaka Ithasala / Eesarpha":
+    elif _v_view == "🔀 Tajaka Applying Aspects":
         if not _v["tajaka_df"].empty:
             show_df(_v["tajaka_df"], hide_index=True)
         else:
-            st.info("No active Tajaka applying/separating aspects within Deeptamsa orbs right now.")
+            st.info("No active Tajaka applying/separating aspects within orbs right now.")
     else:
         show_df(_v["graha_df"], hide_index=True)
+
+    # 4. DEEP VEDIC BREAKDOWN (TUCKED CLEANLY IN AN EXPANDER SO MAIN VIEW STAYS SIMPLE)
+    with st.expander("🔍 Deep Vedic Breakdown (Panchanga, SBC Vedha, Latta, Macro Yogas & Argala)"):
+        _tithi_tone = "bear" if _v["is_bhadra"] else "bull"
+        _sm_tone = "bear" if _v["is_bad_sm_yoga"] else "bull"
+        _sbc_tone = "bear" if _v["sbc_mal_count"] >= 2 else ("warn" if _v["sbc_mal_count"] == 1 else "bull")
+        _lat_tone = "bear" if _v["latta"] != "Clear" else "bull"
+        st.markdown(
+            f"<div class='ga-grid-4'>"
+            f"<div class='ga-card {_tithi_tone}'><div class='ga-lbl'>TITHI & KARANA</div><div class='ga-val'>{esc(_v['tithi'])}</div><div class='ga-sub'>{esc(_v['karana'])} | Lord: {esc(_v['tithi_lord'])}</div></div>"
+            f"<div class='ga-card {_sm_tone}'><div class='ga-lbl'>SUN-MOON YOGA</div><div class='ga-val'>{esc(_v['sm_yoga'])}</div><div class='ga-sub'>Tara Bala: {esc(_v['tara_bala'])}</div></div>"
+            f"<div class='ga-card {_sbc_tone}'><div class='ga-lbl'>SBC VEDHA (28★)</div><div class='ga-val' style='font-size:15px;'>Malefic: {esc(_v['sbc_mal_vedha'])}</div><div class='ga-sub'>Benefic: {esc(_v['sbc_ben_vedha'])}</div></div>"
+            f"<div class='ga-card {_lat_tone}'><div class='ga-lbl'>LATTA & ASPECTS</div><div class='ga-val' style='font-size:15px;'>{esc(_v['latta'])}</div><div class='ga-sub'>{esc(_v['moon_aspects'])}</div></div>"
+            f"</div>"
+            f"<div class='ga-grid-2'>"
+            f"<div class='ga-card warn' style='min-height:64px;'><div class='ga-lbl'>MACRO YOGAS (6/8 & 5/9)</div><div class='ga-val' style='font-size:14px;'>{esc(_v['yogas'])}</div></div>"
+            f"<div class='ga-card info' style='min-height:64px;'><div class='ga-lbl'>ARGALA ON MOON</div><div class='ga-val' style='font-size:14px;'>{esc(_v['argala_moon'])}</div></div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
 
 
 with tab12:
