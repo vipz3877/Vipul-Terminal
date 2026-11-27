@@ -4647,104 +4647,112 @@ def _render_gann_tab():
 
 @_ga_fragment
 def _render_vedic_tab():
-    st.markdown("#### 🌌 VEDIC MARKET WEATHER & FORWARD PREDICTIONS (MUMBAI IST)")
+    st.markdown("#### 🌌 ASTRO TIMING & OUTLOOK (SIMPLIFIED)")
     if GA is None:
         st.error(f"gann_astro.py not loaded: {GA_ERR}")
         return
 
-    vc1, vc2, vc3 = st.columns([1.2, 1.2, 1.6])
-    _v_mode = vc1.radio("CLOCK MODE", ["LIVE IST NOW", "SIMULATE TIME"], horizontal=True, key="ga_v_mode")
-    if _v_mode == "SIMULATE TIME":
-        _sim_d = vc2.date_input("DATE", value=now_ist.date(), key="ga_v_date")
-        _sim_t = vc3.time_input("TIME (IST)", value=now_ist.time().replace(second=0, microsecond=0), key="ga_v_time")
+    # Compact Date/Time selector (only shows inputs if Simulate is toggled)
+    c_top1, c_top2, c_top3 = st.columns([1.2, 1.2, 1.6])
+    _sim_on = c_top1.toggle("Check Another Date / Time", value=False, key="ga_v_sim_toggle")
+    if _sim_on:
+        _sim_d = c_top2.date_input("Date", value=now_ist.date(), key="ga_v_date")
+        _sim_t = c_top3.time_input("Time (IST)", value=now_ist.time().replace(second=0, microsecond=0), key="ga_v_time")
         _eval_dt = datetime.combine(_sim_d, _sim_t, tzinfo=IST).replace(second=0, microsecond=0)
         _eval_iso = _eval_dt.isoformat()
     else:
         _eval_dt = now_ist
         _eval_iso = _now_min_iso
-        vc2.markdown(f"<div style='padding-top:26px;font-size:13px;color:#aaa;'>Mumbai IST: <b style='color:#fff;'>{now_ist.strftime('%d %b %Y, %I:%M:%S %p')}</b></div>", unsafe_allow_html=True)
+        c_top2.markdown(f"<div style='padding-top:6px;font-size:13px;color:#aaa;'>Live: <b style='color:#fff;'>{now_ist.strftime('%d %b %Y, %I:%M %p IST')}</b></div>", unsafe_allow_html=True)
 
     _v = _cached_vedic_state(_eval_iso, round(_anchor_default, 1))
     if not _v.get("ok"):
         st.warning(_v.get("error", "pysweph not installed."))
         return
 
-    # 1. PLAIN-ENGLISH 2-SECOND TRADING VERDICT BANNER
     _vd = GA.build_plain_vedic_verdict(_v)
-    st.markdown(
-        f"<div class='bbg-panel' style='border:2px solid {_vd['color']};'>"
-        f"<div style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:6px;'>"
-        f"<span class='bbg-title'>PLAIN-ENGLISH ASTRO VERDICT (NO DECODING NEEDED)</span>"
-        f"<span class='ga-badge' style='background:{_vd['color']};color:#000;'>{esc(_vd['badge'])}</span></div>"
-        f"<div class='bbg-big' style='color:{_vd['color']};font-size:21px;'>{esc(_vd['headline'])}</div>"
-        f"<div class='bbg-desc'>{esc(_vd['action'])}</div></div>",
-        unsafe_allow_html=True,
-    )
+    _is_trend = _v["regime"] == "TREND"
+    _lot_str = "50% LOTS" if _vd["badge"].startswith("50%") else "100% LOTS"
+    _lot_tone = "bear" if _lot_str == "50% LOTS" else "bull"
 
-    # 2. SIMPLE 3-CARD EXECUTIVE SUMMARY (STYLE, TRAP STATUS, FOCUS SECTORS)
-    _t_pct = round(_v["trend_score"] / 7.0 * 100.0, 1)
-    _f_pct = round(100.0 - _t_pct, 1)
-    _trap_tone = "bear" if _vd["traps_txt"] != "None — Clear Runway" else "bull"
-    _reg_tone = "bull" if _v["regime"] == "TREND" else "warn"
+    # Extract only HIGH-CONVICTION turns (drop repetitive hourly Hora Lagna spam)
+    _turns = _v.get("turns_df")
+    _key_turns = pd.DataFrame()
+    if _turns is not None and not _turns.empty:
+        _key_turns = _turns[~_turns["Type"].str.contains("HORA LAGNA", na=False)].copy()
+        if _key_turns.empty:
+            _key_turns = _turns.head(3).copy()
+    _next_turn = _key_turns.iloc[0]["IST Time"] if not _key_turns.empty else "None"
+
+    # 1. SINGLE 4-BOX ANSWER STRIP (No duplicate banner + cards)
     st.markdown(
-        f"<div class='ga-grid-3'>"
-        f"<div class='ga-card {_reg_tone}'><div class='ga-lbl'>1. MARKET STYLE</div><div class='ga-val'>{'🔥 TREND BREAKOUTS' if _v['regime'] == 'TREND' else '🛡️ FADE GANN WALLS'}</div><div class='ga-sub'>Trend {_t_pct:.0f}% vs Fade {_f_pct:.0f}% ({esc(_v['elements'])})</div></div>"
-        f"<div class='ga-card {_trap_tone}'><div class='ga-lbl'>2. ACTIVE TRAPS NOW</div><div class='ga-val' style='font-size:15px;'>{esc(_vd['traps_txt'])}</div><div class='ga-sub'>Kaal Windows: {esc(_v['kaal_summary'])}</div></div>"
-        f"<div class='ga-card info'><div class='ga-lbl'>3. FOCUS SECTORS & TURN</div><div class='ga-val' style='font-size:15px;'>{esc(_v['sector_focus'])}</div><div class='ga-sub'>Rashi Ingress: {esc(_v['rashi_ingress'])}</div></div>"
+        f"<div class='ga-grid-4'>"
+        f"<div class='ga-card {'bull' if _is_trend else 'warn'}'>"
+        f"  <div class='ga-lbl'>HOW TO TRADE TODAY</div>"
+        f"  <div class='ga-val'>{'🔥 RIDE BREAKOUTS' if _is_trend else '🛡️ FADE GANN WALLS'}</div>"
+        f"  <div class='ga-sub'>{'Trend day — hold winners' if _is_trend else 'Choppy — trade D-S1 / D-R1 only'}</div>"
+        f"</div>"
+        f"<div class='ga-card {_lot_tone}'>"
+        f"  <div class='ga-lbl'>POSITION SIZE</div>"
+        f"  <div class='ga-val'>{_lot_str}</div>"
+        f"  <div class='ga-sub'>{esc(_vd['traps_txt'])}</div>"
+        f"</div>"
+        f"<div class='ga-card info'>"
+        f"  <div class='ga-lbl'>KEY REVERSAL TIME</div>"
+        f"  <div class='ga-val'>{esc(_next_turn)}</div>"
+        f"  <div class='ga-sub'>{len(_key_turns)} key turn window(s) today</div>"
+        f"</div>"
+        f"<div class='ga-card'>"
+        f"  <div class='ga-lbl'>TOP SECTORS</div>"
+        f"  <div class='ga-val' style='font-size:15px;'>{esc(_v['sector_focus'])}</div>"
+        f"  <div class='ga-sub'>Avoid: {esc(_v['kaal_summary'].split('  |  ')[0])}</div>"
+        f"</div>"
         f"</div>",
         unsafe_allow_html=True,
     )
 
-    # 3. INTERACTIVE TABLES (10-DAY ROADMAP & INTRADAY TURNS FIRST)
-    _v_view = st.radio(
-        "VEDIC VIEW",
-        [
-            "📅 10-Day Forward Roadmap",
-            "⚡ Intraday Reversal Windows",
-            "⏰ Hourly Flow (Hora Schedule)",
-            "🔀 Tajaka Applying Aspects",
-            "🪐 Planetary Dignities & Strength",
-        ],
+    # 2. ONLY TWO SIMPLE VIEWS: TODAY vs NEXT 10 DAYS
+    _simple_view = st.radio(
+        "VIEW",
+        ["⚡ Today's Key Times", "📅 Next 10 Days Outlook"],
         horizontal=True,
         label_visibility="collapsed",
-        key="ga_v_subview",
+        key="ga_v_simple_view",
     )
-    if _v_view == "📅 10-Day Forward Roadmap":
-        show_df(_cached_roadmap(_eval_dt.date().isoformat()), hide_index=True)
-    elif _v_view == "⚡ Intraday Reversal Windows":
-        if not _v["turns_df"].empty:
-            show_df(_v["turns_df"], hide_index=True)
+    if _simple_view == "⚡ Today's Key Times":
+        if not _key_turns.empty:
+            show_df(_key_turns, hide_index=True)
         else:
-            st.info("No intraday turn windows calculated.")
-    elif _v_view == "⏰ Hourly Flow (Hora Schedule)":
-        show_df(_v["hora_df"], hide_index=True)
-    elif _v_view == "🔀 Tajaka Applying Aspects":
-        if not _v["tajaka_df"].empty:
-            show_df(_v["tajaka_df"], hide_index=True)
-        else:
-            st.info("No active Tajaka applying/separating aspects within orbs right now.")
+            st.info("No major intraday reversal windows today.")
+        st.caption(f"Avoid chasing during: {_v['kaal_summary']}")
     else:
-        show_df(_v["graha_df"], hide_index=True)
+        _rm = _cached_roadmap(_eval_dt.date().isoformat())
+        if not _rm.empty:
+            # Show only the 4 clean columns a trader needs
+            _clean_cols = [c for c in ["Date", "Trading Plan", "Trap Flags", "Sector Focus"] if c in _rm.columns]
+            show_df(_rm[_clean_cols], hide_index=True)
 
-    # 4. DEEP VEDIC BREAKDOWN (TUCKED CLEANLY IN AN EXPANDER SO MAIN VIEW STAYS SIMPLE)
-    with st.expander("🔍 Deep Vedic Breakdown (Panchanga, SBC Vedha, Latta, Macro Yogas & Argala)"):
-        _tithi_tone = "bear" if _v["is_bhadra"] else "bull"
-        _sm_tone = "bear" if _v["is_bad_sm_yoga"] else "bull"
-        _sbc_tone = "bear" if _v["sbc_mal_count"] >= 2 else ("warn" if _v["sbc_mal_count"] == 1 else "bull")
-        _lat_tone = "bear" if _v["latta"] != "Clear" else "bull"
-        st.markdown(
-            f"<div class='ga-grid-4'>"
-            f"<div class='ga-card {_tithi_tone}'><div class='ga-lbl'>TITHI & KARANA</div><div class='ga-val'>{esc(_v['tithi'])}</div><div class='ga-sub'>{esc(_v['karana'])} | Lord: {esc(_v['tithi_lord'])}</div></div>"
-            f"<div class='ga-card {_sm_tone}'><div class='ga-lbl'>SUN-MOON YOGA</div><div class='ga-val'>{esc(_v['sm_yoga'])}</div><div class='ga-sub'>Tara Bala: {esc(_v['tara_bala'])}</div></div>"
-            f"<div class='ga-card {_sbc_tone}'><div class='ga-lbl'>SBC VEDHA (28★)</div><div class='ga-val' style='font-size:15px;'>Malefic: {esc(_v['sbc_mal_vedha'])}</div><div class='ga-sub'>Benefic: {esc(_v['sbc_ben_vedha'])}</div></div>"
-            f"<div class='ga-card {_lat_tone}'><div class='ga-lbl'>LATTA & ASPECTS</div><div class='ga-val' style='font-size:15px;'>{esc(_v['latta'])}</div><div class='ga-sub'>{esc(_v['moon_aspects'])}</div></div>"
-            f"</div>"
-            f"<div class='ga-grid-2'>"
-            f"<div class='ga-card warn' style='min-height:64px;'><div class='ga-lbl'>MACRO YOGAS (6/8 & 5/9)</div><div class='ga-val' style='font-size:14px;'>{esc(_v['yogas'])}</div></div>"
-            f"<div class='ga-card info' style='min-height:64px;'><div class='ga-lbl'>ARGALA ON MOON</div><div class='ga-val' style='font-size:14px;'>{esc(_v['argala_moon'])}</div></div>"
-            f"</div>",
-            unsafe_allow_html=True,
+    # 3. ALL SANSKRIT / ADVANCED DATA HIDDEN IN ONE COLLAPSED EXPANDER
+    with st.expander("📚 Advanced Vedic Details (Hora, Tajaka, Dignities, Panchanga, SBC Vedha)"):
+        _adv = st.radio(
+            "ADV",
+            ["Hourly Hora", "Tajaka Aspects", "Graha Dignities", "Panchanga & Vedha"],
+            horizontal=True,
+            label_visibility="collapsed",
+            key="ga_v_adv",
         )
+        if _adv == "Hourly Hora":
+            show_df(_v["hora_df"], hide_index=True)
+        elif _adv == "Tajaka Aspects":
+            show_df(_v["tajaka_df"], hide_index=True) if not _v["tajaka_df"].empty else st.info("None active.")
+        elif _adv == "Graha Dignities":
+            show_df(_v["graha_df"], hide_index=True)
+        else:
+            st.write(f"**Tithi & Karana:** {_v['tithi']} | {_v['karana']}")
+            st.write(f"**Nakshatra:** {_v['nakshatra']} | **Sun-Moon Yoga:** {_v['sm_yoga']} | **Tara:** {_v['tara_bala']}")
+            st.write(f"**SBC Malefic Vedha:** {_v['sbc_mal_vedha']} | **Latta:** {_v['latta']}")
+            st.write(f"**Macro Yogas:** {_v['yogas']}")
+            st.write(f"**Argala on Moon:** {_v['argala_moon']}")
 
 
 with tab12:
