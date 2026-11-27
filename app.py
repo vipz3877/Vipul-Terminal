@@ -4454,24 +4454,33 @@ with tab0:
 
 
 # ============================================================
-# HIMA REDDY W.D. GANN & VEDIC ASTROLOGY TABS (FAST FRAGMENT UI)
+# HIMA REDDY W.D. GANN & VEDIC ASTROLOGY TABS (FULL-FLEDGED FAST UI)
 # ============================================================
 _ga_fragment = getattr(st, "fragment", lambda fn: fn)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def _cached_vedic_state(dt_minute_iso):
+def _cached_vedic_state(dt_minute_iso, anchor_rounded):
     if GA is None:
         return {"ok": False, "error": GA_ERR}
     dt = datetime.fromisoformat(dt_minute_iso)
-    return GA.compute_vedic_state(dt)
+    return GA.compute_vedic_state(dt, anchor_price=anchor_rounded)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_roadmap(date_iso):
+    if GA is None:
+        return pd.DataFrame()
+    dt = datetime.fromisoformat(date_iso + "T09:30:00+05:30")
+    return GA.compute_10day_roadmap(dt)
 
 
 st.markdown("""
 <style>
 .ga-grid-4 { display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:12px; margin:12px 0; }
+.ga-grid-3 { display:grid; grid-template-columns:repeat(3, minmax(0,1fr)); gap:12px; margin:10px 0; }
 .ga-grid-2 { display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:12px; margin:10px 0; }
-@media (max-width: 900px) { .ga-grid-4 { grid-template-columns:repeat(2, minmax(0,1fr)); } .ga-grid-2 { grid-template-columns:1fr; } }
+@media (max-width: 900px) { .ga-grid-4, .ga-grid-3 { grid-template-columns:repeat(2, minmax(0,1fr)); } .ga-grid-2 { grid-template-columns:1fr; } }
 .ga-card {
   background: linear-gradient(180deg, #121212 0%, #0a0a0a 100%);
   border: 1px solid #2b2b2b;
@@ -4481,14 +4490,14 @@ st.markdown("""
   display: flex;
   flex-direction: column;
   justify-content: space-between;
-  min-height: 92px;
+  min-height: 90px;
 }
 .ga-card.bull { border-left-color: #00e676; }
 .ga-card.bear { border-left-color: #ff1744; }
 .ga-card.warn { border-left-color: #ffab00; }
 .ga-card.info { border-left-color: #29b6f6; }
 .ga-lbl { font-size: 11px; color: #9e9e9e; letter-spacing: 1.4px; text-transform: uppercase; margin-bottom: 4px; }
-.ga-val { font-size: 19px; font-weight: 700; color: #ffffff; line-height: 1.25; word-break: break-word; }
+.ga-val { font-size: 17px; font-weight: 700; color: #ffffff; line-height: 1.25; word-break: break-word; }
 .ga-sub { font-size: 12px; color: #bdbdbd; margin-top: 6px; line-height: 1.3; }
 .ga-badge {
   display: inline-block; padding: 3px 10px; border-radius: 4px;
@@ -4506,6 +4515,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 _now_min_iso = now_ist.replace(second=0, microsecond=0).isoformat()
+_anchor_default = round(float(prev_close or spot), 2)
 
 
 @_ga_fragment
@@ -4521,11 +4531,10 @@ def _render_gann_tab():
         ["Prev D1 Close (Auto)", "Custom Anchor Price"],
         key="ga_anchor_mode",
     )
-    _base_anchor = float(prev_close or spot)
     if _anchor_mode == "Custom Anchor Price":
-        _anchor_val = ctrl2.number_input("CUSTOM ANCHOR", min_value=100.0, value=_base_anchor, step=5.0, key="ga_custom_anchor")
+        _anchor_val = ctrl2.number_input("CUSTOM ANCHOR", min_value=100.0, value=_anchor_default, step=5.0, key="ga_custom_anchor")
     else:
-        _anchor_val = _base_anchor
+        _anchor_val = _anchor_default
         ctrl2.markdown(f"<div style='padding-top:28px;font-size:13px;color:#aaa;'>Anchor: <b style='color:#fff;'>{_anchor_val:,.2f}</b></div>", unsafe_allow_html=True)
 
     _sim_spot_on = ctrl3.toggle("SIMULATE SPOT (WHAT-IF)", value=False, key="ga_sim_on")
@@ -4542,7 +4551,7 @@ def _render_gann_tab():
 
     _gann = GA.gann_sq9_levels(_anchor_val)
     _tb = GA.evaluate_5m_two_bar(intraday or _xi, _gann)
-    _vedic = _cached_vedic_state(_now_min_iso)
+    _vedic = _cached_vedic_state(_now_min_iso, round(_anchor_val, 1))
     _csig = GA.build_crisp_gann_astro_signal(_eff_spot, _gann, _tb, _vedic)
     _struct = GA.gann_structural_filters(candles_pre, _eff_spot, now_ist.date().isoformat())
     _e8_df, _e8_meta = GA.gann_eighths(candles_pre, _eff_spot)
@@ -4555,7 +4564,7 @@ def _render_gann_tab():
         f"<span class='bbg-title'>CRISP BINARY SIGNAL — HIMA REDDY 3-PILLAR + VEDIC</span>"
         f"<div><span class='ga-badge' style='background:{_csig['color']};color:#000;margin-right:6px;'>{esc(_csig['badge'])}</span>"
         f"<span class='ga-badge' style='background:#222;color:#ff9800;border:1px solid #444;'>{_lot_txt}</span></div></div>"
-        f"<div class='bbg-big' style='color:{_csig['color']};font-size:22px;'>{esc(_csig['signal'])}</div>"
+        f"<div class='bbg-big' style='color:{_csig['color']};font-size:21px;'>{esc(_csig['signal'])}</div>"
         f"<div class='bbg-desc'>{esc(_csig['action'])}</div></div>",
         unsafe_allow_html=True,
     )
@@ -4638,7 +4647,7 @@ def _render_gann_tab():
 
 @_ga_fragment
 def _render_vedic_tab():
-    st.markdown("#### 🌌 LIVE VEDIC FINANCIAL ASTROLOGY (MUMBAI IST)")
+    st.markdown("#### 🌌 FULL-FLEDGED VEDIC FINANCIAL ASTROLOGY (P.V.R. NARASIMHA RAO ENGINE)")
     if GA is None:
         st.error(f"gann_astro.py not loaded: {GA_ERR}")
         return
@@ -4648,36 +4657,40 @@ def _render_vedic_tab():
     if _v_mode == "SIMULATE TIME":
         _sim_d = vc2.date_input("DATE", value=now_ist.date(), key="ga_v_date")
         _sim_t = vc3.time_input("TIME (IST)", value=now_ist.time().replace(second=0, microsecond=0), key="ga_v_time")
-        _eval_iso = datetime.combine(_sim_d, _sim_t, tzinfo=IST).replace(second=0, microsecond=0).isoformat()
+        _eval_dt = datetime.combine(_sim_d, _sim_t, tzinfo=IST).replace(second=0, microsecond=0)
+        _eval_iso = _eval_dt.isoformat()
     else:
+        _eval_dt = now_ist
         _eval_iso = _now_min_iso
         vc2.markdown(f"<div style='padding-top:26px;font-size:13px;color:#aaa;'>Mumbai IST: <b style='color:#fff;'>{now_ist.strftime('%d %b %Y, %I:%M:%S %p')}</b></div>", unsafe_allow_html=True)
 
-    _v = _cached_vedic_state(_eval_iso)
+    _v = _cached_vedic_state(_eval_iso, round(_anchor_default, 1))
     if not _v.get("ok"):
         st.warning(_v.get("error", "pysweph not installed."))
         return
 
+    # Row 1: Full 5-Limb Panchanga + Kaal/Upagraha
     _tithi_tone = "bear" if _v["is_bhadra"] else "bull"
-    _reg_tone = "bull" if _v["regime"] == "TREND" else "warn"
+    _sm_tone = "bear" if _v["is_bad_sm_yoga"] else "bull"
     _kaal_tone = "bear" if _v["is_kaal_trap"] else "bull"
-
     st.markdown(
         f"<div class='ga-grid-4'>"
-        f"<div class='ga-card {_tithi_tone}'><div class='ga-lbl'>LIVE TITHI</div><div class='ga-val' style='font-size:17px;'>{esc(_v['tithi'])}</div><div class='ga-sub'>{'⚠️ BHADRA TRAP ACTIVE' if _v['is_bhadra'] else '✅ Bhadra Clear'}</div></div>"
-        f"<div class='ga-card info'><div class='ga-lbl'>NAKSHATRA & PADA</div><div class='ga-val' style='font-size:17px;'>{esc(_v['nakshatra_name'])}</div><div class='ga-sub'>Ruler: <b>{esc(_v['nakshatra_lord'])}</b>  |  {esc(_v['elements'])}</div></div>"
-        f"<div class='ga-card {_reg_tone}'><div class='ga-lbl'>4-ELEMENT REGIME</div><div class='ga-val' style='font-size:17px;'>{esc(_v['regime'])}</div><div class='ga-sub'>Retro: {esc(_v['retros'])}</div></div>"
-        f"<div class='ga-card {_kaal_tone}'><div class='ga-lbl'>MUMBAI KAAL CHECK</div><div class='ga-val' style='font-size:17px;'>{esc(_v['kaal_short'])}</div><div class='ga-sub'>{esc(_v['kaal_detail'])}</div></div>"
+        f"<div class='ga-card {_tithi_tone}'><div class='ga-lbl'>TITHI & KARANA</div><div class='ga-val'>{esc(_v['tithi'])}</div><div class='ga-sub'>Karana: <b>{esc(_v['karana'])}</b>  |  Lord: {esc(_v['tithi_lord'])} ({esc(_v['tithi_group'])})</div></div>"
+        f"<div class='ga-card info'><div class='ga-lbl'>NAKSHATRA & SECTOR</div><div class='ga-val'>{esc(_v['nakshatra_name'])}</div><div class='ga-sub'>Ruler: <b>{esc(_v['nakshatra_lord'])}</b>  |  {esc(_v['sector_focus'])}</div></div>"
+        f"<div class='ga-card {_sm_tone}'><div class='ga-lbl'>SUN-MOON YOGA (27)</div><div class='ga-val'>{esc(_v['sm_yoga'])}</div><div class='ga-sub'>Tara Bala: {esc(_v['tara_bala'])}</div></div>"
+        f"<div class='ga-card {_kaal_tone}'><div class='ga-lbl'>KAAL & UPAGRAHA TRAP</div><div class='ga-val'>{esc(_v['kaal_short'])}</div><div class='ga-sub'>{esc(_v['kaal_detail'])}</div></div>"
         f"</div>",
         unsafe_allow_html=True,
     )
 
+    # Row 2: 4-Element Visual Balance Bar
     _t_pct = round(_v["trend_score"] / 7.0 * 100.0, 1)
     _f_pct = round(100.0 - _t_pct, 1)
     st.markdown(
         f"<div class='ga-bar-wrap'>"
         f"<div style='display:flex;justify-content:space-between;font-size:12px;'>"
         f"<span style='color:#00e676;font-weight:700;'>🔥 TREND (Fire+Earth): {_v['trend_score']}/7 ({_t_pct:.0f}%)</span>"
+        f"<span style='color:#29b6f6;font-weight:700;'>HL: {esc(_v['hl_rashi'])} | GL: {esc(_v['gl_rashi'])} | Retro: {esc(_v['retros'])} | Combust: {esc(_v['combust'])}</span>"
         f"<span style='color:#ffab00;font-weight:700;'>🛡️ FADE WALLS (Air+Water): {_v['fade_score']}/7 ({_f_pct:.0f}%)</span></div>"
         f"<div class='ga-track' style='display:flex;overflow:hidden;'>"
         f"<div style='width:{_t_pct}%;background:#00e676;height:100%;'></div>"
@@ -4687,27 +4700,56 @@ def _render_vedic_tab():
         unsafe_allow_html=True,
     )
 
+    # Row 3: SBC Vedha, Latta Kick & Compound Hora
+    _sbc_tone = "bear" if _v["sbc_mal_count"] >= 2 else ("warn" if _v["sbc_mal_count"] == 1 else "bull")
+    _lat_tone = "bear" if _v["latta"] != "Clear" else "bull"
     _h_tone = "bull" if _v["hora_rel"] == "FRIEND" else ("bear" if _v["hora_rel"] == "ENEMY" else "info")
     st.markdown(
-        f"<div class='ga-grid-2'>"
-        f"<div class='ga-card {_h_tone}'><div class='ga-lbl'>LIVE HORA FRIENDSHIP</div><div class='ga-val' style='font-size:15px;'>{esc(_v['hora_verdict'])}</div></div>"
-        f"<div class='ga-card info'><div class='ga-lbl'>MOON RASHI INGRESS (NSE HOURS)</div><div class='ga-val' style='font-size:15px;'>{esc(_v['rashi_ingress'])}</div></div>"
-        f"</div>"
-        f"<div class='ga-card warn' style='min-height:64px;margin-bottom:12px;'>"
-        f"<div class='ga-lbl'>MACRO PLANETARY YOGAS (6/8 SHADASHTAK & 5/9 NAVPANCHAM)</div>"
-        f"<div class='ga-val' style='font-size:15px;'>{esc(_v['yogas'])}</div></div>",
+        f"<div class='ga-grid-3'>"
+        f"<div class='ga-card {_sbc_tone}'><div class='ga-lbl'>SARVATOBHADRA VEDHA (28★)</div><div class='ga-val' style='font-size:15px;'>Malefic: {esc(_v['sbc_mal_vedha'])}</div><div class='ga-sub'>Benefic: {esc(_v['sbc_ben_vedha'])}</div></div>"
+        f"<div class='ga-card {_lat_tone}'><div class='ga-lbl'>LATTA (PLANETARY KICK)</div><div class='ga-val' style='font-size:15px;'>{esc(_v['latta'])}</div><div class='ga-sub'>Special Aspects: {esc(_v['moon_aspects'])}</div></div>"
+        f"<div class='ga-card {_h_tone}'><div class='ga-lbl'>COMPOUND HORA FRIENDSHIP</div><div class='ga-val' style='font-size:15px;'>{esc(_v['hora_verdict'])}</div><div class='ga-sub'>Rashi Ingress: {esc(_v['rashi_ingress'])}</div></div>"
+        f"</div>",
         unsafe_allow_html=True,
     )
 
+    # Row 4: Macro Yogas + Argala on Moon
+    st.markdown(
+        f"<div class='ga-grid-2'>"
+        f"<div class='ga-card warn' style='min-height:68px;'><div class='ga-lbl'>MACRO YOGAS (6/8 SHADASHTAK & 5/9 NAVPANCHAM)</div><div class='ga-val' style='font-size:14px;'>{esc(_v['yogas'])}</div></div>"
+        f"<div class='ga-card info' style='min-height:68px;'><div class='ga-lbl'>ARGALA & VIRODHARGALA ON MOON (2/4/11 vs 12/10/3)</div><div class='ga-val' style='font-size:14px;'>{esc(_v['argala_moon'])}</div></div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    # Interactive 5-View Switcher (including 10-Day Forward Prediction Roadmap)
     _v_view = st.radio(
         "VEDIC VIEW",
-        ["⏰ Intraday Hora Schedule (IST)", "🪐 Live Sidereal Graha Positions"],
+        [
+            "📅 10-Day Forward Roadmap",
+            "⚡ Intraday Reversal Windows",
+            "⏰ Compound Hora Schedule",
+            "🔀 Tajaka Ithasala / Eesarpha",
+            "🪐 Graha Dignities & Avasthas",
+        ],
         horizontal=True,
         label_visibility="collapsed",
         key="ga_v_subview",
     )
-    if _v_view == "⏰ Intraday Hora Schedule (IST)":
+    if _v_view == "📅 10-Day Forward Roadmap":
+        show_df(_cached_roadmap(_eval_dt.date().isoformat()), hide_index=True)
+    elif _v_view == "⚡ Intraday Reversal Windows":
+        if not _v["turns_df"].empty:
+            show_df(_v["turns_df"], hide_index=True)
+        else:
+            st.info("No intraday turn windows calculated.")
+    elif _v_view == "⏰ Compound Hora Schedule":
         show_df(_v["hora_df"], hide_index=True)
+    elif _v_view == "🔀 Tajaka Ithasala / Eesarpha":
+        if not _v["tajaka_df"].empty:
+            show_df(_v["tajaka_df"], hide_index=True)
+        else:
+            st.info("No active Tajaka applying/separating aspects within Deeptamsa orbs right now.")
     else:
         show_df(_v["graha_df"], hide_index=True)
 
