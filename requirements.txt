@@ -4,5 +4,4 @@ pandas
 numpy
 requests
 groq
-openpyxl
-websockets
+pysweph
