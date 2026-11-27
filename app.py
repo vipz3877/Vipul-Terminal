@@ -55,6 +55,12 @@ except Exception as _fp_e:      # app still runs; footprint just shows as unavai
     FP, FP_IMPORT_ERR = None, str(_fp_e)
 
 try:
+    import gann_astro as GA
+    GA_ERR = ""
+except Exception as _ga_e:
+    GA, GA_ERR = None, str(_ga_e)
+
+try:
     from streamlit_autorefresh import st_autorefresh
 except ImportError:
     st_autorefresh = None
@@ -2057,7 +2063,7 @@ def fetch_daily_candles(scrip, seg, token, client_id):
         try:
             r = requests.post(f"{BASE_URL}/charts/historical", headers=auth_headers(token, client_id),
                               json={"securityId": str(scrip), "exchangeSegment": seg, "instrument": "INDEX",
-                                    "expiryCode": 0, "fromDate": (today - timedelta(days=35)).isoformat(),
+                                    "expiryCode": 0, "fromDate": (today - timedelta(days=95)).isoformat(),
                                     "toDate": to_date.isoformat()}, timeout=12)
             check(r)
             d = r.json()
@@ -3790,9 +3796,10 @@ for _row in health_rows:
     _hc[_row["Status"]] += 1
 st.caption(f"DATA HEALTH: {_hc['OK']} OK · {_hc['WARN']} warn · {_hc['FAIL']} fail")
 
-tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13 = st.tabs([
     "🛡️ Trade Desk", "📊 Dashboard & Engine", "📐 Day Levels", "🧭 Exhaustion", "🎯 Premium Scanner",
-    "🤖 AI Council & News", "📋 Option Chain", "📒 Scorecard", "🩺 Data Health", "📈 GEX & Skew", "🧾 Manual Trades", "🏦 Footprint"])
+    "🤖 AI Council & News", "📋 Option Chain", "📒 Scorecard", "🩺 Data Health", "📈 GEX & Skew",
+    "🧾 Manual Trades", "🏦 Footprint", "☸ Gann & Astro Signal", "🌌 Vedic Timing"])
 
 with tab1:
     status = m["status"]
@@ -4444,3 +4451,60 @@ with tab0:
         st.warning("CAUTION: " + ", ".join(r["Check"] for r in _warns) + ". Entry is your call; consider smaller size.")
     else:
         st.success("GO: all checks pass. Execute manually and respect your stop.")
+
+
+# ============================================================
+# HIMA REDDY W.D. GANN & VEDIC ASTROLOGY TABS
+# ============================================================
+with tab12:
+    st.markdown("#### ☸ HIMA REDDY W.D. GANN + VEDIC EXECUTION ENGINE")
+    if GA is None:
+        st.error(f"gann_astro.py not loaded: {GA_ERR}")
+    else:
+        _gann = GA.gann_sq9_levels(prev_close or spot)
+        _tb = GA.evaluate_5m_two_bar(intraday or _xi, _gann)
+        _vedic = GA.compute_vedic_state(now_ist)
+        _csig = GA.build_crisp_gann_astro_signal(spot, _gann, _tb, _vedic)
+        _struct = GA.gann_structural_filters(candles_pre, spot, now_ist.date().isoformat())
+        _e8_df, _e8_meta = GA.gann_eighths(candles_pre, spot)
+
+        st.markdown(
+            f"<div class='bbg-panel' style='border:2px solid {_csig['color']};'>"
+            f"<div class='bbg-title'>CRISP BINARY SIGNAL (HIMA REDDY 3-PILLAR + VEDIC)</div>"
+            f"<div class='bbg-big' style='color:{_csig['color']};'>{esc(_csig['signal'])}</div>"
+            f"<div class='bbg-desc'>{esc(_csig['action'])}</div></div>",
+            unsafe_allow_html=True,
+        )
+
+        g1, g2, g3, g4 = st.columns(4)
+        g1.metric("D-R1 (45° BUY CE)", f"{_gann.get('r1', 0):,.1f}", f"T1 {_gann.get('r2', 0):,.0f} / T2 {_gann.get('r3', 0):,.0f}", delta_color="off")
+        g2.metric("D-S1 (45° BUY PE)", f"{_gann.get('s1', 0):,.1f}", f"T1 {_gann.get('s2', 0):,.0f} / T2 {_gann.get('s3', 0):,.0f}", delta_color="off")
+        g3.metric("5M 2-BAR ENGINE", f"{_tb['bars']} closed bars" if _tb["ready"] else "Waiting", f"SL L:{_tb['sl_long']} / S:{_tb['sl_short']}", delta_color="off")
+        g4.metric("60D GANN 50% LINE", f"{_e8_meta.get('mid50', 0):,.1f}" if _e8_meta else "—", f"Spot at {_e8_meta.get('spot_pct', 0):.1f}% of range" if _e8_meta else None, delta_color="off")
+
+        st.markdown("##### Hima Reddy Structural Filters")
+        s1, s2 = st.columns(2)
+        s1.info(f"**4-Week Rule:** {_struct['breakout_4w']}\n\n**Friday Rule:** {_struct['friday_rule']}")
+        s2.info(f"**Overbalancing:** {_struct['overbalance']}\n\n**50% Time Retracement:** {_struct['time_50']}")
+
+        if not _e8_df.empty:
+            st.markdown("##### 60-Day Gann Eighths")
+            show_df(_e8_df, hide_index=True)
+
+with tab13:
+    st.markdown("#### 🌌 LIVE VEDIC FINANCIAL ASTROLOGY (MUMBAI IST)")
+    if GA is None:
+        st.error(f"gann_astro.py not loaded: {GA_ERR}")
+    else:
+        _v = GA.compute_vedic_state(now_ist)
+        if not _v.get("ok"):
+            st.warning(_v.get("error", "pysweph not installed."))
+        else:
+            v1, v2, v3, v4 = st.columns(4)
+            v1.metric("LIVE TITHI", _v["tithi"], "⚠️ BHADRA ACTIVE" if _v["is_bhadra"] else "Bhadra Clear", delta_color="off")
+            v2.metric("NAKSHATRA", _v["nakshatra"], _v["elements"], delta_color="off")
+            v3.metric("ASTRO REGIME", _v["regime"], f"Retro: {_v['retros']}", delta_color="off")
+            v4.metric("KAAL TRAP CHECK", _v["kaal_alert"])
+
+            st.info(f"**Live Hora Friendship:** {_v['hora_verdict']}\n\n**Moon Rashi Ingress (NSE Hours):** {_v['rashi_ingress']}\n\n**Macro Yogas (6/8 & 5/9):** {_v['yogas']}")
+            st.caption(f"Today's Mumbai Caution Windows: {_v['kaal_summary']}")
