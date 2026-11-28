@@ -1437,41 +1437,140 @@ def build_pure_gann_telegram_alert(idx_name, spot, gann, csig, swings=None, stru
     )
 
 
+def _vedic_trend_bias(v):
+    """Pure Vedic trend tendency label: BULLISH, BEARISH, or SIDEWAYS (Jyotish factors only)."""
+    if not v or not v.get("ok"):
+        return "SIDEWAYS"
+    bull_pts = 0
+    bear_pts = 0
+    if v.get("regime") == "TREND":
+        bull_pts += 1
+    else:
+        bear_pts += 1
+
+    h_rel = str(v.get("hora_rel", "")).upper()
+    h_lord = str(v.get("hora_verdict", "")).split(" ")[0].title()
+    if h_rel == "FRIEND":
+        bull_pts += 1
+    elif h_rel == "ENEMY":
+        bear_pts += 1
+    if h_lord in ("Jupiter", "Venus", "Moon", "Mercury"):
+        bull_pts += 1
+    elif h_lord in ("Saturn", "Mars", "Rahu", "Ketu"):
+        bear_pts += 1
+
+    if v.get("is_bhadra"):
+        bear_pts += 2
+    if v.get("is_kaal_trap"):
+        bear_pts += 2
+    if v.get("is_bad_sm_yoga"):
+        bear_pts += 1
+    if v.get("sbc_mal_count", 0) >= 2:
+        bear_pts += 1
+    if v.get("latta") and v.get("latta") != "Clear":
+        bear_pts += 1
+
+    if bull_pts - bear_pts >= 2:
+        return "BULLISH"
+    if bear_pts - bull_pts >= 2:
+        return "BEARISH"
+    return "SIDEWAYS"
+
+
+def get_next_vedic_prediction(now_ist, v):
+    """Pure Vedic next-shift prediction: nearest Moon transition or next Chaldean Hora lord & trend."""
+    if not v or not v.get("ok"):
+        return "Next shift unavailable"
+
+    turns_df = v.get("turns_df")
+    if turns_df is not None and not turns_df.empty:
+        astro_only = turns_df[~turns_df["Type"].str.contains("HORA LAGNA", na=False)]
+        for _, row in astro_only.iterrows():
+            t_str = str(row.get("IST Time", "")).strip()
+            try:
+                parsed_t = datetime.strptime(f"{now_ist.strftime('%Y-%m-%d')} {t_str}", "%Y-%m-%d %I:%M %p").replace(tzinfo=IST)
+                if parsed_t > now_ist:
+                    sec = row.get("Sector Focus") or v.get("sector_focus")
+                    return f"Next @ {t_str}: {row.get('Trigger')} ({sec})"
+            except Exception:
+                continue
+
+    h_verdict = str(v.get("hora_verdict", ""))
+    cur_hora = h_verdict.split(" ")[0].title() if h_verdict else ""
+    if cur_hora in CHALDEAN:
+        nxt_hora = CHALDEAN[(CHALDEAN.index(cur_hora) + 1) % 7]
+        nxt_sec = SECTOR_MAP.get(nxt_hora, v.get("sector_focus"))
+        if nxt_hora in ("Jupiter", "Venus", "Moon"):
+            nxt_bias = "BULLISH"
+        elif nxt_hora in ("Saturn", "Mars", "Rahu", "Ketu"):
+            nxt_bias = "BEARISH"
+        else:
+            nxt_bias = "SIDEWAYS"
+        return f"Next Hora: {nxt_hora} (TREND: {nxt_bias} — {nxt_sec})"
+
+    return f"Next Focus: {v.get('sector_focus')}"
+
+
 def build_pure_vedic_telegram_alert(now_ist, v, day_plan=None):
-    """Formats a concise Telegram alert ONLY when a critical Pure Vedic event triggers."""
+    """Formats a direct, non-diplomatic Telegram alert showing CURRENT state + trend + NEXT prediction."""
     if not v or not v.get("ok"):
         return None
 
     triggers = []
     if v.get("is_kaal_trap"):
-        triggers.append(f"Kaal Trap: {v.get('kaal_alert')}")
+        triggers.append(f"TRAP: {v.get('kaal_alert')}")
     if v.get("is_bhadra"):
-        triggers.append(f"Bhadra (Vishti) Active — {v.get('karana')}")
+        triggers.append(f"BHADRA ACTIVE ({v.get('karana')})")
     if v.get("is_bad_sm_yoga"):
-        triggers.append(f"Adverse Yoga: {v.get('sm_yoga')}")
+        triggers.append(f"BAD YOGA: {v.get('sm_yoga')}")
     if v.get("sbc_mal_count", 0) >= 2:
-        triggers.append(f"SBC Malefic Vedha ({v.get('sbc_mal_vedha')})")
+        triggers.append(f"SBC VEDHA ({v.get('sbc_mal_vedha')})")
     if v.get("latta") and v.get("latta") != "Clear":
-        triggers.append(f"Latta Kick: {v.get('latta')}")
+        triggers.append(f"LATTA KICK: {v.get('latta')}")
     if v.get("hora_rel") == "ENEMY":
-        triggers.append(f"Enemy Hora: {v.get('hora_verdict')}")
+        triggers.append(f"ENEMY HORA: {v.get('hora_verdict')}")
 
     turns_df = v.get("turns_df")
     if turns_df is not None and not turns_df.empty:
         astro_only = turns_df[~turns_df["Type"].str.contains("HORA LAGNA", na=False)]
         if not astro_only.empty:
             first_row = astro_only.iloc[0]
-            triggers.append(f"Moon Turn @ {first_row.get('IST Time')}: {first_row.get('Type')} ({first_row.get('Trigger')})")
+            triggers.append(f"MOON SHIFT @ {first_row.get('IST Time')}: {first_row.get('Trigger')}")
 
     if not triggers:
         return None
 
-    vd = build_plain_vedic_verdict(v)
-    return (
-        f"🌌 PURE VEDIC ALERT — {now_ist.strftime('%d %b %Y, %I:%M %p IST')}\n"
-        f"Verdict: {vd.get('headline')}\n"
-        f"Triggers: {' | '.join(triggers[:4])}\n"
-        f"Nakshatra/Tithi: {v.get('nakshatra')} | {v.get('tithi')}\n"
-        f"Sectors: {v.get('sector_focus')}\n"
-        f"Timing/sizing context only — not a price or strike signal."
+    has_heavy_trap = bool(
+        v.get("is_kaal_trap") or v.get("is_bhadra") or v.get("hora_rel") == "ENEMY" or v.get("sbc_mal_count", 0) >= 2
     )
+    size_cmd = "50% SIZE ONLY — DO NOT CHASE" if has_heavy_trap else "100% SIZE OK"
+    trend_bias = _vedic_trend_bias(v)
+    next_pred = get_next_vedic_prediction(now_ist, v)
+    return (
+        f"🌌 VEDIC SHIFT — {now_ist.strftime('%I:%M %p IST')}\n"
+        f"NOW: {size_cmd} | TREND: {trend_bias}\n"
+        f"{' | '.join(triggers[:4])}\n"
+        f"NEXT: {next_pred}\n"
+        f"{v.get('nakshatra')} | {v.get('tithi')} | {v.get('sector_focus')}"
+    )
+
+
+def vedic_alert_state_key(now_ist, v):
+    """Builds a granular state key so ANY change in active Vedic concepts, trend bias, or next shift fires an alert."""
+    if not v or not v.get("ok"):
+        return ""
+    parts = [
+        now_ist.date().isoformat(),
+        _vedic_trend_bias(v),
+        str(v.get("kaal_short", "")),
+        str(v.get("hora_verdict", "")),
+        str(v.get("nakshatra", "")),
+        str(v.get("tithi", "")),
+        str(v.get("karana", "")),
+        str(v.get("sm_yoga", "")),
+        str(v.get("regime", "")),
+        str(v.get("sbc_mal_vedha", "")),
+        str(v.get("latta", "")),
+        get_next_vedic_prediction(now_ist, v),
+    ]
+    return "|".join(parts)
