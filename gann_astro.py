@@ -330,6 +330,33 @@ def evaluate_5m_two_bar(intraday_1m, gann):
     })
     return out
 
+def gann_sq9_time_turns(anchor_price, now_ist):
+    """Pure W.D. Gann Square of 9 intraday time angles from anchor price (09:15 - 15:30 IST)."""
+    if not anchor_price or anchor_price <= 0:
+        return pd.DataFrame()
+    t_open = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+    fmt = lambda d: d.strftime("%I:%M %p").lstrip("0")
+    ang = (math.sqrt(anchor_price) * 180.0 - 225.0) % 360.0
+    rows = []
+    for mult, lbl in (
+        (0.25, "Gann Sq9 Quarter (90° Harmonic)"),
+        (0.50, "Gann Sq9 Half (180° Harmonic)"),
+        (1.00, "Gann Sq9 Primary Angle"),
+    ):
+        m_g = int(((ang * mult) % 360.0) / 360.0 * 375)
+        if 15 <= m_g <= 360:
+            gt = t_open + timedelta(minutes=m_g)
+            rows.append({
+                "IST Time": fmt(gt),
+                "_sort": m_g,
+                "Gann Cycle": lbl,
+                "Angle": f"{(ang * mult) % 360.0:.0f}° from √{anchor_price:,.0f}",
+                "Action": "Watch for 5m 2-Bar reversal or breakout acceleration",
+            })
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(sorted(rows, key=lambda x: x["_sort"])).drop(columns=["_sort"], errors="ignore")
+
 
 # ============================================================
 # 2. FULL-FLEDGED VEDIC ASTROLOGY ENGINE (P.V.R. NARASIMHA RAO)
@@ -767,18 +794,7 @@ def compute_vedic_state(now_ist, anchor_price=None):
         cur_m += 60.0
         cur_r = (cur_r + 1) % 12
 
-    # 4. Gann Sq9 Time Angles from Anchor Price (if available)
-    if anchor_price and anchor_price > 0:
-        ang = (math.sqrt(anchor_price) * 180.0 - 225.0) % 360.0
-        for mult, lbl in ((1, "Gann Sq9 Primary Angle"), (0.5, "Gann Sq9 Harmonic Half")):
-            m_g = int(((ang * mult) % 360.0) / 360.0 * 375)
-            if 15 <= m_g <= 360:
-                gt = t_open + timedelta(minutes=m_g)
-                turn_windows.append({
-                    "IST Time": fmt(gt), "_sort": m_g, "Type": "⚡ GANN SQ9 TIME TURN",
-                    "Trigger": f"{lbl} ({ang*mult:.0f}° from √{anchor_price:.0f})",
-                    "Sector Focus": sector_focus,
-                })
+    # Pure Jyotish only: no Gann time angles mixed in
 
     turns_df = pd.DataFrame(sorted(turn_windows, key=lambda x: x["_sort"])).drop(columns=["_sort"], errors="ignore")
 
@@ -863,10 +879,10 @@ def compute_10day_roadmap(start_dt_ist):
                 "Regime": f"{'🔥 TREND' if st_['regime'] == 'TREND' else '🛡️ FADE'} ({st_['elements']})",
                 "Trap Flags": "⚠️ " + ", ".join(traps) if traps else "✅ Clean",
                 "Trading Plan": (
-                    "🔴 Cut Size 50% — Wait for Wall Reversals" if len(traps) >= 2
-                    else ("🟡 Caution 50% — Strict 2-Bar Only" if len(traps) == 1
-                          else ("🟢 100% Size — Ride Trend Breakouts" if st_["regime"] == "TREND"
-                                else "🟢 100% Size — Fade Gann Walls"))
+                    "🔴 Defensive (50% Size) — High Whipsaw / Reversal Risk" if len(traps) >= 2
+                    else ("🟡 Caution (50% Size) — Expect Trap / Chop" if len(traps) == 1
+                          else ("🟢 Clean (100% Size) — Strong Directional Flow" if st_["regime"] == "TREND"
+                                else "🟢 Clean (100% Size) — Range-Bound / Mean-Reverting"))
                 ),
                 "Sector Focus": st_["sector_focus"],
             })
@@ -876,52 +892,36 @@ def compute_10day_roadmap(start_dt_ist):
 
 
 # ============================================================
-# 3. ULTRA-CRISP BINARY SIGNAL ENGINE (DIRECT COMMANDS ONLY)
+# 3. PURE W.D. GANN SIGNAL ENGINE (100% GANN — ZERO ASTRO)
 # ============================================================
-def build_crisp_gann_astro_signal(spot, gann, tb, vedic):
-    """Returns one direct command (BUY CE / BUY PE / BOOK / NO TRADE) with zero hedging."""
+def build_pure_gann_signal(spot, gann, tb):
+    """100% Pure W.D. Gann / Hima Reddy binary command (BUY CE / BUY PE / BOOK / NO TRADE)."""
     if not gann:
-        return {"signal": "⛔ NO TRADE", "badge": "NO DATA", "color": "#ffab00", "lot_mult": 0.0,
+        return {"signal": "⛔ NO TRADE", "badge": "NO DATA", "color": "#ffab00",
                 "action": "Waiting for previous close anchor."}
-
-    is_trend = vedic.get("regime", "FADE_WALLS") == "TREND"
-    traps = []
-    if vedic.get("is_bhadra"):
-        traps.append("BHADRA")
-    if vedic.get("is_kaal_trap"):
-        traps.append(vedic.get("kaal_short", "KAAL"))
-    if vedic.get("is_bad_sm_yoga"):
-        traps.append(vedic.get("sm_yoga", "").split(" ")[0].upper())
-    if vedic.get("sbc_mal_count", 0) >= 2:
-        traps.append(f"SBC-VEDHA({vedic['sbc_mal_count']})")
-    if vedic.get("latta") and vedic.get("latta") != "Clear":
-        traps.append("LATTA")
-
-    lot_mult = 0.5 if traps else 1.0
-    size_note = f"SIZE: 50% ({' + '.join(traps[:3])})" if traps else "SIZE: 100% (CLEAR)"
 
     # 1. 180° EXHAUSTION — BOOK PROFITS
     if spot <= gann["s3"] + 15:
         return {
             "signal": f"🏁 BOOK PUTS  |  D-S3 ({gann['s3']:,.0f}) HIT",
-            "badge": "BOOK PUTS", "color": "#ffab00", "lot_mult": lot_mult,
-            "action": f"No fresh PE here. Reversal CE only on 5m 2-bar close > {gann['s3'] + 25:,.0f}.  |  {size_note}",
+            "badge": "BOOK PUTS", "color": "#ffab00",
+            "action": f"180° floor reached. No fresh PE here. Reversal CE only on 5m 2-bar close > {gann['s3'] + 25:,.0f}.",
         }
     if spot >= gann["r3"] - 15:
         return {
             "signal": f"🏁 BOOK CALLS  |  D-R3 ({gann['r3']:,.0f}) HIT",
-            "badge": "BOOK CALLS", "color": "#ffab00", "lot_mult": lot_mult,
-            "action": f"No fresh CE here. Reversal PE only on 5m 2-bar close < {gann['r3'] - 25:,.0f}.  |  {size_note}",
+            "badge": "BOOK CALLS", "color": "#ffab00",
+            "action": f"180° ceiling reached. No fresh CE here. Reversal PE only on 5m 2-bar close < {gann['r3'] - 25:,.0f}.",
         }
 
-    # 2. CONFIRMED 5M 2-BAR BREAKOUT / BREAKDOWN
+    # 2. CONFIRMED 5M 2-BAR BREAKOUT / BREAKDOWN BEYOND 45° WALLS
     if tb["close_below_s1"]:
         t1 = gann["s2"] if spot > gann["s2"] else gann["s3"]
         sl = tb["sl_short"] if tb["sl_short"] else gann["pivot"]
         return {
             "signal": f"🔴 BUY PE  |  T1: {t1:,.0f}  |  T2: {gann['s3']:,.0f}  |  SL: {sl:,.1f}",
-            "badge": "BUY PE", "color": "#ff1744", "lot_mult": lot_mult,
-            "action": f"5m 2-bar close < D-S1 ({gann['s1']:,.0f}). Trail SL to entry at T1.  |  {size_note}",
+            "badge": "BUY PE", "color": "#ff1744",
+            "action": f"Confirmed 5m 2-bar close < D-S1 ({gann['s1']:,.0f}). Trail SL to entry at T1.",
         }
 
     if tb["close_above_r1"]:
@@ -929,25 +929,25 @@ def build_crisp_gann_astro_signal(spot, gann, tb, vedic):
         sl = tb["sl_long"] if tb["sl_long"] else gann["pivot"]
         return {
             "signal": f"🟢 BUY CE  |  T1: {t1:,.0f}  |  T2: {gann['r3']:,.0f}  |  SL: {sl:,.1f}",
-            "badge": "BUY CE", "color": "#00e676", "lot_mult": lot_mult,
-            "action": f"5m 2-bar close > D-R1 ({gann['r1']:,.0f}). Trail SL to entry at T1.  |  {size_note}",
+            "badge": "BUY CE", "color": "#00e676",
+            "action": f"Confirmed 5m 2-bar close > D-R1 ({gann['r1']:,.0f}). Trail SL to entry at T1.",
         }
 
-    # 3. CONFIRMED 2-BAR WALL FADE (ONLY IN FADE_WALLS REGIME)
-    if not is_trend and tb["reject_res"]:
+    # 3. CONFIRMED 2-BAR REJECTION / BOUNCE AT 45° WALLS
+    if tb["reject_res"]:
         sl = tb["sl_short"] if tb["sl_short"] else gann["r2"]
         return {
-            "signal": f"🔴 BUY PE (FADE)  |  T1: {gann['pivot']:,.0f}  |  SL: {sl:,.1f}",
-            "badge": "BUY PE", "color": "#ff1744", "lot_mult": lot_mult,
-            "action": f"2-bar rejection at D-R1 ({gann['r1']:,.0f}).  |  {size_note}",
+            "signal": f"🔴 BUY PE (WALL REJECTION)  |  T1: {gann['pivot']:,.0f}  |  SL: {sl:,.1f}",
+            "badge": "BUY PE", "color": "#ff1744",
+            "action": f"2-bar rejection at D-R1 ({gann['r1']:,.0f}). Target Pivot {gann['pivot']:,.0f}.",
         }
 
-    if not is_trend and tb["bounce_sup"]:
+    if tb["bounce_sup"]:
         sl = tb["sl_long"] if tb["sl_long"] else gann["s2"]
         return {
-            "signal": f"🟢 BUY CE (FADE)  |  T1: {gann['pivot']:,.0f}  |  SL: {sl:,.1f}",
-            "badge": "BUY CE", "color": "#00e676", "lot_mult": lot_mult,
-            "action": f"2-bar bounce at D-S1 ({gann['s1']:,.0f}).  |  {size_note}",
+            "signal": f"🟢 BUY CE (WALL BOUNCE)  |  T1: {gann['pivot']:,.0f}  |  SL: {sl:,.1f}",
+            "badge": "BUY CE", "color": "#00e676",
+            "action": f"2-bar bounce at D-S1 ({gann['s1']:,.0f}). Target Pivot {gann['pivot']:,.0f}.",
         }
 
     # 4. NO CONFIRMED TRIGGER — STRICT NO TRADE
@@ -956,19 +956,22 @@ def build_crisp_gann_astro_signal(spot, gann, tb, vedic):
     elif spot > gann["r1"]:
         trig = f"BUY CE only on 5m 2-bar close > {gann['r1']:,.0f}."
     elif spot >= gann["pivot"]:
-        trig = f"Wait for 5m 2-bar close > {gann['r1']:,.0f} (CE)."
+        trig = f"Wait for 5m 2-bar close > {gann['r1']:,.0f} (CE) or rejection at D-R1."
     else:
-        trig = f"Wait for 5m 2-bar close < {gann['s1']:,.0f} (PE)."
+        trig = f"Wait for 5m 2-bar close < {gann['s1']:,.0f} (PE) or bounce at D-S1."
 
     return {
         "signal": f"⛔ NO TRADE  |  BOX {gann['s1']:,.0f} – {gann['r1']:,.0f}",
-        "badge": "NO TRADE", "color": "#ffab00", "lot_mult": lot_mult,
-        "action": f"{trig}  |  {size_note}",
+        "badge": "NO TRADE", "color": "#ffab00",
+        "action": trig,
     }
 
 
+# ============================================================
+# 4. PURE VEDIC ASTROLOGY VERDICT (100% JYOTISH — ZERO GANN)
+# ============================================================
 def build_plain_vedic_verdict(v):
-    """Converts all Vedic metrics into a 2-second plain-English trading verdict."""
+    """100% Pure Vedic Astrology verdict — zero Gann terminology."""
     if not v or not v.get("ok"):
         return {
             "headline": "⛔ ASTRO ENGINE OFFLINE",
@@ -987,7 +990,7 @@ def build_plain_vedic_verdict(v):
     if v.get("is_bad_sm_yoga"):
         traps.append(f"Bad Yoga ({v.get('sm_yoga', '').split(' ')[0]})")
     if v.get("sbc_mal_count", 0) >= 2:
-        traps.append(f"SBC Malefic Obstruction ({v['sbc_mal_count']} planets)")
+        traps.append(f"SBC Malefic Vedha ({v['sbc_mal_count']})")
     if v.get("latta") and v.get("latta") != "Clear":
         traps.append("Latta Sudden Kick")
     if v.get("hora_rel") == "ENEMY":
@@ -995,27 +998,27 @@ def build_plain_vedic_verdict(v):
 
     is_trend = v.get("regime") == "TREND"
     style = (
-        "DIRECTIONAL TREND — Ride confirmed 5m 2-bar breakouts past D-R1 / D-S1."
+        "DIRECTIONAL ENERGY (Fire+Earth) — Favors sustained one-way momentum."
         if is_trend
-        else "RANGE / FADE WALLS — Ignore mid-range chop; trade 2-bar reactions only at D-S1 or D-R1."
+        else "RANGE-BOUND / VOLATILE (Air+Water) — Favors mean-reversion and sudden swings."
     )
 
     if len(traps) >= 2:
-        headline = f"🔴 HIGH TRAP RISK  |  CUT SIZE TO 50%  |  {'TREND' if is_trend else 'FADE WALLS'}"
+        headline = f"🔴 HIGH TRAP RISK  |  CUT SIZE TO 50%  |  {'DIRECTIONAL' if is_trend else 'RANGE-BOUND'}"
         color, badge = "#ff1744", "50% SIZE — DEFENSIVE"
     elif len(traps) == 1:
-        headline = f"🟡 CAUTION ({traps[0].upper()})  |  TRADE 50% SIZE  |  {'TREND' if is_trend else 'FADE WALLS'}"
+        headline = f"🟡 CAUTION ({traps[0].upper()})  |  TRADE 50% SIZE  |  {'DIRECTIONAL' if is_trend else 'RANGE-BOUND'}"
         color, badge = "#ffab00", "50% SIZE — CAUTION"
     else:
         if is_trend:
-            headline = "🟢 CLEAN TREND ENVIRONMENT  |  100% SIZE ALLOWED"
-            color, badge = "#00e676", "100% SIZE — TREND"
+            headline = "🟢 CLEAN DIRECTIONAL ENERGY  |  100% SIZE ALLOWED"
+            color, badge = "#00e676", "100% SIZE — DIRECTIONAL"
         else:
-            headline = "🟢 CLEAN FADE-WALLS ENVIRONMENT  |  100% SIZE AT WALLS"
-            color, badge = "#00e676", "100% SIZE — FADE WALLS"
+            headline = "🟢 CLEAN RANGE-BOUND ENERGY  |  100% SIZE ALLOWED"
+            color, badge = "#00e676", "100% SIZE — RANGE-BOUND"
 
-    traps_txt = " + ".join(traps) if traps else "None — Clear Runway"
-    action = f"STYLE: {style}  |  ACTIVE TRAPS: {traps_txt}  |  SECTORS: {v.get('sector_focus', 'Broad Market')}"
+    traps_txt = " + ".join(traps) if traps else "None — Clear Sky"
+    action = f"ENERGY: {style}  |  ACTIVE TRAPS: {traps_txt}  |  SECTORS: {v.get('sector_focus', 'Broad Market')}"
     return {
         "headline": headline,
         "color": color,
