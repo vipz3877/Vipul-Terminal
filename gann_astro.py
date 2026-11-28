@@ -1413,3 +1413,65 @@ def build_full_day_vedic_plan(dt_ist):
         "sector_focus": base_v["sector_focus"],
         "timeline_df": pd.DataFrame(timeline),
     }
+
+
+# ============================================================
+# 5. DECOUPLED TELEGRAM CRITICAL-TRIGGER ALERT BUILDERS
+# ============================================================
+def build_pure_gann_telegram_alert(idx_name, spot, gann, csig, swings=None, struct=None):
+    """Formats a concise Telegram alert ONLY when a critical Pure Gann event triggers."""
+    if not csig or csig.get("badge") in ("NO TRADE", "NO DATA"):
+        return None
+    sw_txt = ""
+    if swings and swings.get("ready"):
+        sw_txt = f"\n3D Swing: {swings.get('trend')} (Top {swings.get('last_top')} / Bot {swings.get('last_bot')})"
+    st_txt = ""
+    if struct:
+        st_txt = f"\n4W/Fri: {struct.get('breakout_4w')} | {struct.get('friday_rule')}"
+    return (
+        f"📐 PURE GANN TRIGGER — {idx_name}\n"
+        f"Command: {csig.get('signal')}\n"
+        f"Spot: {spot:,.2f} | Anchor: {gann.get('pivot', 0):,.2f} | D-R1: {gann.get('r1', 0):,.0f} | D-S1: {gann.get('s1', 0):,.0f}\n"
+        f"Rule: {csig.get('action')}{sw_txt}{st_txt}\n"
+        f"Manual execution only. Verify live quote & risk before entering."
+    )
+
+
+def build_pure_vedic_telegram_alert(now_ist, v, day_plan=None):
+    """Formats a concise Telegram alert ONLY when a critical Pure Vedic event triggers."""
+    if not v or not v.get("ok"):
+        return None
+
+    triggers = []
+    if v.get("is_kaal_trap"):
+        triggers.append(f"Kaal Trap: {v.get('kaal_alert')}")
+    if v.get("is_bhadra"):
+        triggers.append(f"Bhadra (Vishti) Active — {v.get('karana')}")
+    if v.get("is_bad_sm_yoga"):
+        triggers.append(f"Adverse Yoga: {v.get('sm_yoga')}")
+    if v.get("sbc_mal_count", 0) >= 2:
+        triggers.append(f"SBC Malefic Vedha ({v.get('sbc_mal_vedha')})")
+    if v.get("latta") and v.get("latta") != "Clear":
+        triggers.append(f"Latta Kick: {v.get('latta')}")
+    if v.get("hora_rel") == "ENEMY":
+        triggers.append(f"Enemy Hora: {v.get('hora_verdict')}")
+
+    turns_df = v.get("turns_df")
+    if turns_df is not None and not turns_df.empty:
+        astro_only = turns_df[~turns_df["Type"].str.contains("HORA LAGNA", na=False)]
+        if not astro_only.empty:
+            first_row = astro_only.iloc[0]
+            triggers.append(f"Moon Turn @ {first_row.get('IST Time')}: {first_row.get('Type')} ({first_row.get('Trigger')})")
+
+    if not triggers:
+        return None
+
+    vd = build_plain_vedic_verdict(v)
+    return (
+        f"🌌 PURE VEDIC ALERT — {now_ist.strftime('%d %b %Y, %I:%M %p IST')}\n"
+        f"Verdict: {vd.get('headline')}\n"
+        f"Triggers: {' | '.join(triggers[:4])}\n"
+        f"Nakshatra/Tithi: {v.get('nakshatra')} | {v.get('tithi')}\n"
+        f"Sectors: {v.get('sector_focus')}\n"
+        f"Timing/sizing context only — not a price or strike signal."
+    )
