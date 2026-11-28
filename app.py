@@ -4539,7 +4539,7 @@ _anchor_default = round(float(prev_close or spot), 2)
 
 @_ga_fragment
 def _render_gann_tab():
-    st.markdown("### 📐 W.D. GANN / HIMA REDDY EXECUTION ENGINE (100% PURE GANN)")
+    st.markdown("### 📐 W.D. GANN / HIMA REDDY EXECUTION ENGINE (100% PURE GANN — BOOKS #1–#12)")
     if GA is None:
         st.error(f"gann_astro.py not loaded: {GA_ERR}")
         return
@@ -4570,16 +4570,19 @@ def _render_gann_tab():
 
     _gann = GA.gann_sq9_levels(_anchor_val)
     _tb = GA.evaluate_5m_two_bar(intraday or _xi, _gann)
-    _csig = GA.build_pure_gann_signal(_eff_spot, _gann, _tb)
+    _swings = GA.compute_gann_3day_swings(candles_pre)
+    _csig = GA.build_pure_gann_signal(_eff_spot, _gann, _tb, _swings)
     _struct = GA.gann_structural_filters(candles_pre, _eff_spot, now_ist.date().isoformat())
     _e8_df, _e8_meta = GA.gann_eighths(candles_pre, _eff_spot)
-    _g_turns = GA.gann_sq9_time_turns(_anchor_val, now_ist)
+    _pct_df = GA.gann_price_percentage_levels(candles_pre, _eff_spot)
+    _cyc_df = GA.gann_time_cycle_radar(candles_pre, now_ist)
+    _deg4_df = GA.gann_intraday_4m_degrees(now_ist)
 
     _flash_cls = "flash-green" if _csig["color"] == "#00e676" else ("flash-red" if _csig["color"] == "#ff1744" else "flash-amber")
     st.markdown(
         f"<div class='ga-verdict-box {_flash_cls}' style='border:2px solid {_csig['color']};'>"
         f"<div style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;'>"
-        f"<span class='ga-lbl' style='margin:0;'>PURE W.D. GANN BINARY SIGNAL (PRICE + 5M 2-BAR RULES)</span>"
+        f"<span class='ga-lbl' style='margin:0;'>PURE W.D. GANN BINARY SIGNAL (SQ9 + 5M 2-BAR + 3D SWINGS)</span>"
         f"<span class='ga-badge' style='background:{_csig['color']};color:#000;'>{esc(_csig['badge'])}</span></div>"
         f"<div class='ga-verdict-title' style='color:{_csig['color']};'>{esc(_csig['signal'])}</div>"
         f"<div class='ga-verdict-body'>{esc(_csig['action'])}</div></div>",
@@ -4609,12 +4612,14 @@ def _render_gann_tab():
     _tb_sub = f"Long SL: {_tb['sl_long']}  |  Short SL: {_tb['sl_short']}" if _tb["ready"] else "Needs ≥ 3 closed 5m candles"
     _m50_val = f"{_e8_meta.get('mid50', 0):,.2f}" if _e8_meta else "—"
     _m50_sub = f"Spot at {_e8_meta.get('spot_pct', 0):.1f}% of 60d range" if _e8_meta else "Loading 60d history"
+    _sw_val = _swings["trend"] if _swings.get("ready") else "Collecting 3D Swings"
+    _sw_sub = f"Top: {_swings['last_top']}  |  Bot: {_swings['last_bot']}" if _swings.get("ready") else "Needs daily OHLC history"
     st.markdown(
         f"<div class='ga-grid-4'>"
         f"<div class='ga-card bull'><div class='ga-lbl'>D-R1 (45° BUY CE)</div><div class='ga-val'>{_gann['r1']:,.2f}</div><div class='ga-sub'>T1: {_gann['r2']:,.0f}  |  T2: {_gann['r3']:,.0f}</div></div>"
         f"<div class='ga-card bear'><div class='ga-lbl'>D-S1 (45° BUY PE)</div><div class='ga-val'>{_gann['s1']:,.2f}</div><div class='ga-sub'>T1: {_gann['s2']:,.0f}  |  T2: {_gann['s3']:,.0f}</div></div>"
-        f"<div class='ga-card info'><div class='ga-lbl'>5-MIN 2-BAR ENGINE</div><div class='ga-val'>{_tb_val}</div><div class='ga-sub'>{_tb_sub}</div></div>"
-        f"<div class='ga-card warn'><div class='ga-lbl'>60D GANN 50% LINE</div><div class='ga-val'>{_m50_val}</div><div class='ga-sub'>{_m50_sub}</div></div>"
+        f"<div class='ga-card info'><div class='ga-lbl'>3-DAY GANN SWING</div><div class='ga-val' style='font-size:18px;'>{esc(_sw_val)}</div><div class='ga-sub'>{esc(_sw_sub)}</div></div>"
+        f"<div class='ga-card warn'><div class='ga-lbl'>60D GANN 50% LINE</div><div class='ga-val'>{_m50_val}</div><div class='ga-sub'>{_m50_sub} ({_tb_val})</div></div>"
         f"</div>",
         unsafe_allow_html=True,
     )
@@ -4631,23 +4636,28 @@ def _render_gann_tab():
 
     _g_view = st.radio(
         "GANN VIEW",
-        ["📐 Square of 9 Ladder", "⚡ Gann Sq9 Time Turns", "📊 60-Day Gann Eighths", "💰 2-Bar Risk & Lot Calculator"],
+        ["📐 Sq9 & % Levels", "⏳ Time Cycles & 4m Degrees", "📊 3-Day Swings & Eighths", "💰 Risk & Decreasing Pyramid"],
         horizontal=True,
         label_visibility="collapsed",
         key="ga_subview",
     )
-    if _g_view == "📐 Square of 9 Ladder":
+    if _g_view == "📐 Sq9 & % Levels":
         show_df(GA.gann_sq9_table(_gann, _eff_spot), hide_index=True)
-    elif _g_view == "⚡ Gann Sq9 Time Turns":
-        if not _g_turns.empty:
-            show_df(_g_turns, hide_index=True)
-        else:
-            st.info("No Gann Sq9 time turns calculated.")
-    elif _g_view == "📊 60-Day Gann Eighths":
+        if not _pct_df.empty:
+            st.markdown("##### Gann Price Percentage & Harmonic Levels")
+            show_df(_pct_df, hide_index=True)
+    elif _g_view == "⏳ Time Cycles & 4m Degrees":
+        st.markdown("##### Gann Day-Cycle & Seasonal Turn Radar")
+        show_df(_cyc_df, hide_index=True)
+        st.markdown("##### Intraday 4-Minute Degree Cycle (1° / 4m from 09:15 AM IST)")
+        show_df(_deg4_df, hide_index=True)
+    elif _g_view == "📊 3-Day Swings & Eighths":
+        if _swings.get("ready") and not _swings["swings_df"].empty:
+            st.markdown("##### Gann 3-Day Swing Pivots")
+            show_df(_swings["swings_df"], hide_index=True)
         if not _e8_df.empty:
+            st.markdown("##### 60-Day Gann Eighths (50% Rule)")
             show_df(_e8_df, hide_index=True)
-        else:
-            st.info("Daily candles required for 60-Day Gann Eighths.")
     else:
         rc1, rc2, rc3 = st.columns(3)
         _lot_sz = rc1.number_input("LOT SIZE (NIFTY=65 / BNF=30)", min_value=1, value=65 if "NIFTY 50" in idx_name else 30, step=1, key="ga_lot_sz")
@@ -4658,10 +4668,10 @@ def _render_gann_tab():
         _allowed_lots = int(_eff_risk_rs // max(_risk_per_lot, 1.0))
         st.markdown(
             f"<div class='ga-grid-4'>"
-            f"<div class='ga-card info'><div class='ga-lbl'>RISK BUDGET (100% GANN)</div><div class='ga-val'>₹{_eff_risk_rs:,.0f}</div><div class='ga-sub'>Max Risk: {P('max_risk')}%</div></div>"
-            f"<div class='ga-card warn'><div class='ga-lbl'>RISK PER LOT</div><div class='ga-val'>₹{_risk_per_lot:,.0f}</div><div class='ga-sub'>SL at ₹{_opt_prem*(1-_sl_pct/100):.1f}</div></div>"
-            f"<div class='ga-card bull'><div class='ga-lbl'>ALLOWED LOTS</div><div class='ga-val'>{_allowed_lots} Lot(s)</div><div class='ga-sub'>{_allowed_lots * _lot_sz:,} units</div></div>"
-            f"<div class='ga-card'><div class='ga-lbl'>BREAKEVEN TRAIL RULE</div><div class='ga-val' style='font-size:17px;'>Shift SL to Entry at T1</div><div class='ga-sub'>Book 50% at 90° Wall</div></div>"
+            f"<div class='ga-card info'><div class='ga-lbl'>RISK BUDGET (100% GANN)</div><div class='ga-val'>₹{_eff_risk_rs:,.0f}</div><div class='ga-sub'>Max Risk: {P('max_risk')}% | Never Avg Loss</div></div>"
+            f"<div class='ga-card warn'><div class='ga-lbl'>RISK PER LOT</div><div class='ga-val'>₹{_risk_per_lot:,.0f}</div><div class='ga-sub'>SL at ₹{_opt_prem*(1-_sl_pct/100):.1f} | Step-Down @ 3 Losses</div></div>"
+            f"<div class='ga-card bull'><div class='ga-lbl'>ALLOWED LOTS</div><div class='ga-val'>{_allowed_lots} Lot(s)</div><div class='ga-sub'>Pyramid: 100% → 50% → 30% → 20%</div></div>"
+            f"<div class='ga-card'><div class='ga-lbl'>BREAKEVEN TRAIL RULE</div><div class='ga-val' style='font-size:17px;'>Shift SL to Entry at T1</div><div class='ga-sub'>3-Day Max Time-Stop | Never Cancel SL</div></div>"
             f"</div>",
             unsafe_allow_html=True,
         )
