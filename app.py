@@ -3790,8 +3790,14 @@ if alerts_on and tg_token and tg_chat:
         _v_live = GA.compute_vedic_state(now_ist.replace(second=0, microsecond=0))
         _v_msg = GA.build_pure_vedic_telegram_alert(now_ist, _v_live)
         if _v_msg:
-            _v_key = f"pure_vedic_{now_ist.date().isoformat()}_{_v_live.get('kaal_short')}_{_v_live.get('hora_verdict', '').split(' ')[0]}_{int(_v_live.get('is_bhadra', False))}"
-            alert_results += fire_alert(_v_key, _v_msg, 60, alert_cfg)
+            _v_state = GA.vedic_alert_state_key(now_ist, _v_live)
+            _v_prev_state = st.session_state.get("_last_vedic_alert_state")
+            _v_cd = 5 if (_v_prev_state and _v_prev_state != _v_state) else 60
+            _v_key = f"pure_vedic_{abs(hash(_v_state)) % 10**10}"
+            _sent_v = fire_alert(_v_key, _v_msg, _v_cd, alert_cfg)
+            alert_results += _sent_v
+            if _sent_v:
+                st.session_state["_last_vedic_alert_state"] = _v_state
 
 
 # ============================================================
