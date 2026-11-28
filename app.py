@@ -4454,7 +4454,7 @@ with tab0:
 
 
 # ============================================================
-# DECOUPLED TABS: PURE W.D. GANN ENGINE & PURE VEDIC ASTROLOGY
+# DECOUPLED TABS: PURE W.D. GANN ENGINE & PURE VEDIC ASTROLOGY (LARGE READABLE UI)
 # ============================================================
 _ga_fragment = getattr(st, "fragment", lambda fn: fn)
 
@@ -4467,6 +4467,14 @@ def _cached_vedic_state(dt_minute_iso):
     return GA.compute_vedic_state(dt)
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def _cached_full_day_plan(date_iso):
+    if GA is None:
+        return {"ok": False, "error": GA_ERR}
+    dt = datetime.fromisoformat(date_iso + "T09:30:00+05:30")
+    return GA.build_full_day_vedic_plan(dt)
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def _cached_roadmap(date_iso):
     if GA is None:
@@ -4477,40 +4485,51 @@ def _cached_roadmap(date_iso):
 
 st.markdown("""
 <style>
-.ga-grid-4 { display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:12px; margin:12px 0; }
-.ga-grid-3 { display:grid; grid-template-columns:repeat(3, minmax(0,1fr)); gap:12px; margin:10px 0; }
-.ga-grid-2 { display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:12px; margin:10px 0; }
+.ga-grid-4 { display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:14px; margin:14px 0; }
+.ga-grid-3 { display:grid; grid-template-columns:repeat(3, minmax(0,1fr)); gap:14px; margin:12px 0; }
+.ga-grid-2 { display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:14px; margin:12px 0; }
 @media (max-width: 900px) { .ga-grid-4, .ga-grid-3 { grid-template-columns:repeat(2, minmax(0,1fr)); } .ga-grid-2 { grid-template-columns:1fr; } }
 .ga-card {
-  background: linear-gradient(180deg, #121212 0%, #0a0a0a 100%);
-  border: 1px solid #2b2b2b;
-  border-left: 4px solid #ff9800;
-  border-radius: 6px;
-  padding: 12px 14px;
+  background: linear-gradient(180deg, #161616 0%, #0b0b0b 100%);
+  border: 1px solid #333;
+  border-left: 5px solid #ff9800;
+  border-radius: 8px;
+  padding: 16px 18px;
   display: flex;
   flex-direction: column;
   justify-content: space-between;
-  min-height: 90px;
+  min-height: 112px;
 }
 .ga-card.bull { border-left-color: #00e676; }
 .ga-card.bear { border-left-color: #ff1744; }
 .ga-card.warn { border-left-color: #ffab00; }
 .ga-card.info { border-left-color: #29b6f6; }
-.ga-lbl { font-size: 11px; color: #9e9e9e; letter-spacing: 1.4px; text-transform: uppercase; margin-bottom: 4px; }
-.ga-val { font-size: 17px; font-weight: 700; color: #ffffff; line-height: 1.25; word-break: break-word; }
-.ga-sub { font-size: 12px; color: #bdbdbd; margin-top: 6px; line-height: 1.3; }
+.ga-lbl { font-size: 13px; font-weight: 700; color: #ffb74d; letter-spacing: 1.3px; text-transform: uppercase; margin-bottom: 6px; }
+.ga-val { font-size: 22px; font-weight: 800; color: #ffffff; line-height: 1.3; word-break: break-word; }
+.ga-sub { font-size: 14px; color: #e0e0e0; margin-top: 8px; line-height: 1.4; }
+.ga-verdict-box {
+  background: #121212;
+  border-radius: 8px;
+  padding: 18px 20px;
+  margin: 12px 0 16px 0;
+}
+.ga-verdict-title { font-size: 24px; font-weight: 800; line-height: 1.3; margin: 6px 0; }
+.ga-verdict-body { font-size: 16px; color: #f0f0f0; line-height: 1.5; margin-top: 6px; }
 .ga-badge {
-  display: inline-block; padding: 3px 10px; border-radius: 4px;
-  font-size: 11px; font-weight: 800; letter-spacing: 1.2px; text-transform: uppercase;
+  display: inline-block; padding: 4px 12px; border-radius: 4px;
+  font-size: 13px; font-weight: 800; letter-spacing: 1.1px; text-transform: uppercase;
 }
-.ga-bar-wrap { background:#181818; border:1px solid #2e2e2e; border-radius:6px; padding:12px 14px; margin:10px 0; }
-.ga-track { position:relative; height:12px; background:#262626; border-radius:6px; margin:10px 0 6px 0; overflow:visible; }
-.ga-fill { height:100%; border-radius:6px; }
+.ga-bar-wrap { background:#181818; border:1px solid #333; border-radius:8px; padding:14px 16px; margin:12px 0; }
+.ga-track { position:relative; height:14px; background:#262626; border-radius:7px; margin:12px 0 8px 0; overflow:visible; }
+.ga-fill { height:100%; border-radius:7px; }
 .ga-pin {
-  position:absolute; top:-4px; width:4px; height:20px; background:#ffffff;
-  border-radius:2px; box-shadow:0 0 8px #ffffff; transform:translateX(-50%);
+  position:absolute; top:-4px; width:5px; height:22px; background:#ffffff;
+  border-radius:2px; box-shadow:0 0 10px #ffffff; transform:translateX(-50%);
 }
-.ga-scale { display:flex; justify-content:space-between; font-size:11px; color:#9e9e9e; }
+.ga-scale { display:flex; justify-content:space-between; font-size:13px; color:#ccc; }
+/* Larger readable radio & table text */
+div[data-testid="stRadio"] label p { font-size: 16px !important; font-weight: 600 !important; }
+div[data-testid="stDataFrame"] { font-size: 15px !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -4520,7 +4539,7 @@ _anchor_default = round(float(prev_close or spot), 2)
 
 @_ga_fragment
 def _render_gann_tab():
-    st.markdown("#### 📐 W.D. GANN / HIMA REDDY EXECUTION ENGINE (100% PURE GANN)")
+    st.markdown("### 📐 W.D. GANN / HIMA REDDY EXECUTION ENGINE (100% PURE GANN)")
     if GA is None:
         st.error(f"gann_astro.py not loaded: {GA_ERR}")
         return
@@ -4535,7 +4554,7 @@ def _render_gann_tab():
         _anchor_val = ctrl2.number_input("CUSTOM ANCHOR", min_value=100.0, value=_anchor_default, step=5.0, key="ga_custom_anchor")
     else:
         _anchor_val = _anchor_default
-        ctrl2.markdown(f"<div style='padding-top:28px;font-size:13px;color:#aaa;'>Anchor: <b style='color:#fff;'>{_anchor_val:,.2f}</b></div>", unsafe_allow_html=True)
+        ctrl2.markdown(f"<div style='padding-top:28px;font-size:15px;color:#ccc;'>Anchor: <b style='color:#fff;'>{_anchor_val:,.2f}</b></div>", unsafe_allow_html=True)
 
     _sim_spot_on = ctrl3.toggle("SIMULATE SPOT (WHAT-IF)", value=False, key="ga_sim_on")
     _eff_spot = float(spot)
@@ -4558,12 +4577,12 @@ def _render_gann_tab():
 
     _flash_cls = "flash-green" if _csig["color"] == "#00e676" else ("flash-red" if _csig["color"] == "#ff1744" else "flash-amber")
     st.markdown(
-        f"<div class='bbg-panel {_flash_cls}' style='border:2px solid {_csig['color']};'>"
-        f"<div style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:6px;'>"
-        f"<span class='bbg-title'>PURE W.D. GANN BINARY SIGNAL (PRICE + 5M 2-BAR RULES)</span>"
+        f"<div class='ga-verdict-box {_flash_cls}' style='border:2px solid {_csig['color']};'>"
+        f"<div style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;'>"
+        f"<span class='ga-lbl' style='margin:0;'>PURE W.D. GANN BINARY SIGNAL (PRICE + 5M 2-BAR RULES)</span>"
         f"<span class='ga-badge' style='background:{_csig['color']};color:#000;'>{esc(_csig['badge'])}</span></div>"
-        f"<div class='bbg-big' style='color:{_csig['color']};font-size:21px;'>{esc(_csig['signal'])}</div>"
-        f"<div class='bbg-desc'>{esc(_csig['action'])}</div></div>",
+        f"<div class='ga-verdict-title' style='color:{_csig['color']};'>{esc(_csig['signal'])}</div>"
+        f"<div class='ga-verdict-body'>{esc(_csig['action'])}</div></div>",
         unsafe_allow_html=True,
     )
 
@@ -4571,7 +4590,7 @@ def _render_gann_tab():
     _g_pct = max(0.0, min(100.0, (_eff_spot - _g_min) / max(_g_max - _g_min, 1.0) * 100.0))
     st.markdown(
         f"<div class='ga-bar-wrap'>"
-        f"<div style='display:flex;justify-content:space-between;font-size:12px;'>"
+        f"<div style='display:flex;justify-content:space-between;font-size:14px;'>"
         f"<span style='color:#ff9800;font-weight:700;'>GANN SQ9 INTRADAY BATTLEFIELD (180° FLOOR → 180° CEILING)</span>"
         f"<span style='color:#fff;'>Spot: <b>{_eff_spot:,.2f}</b> ({_g_pct:.1f}% of 180° span)</span></div>"
         f"<div class='ga-track'>"
@@ -4580,7 +4599,7 @@ def _render_gann_tab():
         f"</div>"
         f"<div class='ga-scale'>"
         f"<span>D-S3 {_gann['s3']:,.0f}</span><span>D-S1 {_gann['s1']:,.0f}</span>"
-        f"<span style='color:#ff9800;'>Pivot {_gann['pivot']:,.0f}</span>"
+        f"<span style='color:#ff9800;font-weight:700;'>Pivot {_gann['pivot']:,.0f}</span>"
         f"<span>D-R1 {_gann['r1']:,.0f}</span><span>D-R3 {_gann['r3']:,.0f}</span>"
         f"</div></div>",
         unsafe_allow_html=True,
@@ -4602,10 +4621,10 @@ def _render_gann_tab():
 
     st.markdown(
         f"<div class='ga-grid-2'>"
-        f"<div class='ga-card {_struct['b4w_tone']}'><div class='ga-lbl'>4-WEEK BREAKOUT RULE</div><div class='ga-val' style='font-size:16px;'>{esc(_struct['breakout_4w'])}</div></div>"
-        f"<div class='ga-card {_struct['fri_tone']}'><div class='ga-lbl'>FRIDAY HIGH/LOW WEEKLY RULE</div><div class='ga-val' style='font-size:16px;'>{esc(_struct['friday_rule'])}</div></div>"
-        f"<div class='ga-card {_struct['ov_tone']}'><div class='ga-lbl'>OVERBALANCING (PRICE & TIME)</div><div class='ga-val' style='font-size:16px;'>{esc(_struct['overbalance'])}</div></div>"
-        f"<div class='ga-card {_struct['t50_tone']}'><div class='ga-lbl'>50% TIME RETRACEMENT</div><div class='ga-val' style='font-size:16px;'>{esc(_struct['time_50'])}</div></div>"
+        f"<div class='ga-card {_struct['b4w_tone']}'><div class='ga-lbl'>4-WEEK BREAKOUT RULE</div><div class='ga-val' style='font-size:18px;'>{esc(_struct['breakout_4w'])}</div></div>"
+        f"<div class='ga-card {_struct['fri_tone']}'><div class='ga-lbl'>FRIDAY HIGH/LOW WEEKLY RULE</div><div class='ga-val' style='font-size:18px;'>{esc(_struct['friday_rule'])}</div></div>"
+        f"<div class='ga-card {_struct['ov_tone']}'><div class='ga-lbl'>OVERBALANCING (PRICE & TIME)</div><div class='ga-val' style='font-size:18px;'>{esc(_struct['overbalance'])}</div></div>"
+        f"<div class='ga-card {_struct['t50_tone']}'><div class='ga-lbl'>50% TIME RETRACEMENT</div><div class='ga-val' style='font-size:18px;'>{esc(_struct['time_50'])}</div></div>"
         f"</div>",
         unsafe_allow_html=True,
     )
@@ -4642,7 +4661,7 @@ def _render_gann_tab():
             f"<div class='ga-card info'><div class='ga-lbl'>RISK BUDGET (100% GANN)</div><div class='ga-val'>₹{_eff_risk_rs:,.0f}</div><div class='ga-sub'>Max Risk: {P('max_risk')}%</div></div>"
             f"<div class='ga-card warn'><div class='ga-lbl'>RISK PER LOT</div><div class='ga-val'>₹{_risk_per_lot:,.0f}</div><div class='ga-sub'>SL at ₹{_opt_prem*(1-_sl_pct/100):.1f}</div></div>"
             f"<div class='ga-card bull'><div class='ga-lbl'>ALLOWED LOTS</div><div class='ga-val'>{_allowed_lots} Lot(s)</div><div class='ga-sub'>{_allowed_lots * _lot_sz:,} units</div></div>"
-            f"<div class='ga-card'><div class='ga-lbl'>BREAKEVEN TRAIL RULE</div><div class='ga-val' style='font-size:15px;'>Shift SL to Entry at T1</div><div class='ga-sub'>Book 50% at 90° Wall</div></div>"
+            f"<div class='ga-card'><div class='ga-lbl'>BREAKEVEN TRAIL RULE</div><div class='ga-val' style='font-size:17px;'>Shift SL to Entry at T1</div><div class='ga-sub'>Book 50% at 90° Wall</div></div>"
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -4650,7 +4669,7 @@ def _render_gann_tab():
 
 @_ga_fragment
 def _render_vedic_tab():
-    st.markdown("#### 🌌 VEDIC FINANCIAL ASTROLOGY (100% PURE JYOTISH — MUMBAI IST)")
+    st.markdown("### 🌌 VEDIC FINANCIAL ASTROLOGY — FULL-DAY PLAN (MUMBAI IST)")
     if GA is None:
         st.error(f"gann_astro.py not loaded: {GA_ERR}")
         return
@@ -4665,73 +4684,64 @@ def _render_vedic_tab():
     else:
         _eval_dt = now_ist
         _eval_iso = _now_min_iso
-        c_top2.markdown(f"<div style='padding-top:6px;font-size:13px;color:#aaa;'>Live: <b style='color:#fff;'>{now_ist.strftime('%d %b %Y, %I:%M %p IST')}</b></div>", unsafe_allow_html=True)
+        c_top2.markdown(f"<div style='padding-top:6px;font-size:15px;color:#ccc;'>Live: <b style='color:#fff;'>{now_ist.strftime('%d %b %Y, %I:%M %p IST')}</b></div>", unsafe_allow_html=True)
 
     _v = _cached_vedic_state(_eval_iso)
-    if not _v.get("ok"):
+    _day_plan = _cached_full_day_plan(_eval_dt.date().isoformat())
+    if not _v.get("ok") or not _day_plan.get("ok"):
         st.warning(_v.get("error", "pysweph not installed."))
         return
 
-    _vd = GA.build_plain_vedic_verdict(_v)
-    _is_trend = _v["regime"] == "TREND"
-    _lot_str = "50% LOTS" if _vd["badge"].startswith("50%") else "100% LOTS"
-    _lot_tone = "bear" if _lot_str == "50% LOTS" else "bull"
-
-    # Pure Astronomical Turns (Moon Rashi Ingress & Moon Pada Shifts — drop hourly Hora Lagna spam)
-    _turns = _v.get("turns_df")
-    _astro_turns = pd.DataFrame()
-    if _turns is not None and not _turns.empty:
-        _astro_turns = _turns[~_turns["Type"].str.contains("HORA LAGNA", na=False)].copy()
-    _next_turn = _astro_turns.iloc[0]["IST Time"] if not _astro_turns.empty else "None today"
-
-    # 1. SINGLE 4-BOX PURE VEDIC ANSWER STRIP
+    # 1. FULL-DAY EXECUTIVE VERDICT BANNER (LARGE, CLEAR, READABLE)
     st.markdown(
-        f"<div class='ga-grid-4'>"
-        f"<div class='ga-card {'bull' if _is_trend else 'warn'}'>"
-        f"  <div class='ga-lbl'>ASTRO MARKET ENERGY</div>"
-        f"  <div class='ga-val'>{'🔥 DIRECTIONAL' if _is_trend else '🌊 RANGE-BOUND'}</div>"
-        f"  <div class='ga-sub'>{'Fire+Earth dominant — sustained flow' if _is_trend else 'Air+Water dominant — mean-reverting'}</div>"
+        f"<div class='ga-verdict-box' style='border:2px solid {_day_plan['verdict_color']};'>"
+        f"<div class='ga-lbl'>FULL-DAY ASTRO VERDICT — {esc(_day_plan['date_str'])}</div>"
+        f"<div class='ga-verdict-title' style='color:{_day_plan['verdict_color']};'>{esc(_day_plan['verdict_title'])}</div>"
+        f"<div class='ga-verdict-body'>{esc(_day_plan['verdict_summary'])}</div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    # 2. KEY WINDOWS SUMMARY (BEST / AVOID / REVERSAL / SECTORS) — LARGE FONTS
+    st.markdown(
+        f"<div class='ga-grid-2'>"
+        f"<div class='ga-card bull'>"
+        f"  <div class='ga-lbl'>🟢 BEST TRADE WINDOWS (CLEAN FLOW)</div>"
+        f"  <div class='ga-val' style='font-size:18px;'>{esc(_day_plan['best_windows'])}</div>"
         f"</div>"
-        f"<div class='ga-card {_lot_tone}'>"
-        f"  <div class='ga-lbl'>ASTRO RISK SIZING</div>"
-        f"  <div class='ga-val'>{_lot_str}</div>"
-        f"  <div class='ga-sub'>{esc(_vd['traps_txt'])}</div>"
+        f"<div class='ga-card bear'>"
+        f"  <div class='ga-lbl'>🔴 AVOID / TRAP WINDOWS (DO NOT CHASE)</div>"
+        f"  <div class='ga-val' style='font-size:18px;'>{esc(_day_plan['avoid_windows'])}</div>"
         f"</div>"
         f"<div class='ga-card info'>"
-        f"  <div class='ga-lbl'>MOON TRANSIT TURN</div>"
-        f"  <div class='ga-val'>{esc(_next_turn)}</div>"
-        f"  <div class='ga-sub'>{len(_astro_turns)} Moon shift(s) in NSE hours</div>"
+        f"  <div class='ga-lbl'>🌙 KEY MOON REVERSAL TIMES</div>"
+        f"  <div class='ga-val' style='font-size:18px;'>{esc(_day_plan['reversal_times'])}</div>"
         f"</div>"
-        f"<div class='ga-card'>"
-        f"  <div class='ga-lbl'>RULING SECTORS</div>"
-        f"  <div class='ga-val' style='font-size:15px;'>{esc(_v['sector_focus'])}</div>"
-        f"  <div class='ga-sub'>Avoid: {esc(_v['kaal_summary'].split('  |  ')[0])}</div>"
+        f"<div class='ga-card warn'>"
+        f"  <div class='ga-lbl'>🎯 RULING SECTORS TODAY</div>"
+        f"  <div class='ga-val' style='font-size:18px;'>{esc(_day_plan['sector_focus'])}</div>"
         f"</div>"
         f"</div>",
         unsafe_allow_html=True,
     )
 
-    # 2. TWO SIMPLE PURE-ASTRO VIEWS: TODAY vs NEXT 10 DAYS
+    # 3. FULL-DAY TIMELINE vs NEXT 10 DAYS OUTLOOK
     _simple_view = st.radio(
         "VIEW",
-        ["🌙 Today's Astro Turns & Kaals", "📅 Next 10 Days Astro Outlook"],
+        ["📋 Full-Day Intraday Action Plan (09:15 – 03:30 IST)", "📅 Next 10 Days Astro Outlook"],
         horizontal=True,
         label_visibility="collapsed",
         key="ga_v_simple_view",
     )
-    if _simple_view == "🌙 Today's Astro Turns & Kaals":
-        if not _astro_turns.empty:
-            show_df(_astro_turns, hide_index=True)
-        else:
-            st.info("No Moon Rashi or Pada shifts during NSE hours today.")
-        st.caption(f"Mumbai Kaal / Upagraha Caution Windows: {_v['kaal_summary']}")
+    if _simple_view == "📋 Full-Day Intraday Action Plan (09:15 – 03:30 IST)":
+        show_df(_day_plan["timeline_df"], hide_index=True)
     else:
         _rm = _cached_roadmap(_eval_dt.date().isoformat())
         if not _rm.empty:
             _clean_cols = [c for c in ["Date", "Trading Plan", "Trap Flags", "Sector Focus"] if c in _rm.columns]
             show_df(_rm[_clean_cols], hide_index=True)
 
-    # 3. ALL ADVANCED JYOTISH DATA IN ONE COLLAPSED EXPANDER
+    # 4. ALL ADVANCED JYOTISH DATA IN ONE COLLAPSED EXPANDER
     with st.expander("📚 Advanced Jyotish Details (Hora, Tajaka, Dignities, Panchanga, SBC Vedha)"):
         _adv = st.radio(
             "ADV",
