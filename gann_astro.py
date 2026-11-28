@@ -892,13 +892,211 @@ def compute_10day_roadmap(start_dt_ist):
 
 
 # ============================================================
-# 3. PURE W.D. GANN SIGNAL ENGINE (100% GANN — ZERO ASTRO)
+# 1B. ADVANCED PURE W.D. GANN ENGINE (BOOKS #1 - #12)
 # ============================================================
-def build_pure_gann_signal(spot, gann, tb):
+GANN_SEASONAL_DATES = [
+    (2, 4, "Mid-Season Power Date (Feb 4)"),
+    (3, 21, "Spring Equinox Seasonal Turn (Mar 21)"),
+    (5, 5, "Mid-Season Power Date (May 5)"),
+    (6, 21, "Summer Solstice Seasonal Turn (Jun 21)"),
+    (7, 23, "1/3 Year Seasonal Turn (Jul 23)"),
+    (8, 5, "Mid-Season Power Date (Aug 5)"),
+    (9, 22, "Autumn Equinox Seasonal Turn (Sep 22)"),
+    (11, 8, "Mid-Season Power Date (Nov 8)"),
+    (11, 22, "2/3 Year Seasonal Turn (Nov 22)"),
+    (12, 21, "Winter Solstice Seasonal Turn (Dec 21)"),
+]
+GANN_MONTHLY_TURN_DAYS = [(6, 7), (9, 10), (14, 15), (19, 20), (23, 24), (29, 31)]
+GANN_DAY_CYCLES = [3.5, 7, 14, 21, 23, 30, 45, 49, 63, 72, 81, 90, 108, 120, 144, 180]
+GANN_144_DIVISIONS = [36, 45, 48, 54, 63, 72, 81, 90, 96, 108, 126, 144]
+
+
+def compute_gann_3day_swings(candles):
+    """Builds Gann's 3-Day Swing Chart (3 consecutive higher H/L = up, 3 lower L/H = down)."""
+    if not candles or len(candles) < 6:
+        return {"ready": False, "trend": "NEUTRAL", "last_top": None, "last_bot": None, "swings_df": pd.DataFrame()}
+
+    swings = []
+    mode = None  # "UP" or "DOWN"
+    streak = 0
+    ext_high = candles[0]["h"]
+    ext_high_date = candles[0]["date"]
+    ext_low = candles[0]["l"]
+    ext_low_date = candles[0]["date"]
+
+    for i in range(1, len(candles)):
+        b = candles[i]
+        prev = candles[i - 1]
+        if b["h"] > ext_high:
+            ext_high, ext_high_date = b["h"], b["date"]
+        if b["l"] < ext_low:
+            ext_low, ext_low_date = b["l"], b["date"]
+
+        if b["h"] > prev["h"] and b["l"] > prev["l"]:
+            if mode == "UP":
+                streak += 1
+            else:
+                mode, streak = "UP", 1
+            if streak >= 3 and (not swings or swings[-1]["Type"] != "TOP"):
+                swings.append({"Type": "TOP", "Date": ext_high_date, "Price": round(ext_high, 2), "Idx": i})
+                ext_low, ext_low_date = b["l"], b["date"]
+        elif b["l"] < prev["l"] and b["h"] < prev["h"]:
+            if mode == "DOWN":
+                streak += 1
+            else:
+                mode, streak = "DOWN", 1
+            if streak >= 3 and (not swings or swings[-1]["Type"] != "BOTTOM"):
+                swings.append({"Type": "BOTTOM", "Date": ext_low_date, "Price": round(ext_low, 2), "Idx": i})
+                ext_high, ext_high_date = b["h"], b["date"]
+        else:
+            streak = 0
+
+    tops = [s for s in swings if s["Type"] == "TOP"]
+    bots = [s for s in swings if s["Type"] == "BOTTOM"]
+    last_top = tops[-1]["Price"] if tops else None
+    last_bot = bots[-1]["Price"] if bots else None
+
+    if len(tops) >= 2 and len(bots) >= 2:
+        if tops[-1]["Price"] > tops[-2]["Price"] and bots[-1]["Price"] > bots[-2]["Price"]:
+            trend = "UP (Higher Tops & Bottoms)"
+        elif tops[-1]["Price"] < tops[-2]["Price"] and bots[-1]["Price"] < bots[-2]["Price"]:
+            trend = "DOWN (Lower Tops & Bottoms)"
+        else:
+            trend = "TRANSITION / MIXED"
+    elif len(swings) >= 1:
+        trend = "UP" if swings[-1]["Type"] == "TOP" else "DOWN"
+    else:
+        trend = "NEUTRAL"
+
+    df_sw = pd.DataFrame(swings[-12:]).drop(columns=["Idx"], errors="ignore") if swings else pd.DataFrame()
+    return {"ready": bool(swings), "trend": trend, "last_top": last_top, "last_bot": last_bot, "swings_df": df_sw}
+
+
+def gann_intraday_4m_degrees(now_ist):
+    """Gann 4-Minute Intraday Degree Cycle (1° per 4 minutes from 09:15 AM IST open)."""
+    t_open = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+    fmt = lambda d: d.strftime("%I:%M %p").lstrip("0")
+    rows = []
+    for deg, lbl in [
+        (15, "15° (1 Hr / 60m)"),
+        (30, "30° (2 Hr / 120m)"),
+        (45, "45° (3 Hr / 180m — Half Day)"),
+        (60, "60° (4 Hr / 240m)"),
+        (75, "75° (5 Hr / 300m)"),
+        (90, "90° (6 Hr / 360m — Late Turn)"),
+    ]:
+        mins = deg * 4
+        if 0 <= mins <= 375:
+            gt = t_open + timedelta(minutes=mins)
+            rows.append({
+                "IST Time": fmt(gt),
+                "4m Cycle": lbl,
+                "Elapsed": f"{mins}m ({mins // 60}h {mins % 60}m)",
+                "Watch": "Check 5m 2-Bar breakout/reversal & volume",
+            })
+    return pd.DataFrame(rows)
+
+
+def gann_time_cycle_radar(candles, now_ist):
+    """Computes Gann calendar-day turn counts from recent daily swing highs/lows + seasonal/monthly dates."""
+    today = now_ist.date()
+    closed = [c for c in (candles or []) if c.get("date", "") < today.isoformat()]
+    rows = []
+
+    # Check swing pivots from last 60 closed days
+    sub = closed[-60:] if len(closed) >= 5 else closed
+    pivots = []
+    for i in range(1, len(sub) - 1):
+        if sub[i]["h"] >= sub[i - 1]["h"] and sub[i]["h"] >= sub[i + 1]["h"]:
+            pivots.append(("SWING HIGH", sub[i]["date"], sub[i]["h"]))
+        if sub[i]["l"] <= sub[i - 1]["l"] and sub[i]["l"] <= sub[i + 1]["l"]:
+            pivots.append(("SWING LOW", sub[i]["date"], sub[i]["l"]))
+
+    for kind, d_str, px in pivots[-6:]:
+        try:
+            p_date = datetime.strptime(d_str, "%Y-%m-%d").date()
+        except Exception:
+            continue
+        elapsed = (today - p_date).days
+        for cyc in GANN_DAY_CYCLES:
+            diff = abs(elapsed - cyc)
+            if diff <= 2:
+                target_d = p_date + timedelta(days=int(round(cyc)))
+                rows.append({
+                    "Window": f"{target_d.strftime('%d %b')} ({cyc:g}d)",
+                    "Anchor": f"{kind} {px:,.0f} ({d_str})",
+                    "Status": "⚡ ACTIVE TODAY" if diff == 0 else f"Within {diff}d (Elapsed {elapsed}d)",
+                })
+
+    # Upcoming Seasonal & Mid-Season dates within next 25 days
+    for offset in range(-1, 25):
+        cand_d = today + timedelta(days=offset)
+        for m_no, d_no, lbl in GANN_SEASONAL_DATES:
+            if cand_d.month == m_no and cand_d.day == d_no:
+                rows.append({
+                    "Window": cand_d.strftime("%d %b (%a)"),
+                    "Anchor": lbl,
+                    "Status": "⚡ ACTIVE TODAY" if offset == 0 else (f"In {offset} day(s)" if offset > 0 else "Yesterday"),
+                })
+
+    # Monthly natural turn windows today
+    for d1, d2 in GANN_MONTHLY_TURN_DAYS:
+        if d1 <= today.day <= d2:
+            rows.append({
+                "Window": f"{today.strftime('%b')} {d1}–{d2}",
+                "Anchor": "Monthly Natural Turn Window",
+                "Status": "⚡ ACTIVE TODAY",
+            })
+
+    return pd.DataFrame(rows) if rows else pd.DataFrame([{
+        "Window": today.strftime("%d %b (%a)"),
+        "Anchor": "No exact Gann day-count or seasonal turn on today's date",
+        "Status": "Follow 1x1 / 5m 2-Bar rules",
+    }])
+
+
+def gann_price_percentage_levels(candles, spot):
+    """Gann percentage levels (12.5%, 25%, 33.3%, 50%, 66.7%, 75%, 100%) from 60-day range & swing extremes."""
+    if not candles or len(candles) < 5:
+        return pd.DataFrame()
+    win = candles[-60:]
+    hi = max(c["h"] for c in win)
+    lo = min(c["l"] for c in win)
+    rng = hi - lo
+    if rng <= 0:
+        return pd.DataFrame()
+
+    levels = [
+        ("60D High (100% of Range)", hi),
+        ("75% Range Level", lo + 0.75 * rng),
+        ("66.7% (2/3) Harmonic", lo + (2.0 / 3.0) * rng),
+        ("50% Master Balance Point", lo + 0.50 * rng),
+        ("33.3% (1/3) Harmonic", lo + (1.0 / 3.0) * rng),
+        ("25% Range Level", lo + 0.25 * rng),
+        ("60D Low (0% of Range)", lo),
+        ("50% of 60D High", 0.50 * hi),
+    ]
+    rows = []
+    for name, px in levels:
+        dist = px - spot
+        rows.append({
+            "Gann Level": name,
+            "Price": round(px, 2),
+            "Dist (pts)": f"{dist:+.1f}",
+            "Position": "ABOVE SPOT" if dist > 0 else "BELOW SPOT",
+        })
+    return pd.DataFrame(rows)
+
+
+def build_pure_gann_signal(spot, gann, tb, swings=None):
     """100% Pure W.D. Gann / Hima Reddy binary command (BUY CE / BUY PE / BOOK / NO TRADE)."""
     if not gann:
         return {"signal": "⛔ NO TRADE", "badge": "NO DATA", "color": "#ffab00",
                 "action": "Waiting for previous close anchor."}
+
+    # Narrow-range dead-zone guard when spot is inside tight 45° walls with no 2-bar signal
+    in_box = (gann["s1"] <= spot <= gann["r1"])
+    no_tb_trig = not any([tb.get("close_above_r1"), tb.get("close_below_s1"), tb.get("reject_res"), tb.get("bounce_sup")])
 
     # 1. 180° EXHAUSTION — BOOK PROFITS
     if spot <= gann["s3"] + 15:
@@ -918,19 +1116,21 @@ def build_pure_gann_signal(spot, gann, tb):
     if tb["close_below_s1"]:
         t1 = gann["s2"] if spot > gann["s2"] else gann["s3"]
         sl = tb["sl_short"] if tb["sl_short"] else gann["pivot"]
+        sw_note = f" | 3D Swing: {swings['trend']}" if (swings and swings.get("ready")) else ""
         return {
             "signal": f"🔴 BUY PE  |  T1: {t1:,.0f}  |  T2: {gann['s3']:,.0f}  |  SL: {sl:,.1f}",
             "badge": "BUY PE", "color": "#ff1744",
-            "action": f"Confirmed 5m 2-bar close < D-S1 ({gann['s1']:,.0f}). Trail SL to entry at T1.",
+            "action": f"Confirmed 5m 2-bar close < D-S1 ({gann['s1']:,.0f}). Trail SL to entry at T1.{sw_note}",
         }
 
     if tb["close_above_r1"]:
         t1 = gann["r2"] if spot < gann["r2"] else gann["r3"]
         sl = tb["sl_long"] if tb["sl_long"] else gann["pivot"]
+        sw_note = f" | 3D Swing: {swings['trend']}" if (swings and swings.get("ready")) else ""
         return {
             "signal": f"🟢 BUY CE  |  T1: {t1:,.0f}  |  T2: {gann['r3']:,.0f}  |  SL: {sl:,.1f}",
             "badge": "BUY CE", "color": "#00e676",
-            "action": f"Confirmed 5m 2-bar close > D-R1 ({gann['r1']:,.0f}). Trail SL to entry at T1.",
+            "action": f"Confirmed 5m 2-bar close > D-R1 ({gann['r1']:,.0f}). Trail SL to entry at T1.{sw_note}",
         }
 
     # 3. CONFIRMED 2-BAR REJECTION / BOUNCE AT 45° WALLS
@@ -955,6 +1155,8 @@ def build_pure_gann_signal(spot, gann, tb):
         trig = f"BUY PE only on 5m 2-bar close < {gann['s1']:,.0f}."
     elif spot > gann["r1"]:
         trig = f"BUY CE only on 5m 2-bar close > {gann['r1']:,.0f}."
+    elif in_box and no_tb_trig:
+        trig = f"Gann Dead-Zone / Range Box ({gann['s1']:,.0f}–{gann['r1']:,.0f}): Do not trade inside range; wait for 5m 2-bar breakout."
     elif spot >= gann["pivot"]:
         trig = f"Wait for 5m 2-bar close > {gann['r1']:,.0f} (CE) or rejection at D-R1."
     else:
@@ -1062,11 +1264,9 @@ def build_full_day_vedic_plan(dt_ist):
     yama_w = up_wins.get("Yamaganda", win([5, 4, 3, 2, 1, 7, 6][sun0]))
     mrityu_w = up_wins.get("Mrityu")
 
-    # Build chronological NSE session blocks (09:15 to 15:30)
     t_open = day_dt.replace(hour=9, minute=15, second=0, microsecond=0)
     t_close = day_dt.replace(hour=15, minute=30, second=0, microsecond=0)
 
-    # Collect key split timestamps inside [09:15, 15:30]
     cuts = {t_open, t_close}
     for h in range(2, 10):
         ht = sr + timedelta(hours=h)
@@ -1079,7 +1279,6 @@ def build_full_day_vedic_plan(dt_ist):
                 if t_open < pt_c < t_close:
                     cuts.add(pt_c)
 
-    # Add Moon Rashi / Pada shift timestamps
     m_open, _ = _sid_lon(_jd_utc(t_open), swe.MOON)
     m_close, _ = _sid_lon(_jd_utc(t_close), swe.MOON)
     rev_times = []
@@ -1101,13 +1300,24 @@ def build_full_day_vedic_plan(dt_ist):
         if t_open < pt < t_close:
             cuts.add(pt)
 
+    # Exact time when Bhadra (Vishti Karana) ends during NSE hours (if currently active)
+    if base_v.get("is_bhadra"):
+        cur_scan = t_open
+        while cur_scan <= t_close:
+            st_scan = compute_vedic_state(cur_scan)
+            if not st_scan.get("is_bhadra"):
+                rev_times.append(f"{fmt(cur_scan)} (Bhadra Karana ends — obstruction lifts)")
+                cuts.add(cur_scan)
+                break
+            cur_scan += timedelta(minutes=15)
+
     sorted_cuts = sorted(cuts)
     timeline = []
     best_wins, avoid_wins = [], []
 
     for i in range(len(sorted_cuts) - 1):
         s_t, e_t = sorted_cuts[i], sorted_cuts[i + 1]
-        if (e_t - s_t).total_seconds() < 600:  # skip tiny <10m slivers
+        if (e_t - s_t).total_seconds() < 600:
             continue
         mid_t = s_t + (e_t - s_t) / 2
         st_ = compute_vedic_state(mid_t)
@@ -1154,7 +1364,6 @@ def build_full_day_vedic_plan(dt_ist):
             "Suggested Action": action,
         })
 
-    # Overall Day Verdict
     is_trend_day = base_v["regime"] == "TREND"
     day_traps = []
     if base_v.get("is_bhadra"):
