@@ -3774,6 +3774,26 @@ if alerts_on and tg_token and tg_chat:
     # Retry previously failed Telegram/webhook deliveries on subsequent app reruns.
     alert_results += process_alert_queue(alert_cfg)
 
+    # Decoupled Pure Gann & Pure Vedic critical-event Telegram alerts (market open only)
+    if GA is not None and market_open_now(now_ist):
+        _ga_anchor = round(float(prev_close or spot), 2)
+        _ga_lv = GA.gann_sq9_levels(_ga_anchor)
+        _ga_tb = GA.evaluate_5m_two_bar(intraday or _xi, _ga_lv)
+        _ga_sw = GA.compute_gann_3day_swings(candles_pre)
+        _ga_st = GA.gann_structural_filters(candles_pre, float(spot), now_ist.date().isoformat())
+        _ga_sig = GA.build_pure_gann_signal(float(spot), _ga_lv, _ga_tb, _ga_sw)
+        _g_msg = GA.build_pure_gann_telegram_alert(idx_name, float(spot), _ga_lv, _ga_sig, _ga_sw, _ga_st)
+        if _g_msg:
+            _g_key = f"pure_gann_{idx_name}_{now_ist.date().isoformat()}_{_ga_sig.get('badge')}"
+            alert_results += fire_alert(_g_key, _g_msg, 30, alert_cfg)
+
+        _v_live = GA.compute_vedic_state(now_ist.replace(second=0, microsecond=0))
+        _v_msg = GA.build_pure_vedic_telegram_alert(now_ist, _v_live)
+        if _v_msg:
+            _v_key = f"pure_vedic_{now_ist.date().isoformat()}_{_v_live.get('kaal_short')}_{_v_live.get('hora_verdict', '').split(' ')[0]}_{int(_v_live.get('is_bhadra', False))}"
+            alert_results += fire_alert(_v_key, _v_msg, 60, alert_cfg)
+
+
 # ============================================================
 # DASHBOARD HEADER
 # ============================================================
