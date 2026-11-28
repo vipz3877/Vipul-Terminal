@@ -1027,3 +1027,180 @@ def build_plain_vedic_verdict(v):
         "traps_txt": traps_txt,
         "action": action,
     }
+
+
+def build_full_day_vedic_plan(dt_ist):
+    """Builds a complete 09:15 AM - 03:30 PM IST pure-Jyotish intraday analysis & action plan."""
+    if not SWE_OK:
+        return {"ok": False, "error": "Install pysweph for live Vedic calculations."}
+
+    day_dt = dt_ist.replace(hour=9, minute=30, second=0, microsecond=0)
+    base_v = compute_vedic_state(day_dt)
+    sr, ss = _approx_mumbai_sun(day_dt)
+    day_idx = day_dt.weekday()
+    sun0 = (day_idx + 1) % 7
+    seg = (ss - sr) / 8
+    win = lambda s: (sr + (s - 1) * seg, sr + s * seg)
+    fmt = lambda d: d.strftime("%I:%M %p").lstrip("0")
+
+    # Day Kaal / Upagraha windows
+    r_seg = [8, 2, 7, 5, 6, 4, 3][sun0]
+    rahu_w = win(r_seg)
+    day_seq = []
+    cur_w = sun0
+    for _ in range(8):
+        if len(day_seq) > 0 and day_seq[-1] == "Saturn":
+            day_seq.append("None")
+        else:
+            day_seq.append(WEEKDAY_ORDER[cur_w % 7])
+            cur_w += 1
+    up_wins = {}
+    up_map = {"Sun": "Kaala", "Mars": "Mrityu", "Jupiter": "Yamaganda", "Saturn": "Gulika"}
+    for idx_s, ruler in enumerate(day_seq, 1):
+        if ruler in up_map:
+            up_wins[up_map[ruler]] = win(idx_s)
+    yama_w = up_wins.get("Yamaganda", win([5, 4, 3, 2, 1, 7, 6][sun0]))
+    mrityu_w = up_wins.get("Mrityu")
+
+    # Build chronological NSE session blocks (09:15 to 15:30)
+    t_open = day_dt.replace(hour=9, minute=15, second=0, microsecond=0)
+    t_close = day_dt.replace(hour=15, minute=30, second=0, microsecond=0)
+
+    # Collect key split timestamps inside [09:15, 15:30]
+    cuts = {t_open, t_close}
+    for h in range(2, 10):
+        ht = sr + timedelta(hours=h)
+        if t_open < ht < t_close:
+            cuts.add(ht.replace(second=0, microsecond=0))
+    for w in (rahu_w, yama_w, mrityu_w):
+        if w:
+            for pt in w:
+                pt_c = pt.replace(second=0, microsecond=0)
+                if t_open < pt_c < t_close:
+                    cuts.add(pt_c)
+
+    # Add Moon Rashi / Pada shift timestamps
+    m_open, _ = _sid_lon(_jd_utc(t_open), swe.MOON)
+    m_close, _ = _sid_lon(_jd_utc(t_close), swe.MOON)
+    rev_times = []
+    r_open, r_close = int(m_open // 30), int(m_close // 30)
+    if r_open != r_close:
+        bound = ((r_open + 1) * 30) % 360
+        mins = round(((bound - m_open) % 360) / max((m_close - m_open) % 360, 0.01) * 375)
+        ing_t = t_open + timedelta(minutes=mins)
+        rev_times.append(f"{fmt(ing_t)} (Moon {RASHIS[r_open]} → {RASHIS[r_close]})")
+        if t_open < ing_t < t_close:
+            cuts.add(ing_t)
+
+    p_open, p_close = int(m_open // (360.0 / 108.0)), int(m_close // (360.0 / 108.0))
+    if p_open != p_close:
+        bound = ((p_open + 1) * (360.0 / 108.0)) % 360
+        mins = round(((bound - m_open) % 360) / max((m_close - m_open) % 360, 0.01) * 375)
+        pt = t_open + timedelta(minutes=mins)
+        rev_times.append(f"{fmt(pt)} (Moon Pada {(p_open % 4)+1} → {((p_open+1) % 4)+1})")
+        if t_open < pt < t_close:
+            cuts.add(pt)
+
+    sorted_cuts = sorted(cuts)
+    timeline = []
+    best_wins, avoid_wins = [], []
+
+    for i in range(len(sorted_cuts) - 1):
+        s_t, e_t = sorted_cuts[i], sorted_cuts[i + 1]
+        if (e_t - s_t).total_seconds() < 600:  # skip tiny <10m slivers
+            continue
+        mid_t = s_t + (e_t - s_t) / 2
+        st_ = compute_vedic_state(mid_t)
+        w_label = f"{fmt(s_t)} – {fmt(e_t)}"
+
+        traps = []
+        if st_.get("is_kaal_trap"):
+            traps.append(st_["kaal_short"])
+        if st_.get("is_bhadra"):
+            traps.append("Bhadra")
+        if st_.get("hora_rel") == "ENEMY":
+            traps.append("Enemy Hora")
+        if st_.get("latta") != "Clear":
+            traps.append("Latta")
+
+        h_lord = st_["hora_verdict"].split(" ")[0].title()
+        is_tr = st_["regime"] == "TREND"
+
+        if st_.get("is_kaal_trap") or len(traps) >= 3:
+            energy = f"🔴 TRAP / WHIPSAW ({', '.join(traps[:2])})"
+            behavior = "Stop-loss hunting, fake breakouts, sudden spikes."
+            action = "AVOID NEW ENTRIES — Stay flat or book existing profits."
+            avoid_wins.append(f"{w_label} ({', '.join(traps[:2])})")
+        elif st_.get("hora_rel") == "ENEMY" or len(traps) == 2:
+            energy = f"🟡 CHOPPY / CAUTIOUS ({h_lord} Hora)"
+            behavior = "Two-way swings, weak follow-through."
+            action = "50% SIZE ONLY — Quick scalps, strict SL."
+        elif st_.get("hora_rel") == "FRIEND" and not traps:
+            energy = f"🟢 CLEAN FLOW ({h_lord} Friend Hora)"
+            behavior = "Sustained directional moves with clean follow-through." if is_tr else "Clean swings between support & resistance."
+            action = "BEST WINDOW (100% Size) — Take high-conviction setups."
+            best_wins.append(f"{w_label} ({h_lord} Hora)")
+        else:
+            energy = f"⚪ BALANCED ({h_lord} Neutral Hora)"
+            behavior = "Steady directional drift." if is_tr else "Range-bound / mean-reverting moves."
+            action = "STANDARD RULES — Wait for clear confirmation."
+            if not traps:
+                best_wins.append(f"{w_label} ({h_lord} Hora)")
+
+        timeline.append({
+            "Time (IST)": w_label,
+            "Market Energy": energy,
+            "Expected Behavior": behavior,
+            "Suggested Action": action,
+        })
+
+    # Overall Day Verdict
+    is_trend_day = base_v["regime"] == "TREND"
+    day_traps = []
+    if base_v.get("is_bhadra"):
+        day_traps.append("Bhadra")
+    if base_v.get("is_bad_sm_yoga"):
+        day_traps.append(base_v["sm_yoga"].split(" ")[0])
+    if base_v.get("sbc_mal_count", 0) >= 2:
+        day_traps.append(f"SBC Vedha ({base_v['sbc_mal_count']})")
+    if base_v.get("latta") != "Clear":
+        day_traps.append("Latta Kick")
+
+    if len(day_traps) >= 2:
+        verdict_title = f"🔴 DEFENSIVE / HIGH-TRAP SESSION — 50% SIZE ONLY ({'DIRECTIONAL' if is_trend_day else 'RANGE-BOUND'})"
+        verdict_color = "#ff1744"
+        verdict_summary = (
+            f"Multiple astro traps active ({', '.join(day_traps)}). Expect stop-hunts and sharp whipsaws. "
+            f"Do NOT chase breakouts; trade strictly during the clean windows below at 50% position size."
+        )
+    elif len(day_traps) == 1:
+        verdict_title = f"🟡 CAUTIOUS SESSION ({day_traps[0].upper()}) — 50% SIZE ({'DIRECTIONAL' if is_trend_day else 'RANGE-BOUND'})"
+        verdict_color = "#ffab00"
+        verdict_summary = (
+            f"{day_traps[0]} is active today. Keep position size at 50%, respect avoid windows, and book profits quickly."
+        )
+    else:
+        verdict_title = (
+            "🟢 CLEAN DIRECTIONAL SESSION — 100% SIZE ALLOWED"
+            if is_trend_day
+            else "🟢 CLEAN RANGE-BOUND SESSION — 100% SIZE ALLOWED"
+        )
+        verdict_color = "#00e676"
+        verdict_summary = (
+            "No major astro traps active. Clean Fire+Earth directional energy favors riding trend moves."
+            if is_trend_day
+            else "No major astro traps active. Air+Water energy favors clean mean-reversion and range plays."
+        )
+
+    return {
+        "ok": True,
+        "date_str": day_dt.strftime("%A, %d %b %Y"),
+        "verdict_title": verdict_title,
+        "verdict_color": verdict_color,
+        "verdict_summary": verdict_summary,
+        "best_windows": "  |  ".join(best_wins[:3]) if best_wins else "No fully trap-free window — scalp only",
+        "avoid_windows": "  |  ".join(avoid_wins[:3]) if avoid_wins else f"Rahu {fmt(rahu_w[0])}–{fmt(rahu_w[1])}",
+        "reversal_times": "  |  ".join(rev_times) if rev_times else "No Moon Rashi/Pada shift during NSE hours",
+        "sector_focus": base_v["sector_focus"],
+        "timeline_df": pd.DataFrame(timeline),
+    }
