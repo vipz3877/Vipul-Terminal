@@ -3799,7 +3799,7 @@ st.caption(f"DATA HEALTH: {_hc['OK']} OK · {_hc['WARN']} warn · {_hc['FAIL']} 
 tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13 = st.tabs([
     "🛡️ Trade Desk", "📊 Dashboard & Engine", "📐 Day Levels", "🧭 Exhaustion", "🎯 Premium Scanner",
     "🤖 AI Council & News", "📋 Option Chain", "📒 Scorecard", "🩺 Data Health", "📈 GEX & Skew",
-    "🧾 Manual Trades", "🏦 Footprint", "☸ Gann & Astro Signal", "🌌 Vedic Timing"])
+    "🧾 Manual Trades", "🏦 Footprint", "📐 W.D. Gann Engine", "🌌 Vedic Astrology"])
 
 with tab1:
     status = m["status"]
@@ -4454,17 +4454,17 @@ with tab0:
 
 
 # ============================================================
-# HIMA REDDY W.D. GANN & VEDIC ASTROLOGY TABS (FULL-FLEDGED FAST UI)
+# DECOUPLED TABS: PURE W.D. GANN ENGINE & PURE VEDIC ASTROLOGY
 # ============================================================
 _ga_fragment = getattr(st, "fragment", lambda fn: fn)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def _cached_vedic_state(dt_minute_iso, anchor_rounded):
+def _cached_vedic_state(dt_minute_iso):
     if GA is None:
         return {"ok": False, "error": GA_ERR}
     dt = datetime.fromisoformat(dt_minute_iso)
-    return GA.compute_vedic_state(dt, anchor_price=anchor_rounded)
+    return GA.compute_vedic_state(dt)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -4520,7 +4520,7 @@ _anchor_default = round(float(prev_close or spot), 2)
 
 @_ga_fragment
 def _render_gann_tab():
-    st.markdown("#### ☸ HIMA REDDY W.D. GANN + VEDIC EXECUTION ENGINE")
+    st.markdown("#### 📐 W.D. GANN / HIMA REDDY EXECUTION ENGINE (100% PURE GANN)")
     if GA is None:
         st.error(f"gann_astro.py not loaded: {GA_ERR}")
         return
@@ -4551,19 +4551,17 @@ def _render_gann_tab():
 
     _gann = GA.gann_sq9_levels(_anchor_val)
     _tb = GA.evaluate_5m_two_bar(intraday or _xi, _gann)
-    _vedic = _cached_vedic_state(_now_min_iso, round(_anchor_val, 1))
-    _csig = GA.build_crisp_gann_astro_signal(_eff_spot, _gann, _tb, _vedic)
+    _csig = GA.build_pure_gann_signal(_eff_spot, _gann, _tb)
     _struct = GA.gann_structural_filters(candles_pre, _eff_spot, now_ist.date().isoformat())
     _e8_df, _e8_meta = GA.gann_eighths(candles_pre, _eff_spot)
+    _g_turns = GA.gann_sq9_time_turns(_anchor_val, now_ist)
 
     _flash_cls = "flash-green" if _csig["color"] == "#00e676" else ("flash-red" if _csig["color"] == "#ff1744" else "flash-amber")
-    _lot_txt = "50% SIZE (TRAP)" if _csig["lot_mult"] < 1.0 else "100% STANDARD SIZE"
     st.markdown(
         f"<div class='bbg-panel {_flash_cls}' style='border:2px solid {_csig['color']};'>"
         f"<div style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:6px;'>"
-        f"<span class='bbg-title'>CRISP BINARY SIGNAL — HIMA REDDY 3-PILLAR + VEDIC</span>"
-        f"<div><span class='ga-badge' style='background:{_csig['color']};color:#000;margin-right:6px;'>{esc(_csig['badge'])}</span>"
-        f"<span class='ga-badge' style='background:#222;color:#ff9800;border:1px solid #444;'>{_lot_txt}</span></div></div>"
+        f"<span class='bbg-title'>PURE W.D. GANN BINARY SIGNAL (PRICE + 5M 2-BAR RULES)</span>"
+        f"<span class='ga-badge' style='background:{_csig['color']};color:#000;'>{esc(_csig['badge'])}</span></div>"
         f"<div class='bbg-big' style='color:{_csig['color']};font-size:21px;'>{esc(_csig['signal'])}</div>"
         f"<div class='bbg-desc'>{esc(_csig['action'])}</div></div>",
         unsafe_allow_html=True,
@@ -4614,13 +4612,18 @@ def _render_gann_tab():
 
     _g_view = st.radio(
         "GANN VIEW",
-        ["📐 Square of 9 Ladder", "📊 60-Day Gann Eighths", "💰 2-Bar Risk & Lot Calculator"],
+        ["📐 Square of 9 Ladder", "⚡ Gann Sq9 Time Turns", "📊 60-Day Gann Eighths", "💰 2-Bar Risk & Lot Calculator"],
         horizontal=True,
         label_visibility="collapsed",
         key="ga_subview",
     )
     if _g_view == "📐 Square of 9 Ladder":
         show_df(GA.gann_sq9_table(_gann, _eff_spot), hide_index=True)
+    elif _g_view == "⚡ Gann Sq9 Time Turns":
+        if not _g_turns.empty:
+            show_df(_g_turns, hide_index=True)
+        else:
+            st.info("No Gann Sq9 time turns calculated.")
     elif _g_view == "📊 60-Day Gann Eighths":
         if not _e8_df.empty:
             show_df(_e8_df, hide_index=True)
@@ -4631,12 +4634,12 @@ def _render_gann_tab():
         _lot_sz = rc1.number_input("LOT SIZE (NIFTY=65 / BNF=30)", min_value=1, value=65 if "NIFTY 50" in idx_name else 30, step=1, key="ga_lot_sz")
         _opt_prem = rc2.number_input("OPTION PREMIUM (₹)", min_value=5.0, value=120.0, step=5.0, key="ga_opt_prem")
         _sl_pct = rc3.slider("OPTION STOP LOSS (%)", min_value=10, max_value=40, value=20, step=5, key="ga_sl_pct")
-        _eff_risk_rs = float(P("capital")) * (float(P("max_risk")) / 100.0) * _csig["lot_mult"]
+        _eff_risk_rs = float(P("capital")) * (float(P("max_risk")) / 100.0)
         _risk_per_lot = _opt_prem * (_sl_pct / 100.0) * _lot_sz
         _allowed_lots = int(_eff_risk_rs // max(_risk_per_lot, 1.0))
         st.markdown(
             f"<div class='ga-grid-4'>"
-            f"<div class='ga-card info'><div class='ga-lbl'>EFFECTIVE RISK BUDGET</div><div class='ga-val'>₹{_eff_risk_rs:,.0f}</div><div class='ga-sub'>Multiplier: {int(_csig['lot_mult']*100)}%</div></div>"
+            f"<div class='ga-card info'><div class='ga-lbl'>RISK BUDGET (100% GANN)</div><div class='ga-val'>₹{_eff_risk_rs:,.0f}</div><div class='ga-sub'>Max Risk: {P('max_risk')}%</div></div>"
             f"<div class='ga-card warn'><div class='ga-lbl'>RISK PER LOT</div><div class='ga-val'>₹{_risk_per_lot:,.0f}</div><div class='ga-sub'>SL at ₹{_opt_prem*(1-_sl_pct/100):.1f}</div></div>"
             f"<div class='ga-card bull'><div class='ga-lbl'>ALLOWED LOTS</div><div class='ga-val'>{_allowed_lots} Lot(s)</div><div class='ga-sub'>{_allowed_lots * _lot_sz:,} units</div></div>"
             f"<div class='ga-card'><div class='ga-lbl'>BREAKEVEN TRAIL RULE</div><div class='ga-val' style='font-size:15px;'>Shift SL to Entry at T1</div><div class='ga-sub'>Book 50% at 90° Wall</div></div>"
@@ -4647,12 +4650,11 @@ def _render_gann_tab():
 
 @_ga_fragment
 def _render_vedic_tab():
-    st.markdown("#### 🌌 ASTRO TIMING & OUTLOOK (SIMPLIFIED)")
+    st.markdown("#### 🌌 VEDIC FINANCIAL ASTROLOGY (100% PURE JYOTISH — MUMBAI IST)")
     if GA is None:
         st.error(f"gann_astro.py not loaded: {GA_ERR}")
         return
 
-    # Compact Date/Time selector (only shows inputs if Simulate is toggled)
     c_top1, c_top2, c_top3 = st.columns([1.2, 1.2, 1.6])
     _sim_on = c_top1.toggle("Check Another Date / Time", value=False, key="ga_v_sim_toggle")
     if _sim_on:
@@ -4665,7 +4667,7 @@ def _render_vedic_tab():
         _eval_iso = _now_min_iso
         c_top2.markdown(f"<div style='padding-top:6px;font-size:13px;color:#aaa;'>Live: <b style='color:#fff;'>{now_ist.strftime('%d %b %Y, %I:%M %p IST')}</b></div>", unsafe_allow_html=True)
 
-    _v = _cached_vedic_state(_eval_iso, round(_anchor_default, 1))
+    _v = _cached_vedic_state(_eval_iso)
     if not _v.get("ok"):
         st.warning(_v.get("error", "pysweph not installed."))
         return
@@ -4675,35 +4677,33 @@ def _render_vedic_tab():
     _lot_str = "50% LOTS" if _vd["badge"].startswith("50%") else "100% LOTS"
     _lot_tone = "bear" if _lot_str == "50% LOTS" else "bull"
 
-    # Extract only HIGH-CONVICTION turns (drop repetitive hourly Hora Lagna spam)
+    # Pure Astronomical Turns (Moon Rashi Ingress & Moon Pada Shifts — drop hourly Hora Lagna spam)
     _turns = _v.get("turns_df")
-    _key_turns = pd.DataFrame()
+    _astro_turns = pd.DataFrame()
     if _turns is not None and not _turns.empty:
-        _key_turns = _turns[~_turns["Type"].str.contains("HORA LAGNA", na=False)].copy()
-        if _key_turns.empty:
-            _key_turns = _turns.head(3).copy()
-    _next_turn = _key_turns.iloc[0]["IST Time"] if not _key_turns.empty else "None"
+        _astro_turns = _turns[~_turns["Type"].str.contains("HORA LAGNA", na=False)].copy()
+    _next_turn = _astro_turns.iloc[0]["IST Time"] if not _astro_turns.empty else "None today"
 
-    # 1. SINGLE 4-BOX ANSWER STRIP (No duplicate banner + cards)
+    # 1. SINGLE 4-BOX PURE VEDIC ANSWER STRIP
     st.markdown(
         f"<div class='ga-grid-4'>"
         f"<div class='ga-card {'bull' if _is_trend else 'warn'}'>"
-        f"  <div class='ga-lbl'>HOW TO TRADE TODAY</div>"
-        f"  <div class='ga-val'>{'🔥 RIDE BREAKOUTS' if _is_trend else '🛡️ FADE GANN WALLS'}</div>"
-        f"  <div class='ga-sub'>{'Trend day — hold winners' if _is_trend else 'Choppy — trade D-S1 / D-R1 only'}</div>"
+        f"  <div class='ga-lbl'>ASTRO MARKET ENERGY</div>"
+        f"  <div class='ga-val'>{'🔥 DIRECTIONAL' if _is_trend else '🌊 RANGE-BOUND'}</div>"
+        f"  <div class='ga-sub'>{'Fire+Earth dominant — sustained flow' if _is_trend else 'Air+Water dominant — mean-reverting'}</div>"
         f"</div>"
         f"<div class='ga-card {_lot_tone}'>"
-        f"  <div class='ga-lbl'>POSITION SIZE</div>"
+        f"  <div class='ga-lbl'>ASTRO RISK SIZING</div>"
         f"  <div class='ga-val'>{_lot_str}</div>"
         f"  <div class='ga-sub'>{esc(_vd['traps_txt'])}</div>"
         f"</div>"
         f"<div class='ga-card info'>"
-        f"  <div class='ga-lbl'>KEY REVERSAL TIME</div>"
+        f"  <div class='ga-lbl'>MOON TRANSIT TURN</div>"
         f"  <div class='ga-val'>{esc(_next_turn)}</div>"
-        f"  <div class='ga-sub'>{len(_key_turns)} key turn window(s) today</div>"
+        f"  <div class='ga-sub'>{len(_astro_turns)} Moon shift(s) in NSE hours</div>"
         f"</div>"
         f"<div class='ga-card'>"
-        f"  <div class='ga-lbl'>TOP SECTORS</div>"
+        f"  <div class='ga-lbl'>RULING SECTORS</div>"
         f"  <div class='ga-val' style='font-size:15px;'>{esc(_v['sector_focus'])}</div>"
         f"  <div class='ga-sub'>Avoid: {esc(_v['kaal_summary'].split('  |  ')[0])}</div>"
         f"</div>"
@@ -4711,29 +4711,28 @@ def _render_vedic_tab():
         unsafe_allow_html=True,
     )
 
-    # 2. ONLY TWO SIMPLE VIEWS: TODAY vs NEXT 10 DAYS
+    # 2. TWO SIMPLE PURE-ASTRO VIEWS: TODAY vs NEXT 10 DAYS
     _simple_view = st.radio(
         "VIEW",
-        ["⚡ Today's Key Times", "📅 Next 10 Days Outlook"],
+        ["🌙 Today's Astro Turns & Kaals", "📅 Next 10 Days Astro Outlook"],
         horizontal=True,
         label_visibility="collapsed",
         key="ga_v_simple_view",
     )
-    if _simple_view == "⚡ Today's Key Times":
-        if not _key_turns.empty:
-            show_df(_key_turns, hide_index=True)
+    if _simple_view == "🌙 Today's Astro Turns & Kaals":
+        if not _astro_turns.empty:
+            show_df(_astro_turns, hide_index=True)
         else:
-            st.info("No major intraday reversal windows today.")
-        st.caption(f"Avoid chasing during: {_v['kaal_summary']}")
+            st.info("No Moon Rashi or Pada shifts during NSE hours today.")
+        st.caption(f"Mumbai Kaal / Upagraha Caution Windows: {_v['kaal_summary']}")
     else:
         _rm = _cached_roadmap(_eval_dt.date().isoformat())
         if not _rm.empty:
-            # Show only the 4 clean columns a trader needs
             _clean_cols = [c for c in ["Date", "Trading Plan", "Trap Flags", "Sector Focus"] if c in _rm.columns]
             show_df(_rm[_clean_cols], hide_index=True)
 
-    # 3. ALL SANSKRIT / ADVANCED DATA HIDDEN IN ONE COLLAPSED EXPANDER
-    with st.expander("📚 Advanced Vedic Details (Hora, Tajaka, Dignities, Panchanga, SBC Vedha)"):
+    # 3. ALL ADVANCED JYOTISH DATA IN ONE COLLAPSED EXPANDER
+    with st.expander("📚 Advanced Jyotish Details (Hora, Tajaka, Dignities, Panchanga, SBC Vedha)"):
         _adv = st.radio(
             "ADV",
             ["Hourly Hora", "Tajaka Aspects", "Graha Dignities", "Panchanga & Vedha"],
